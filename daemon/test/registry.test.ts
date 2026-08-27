@@ -225,6 +225,45 @@ describe("Registry applyEvent(colored)", () => {
   });
 });
 
+describe("Registry.markPainted (color backflow)", () => {
+  test("sets paintedColor on the matching ref", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markPainted(ref.id, "#1a73e8");
+    expect(ref.paintedColor).toBe("#1a73e8");
+  });
+
+  test("overwrites a previous paintedColor (repaint after the target changed)", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markPainted(ref.id, "#1a73e8");
+    reg.markPainted(ref.id, "#d93025");
+    expect(ref.paintedColor).toBe("#d93025");
+  });
+
+  test("does not touch cmuxColor -- that stays applyColor's job", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markPainted(ref.id, "#1a73e8");
+    expect(ref.cmuxColor).toBeNull();
+  });
+
+  test("a newly created workspace starts with paintedColor: null", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.paintedColor).toBeNull();
+  });
+
+  test("unknown id is a no-op, not a throw", () => {
+    const reg = new Registry();
+    expect(() => reg.markPainted("mw_unknown", "#1a73e8")).not.toThrow();
+  });
+});
+
 describe("Registry attachedAt persistence", () => {
   test("a newly created workspace starts with attachedAt: null", () => {
     const reg = new Registry();
@@ -272,6 +311,84 @@ describe("Registry attachedAt persistence", () => {
     reg.applyEvent(ev("renamed", "W1", "renamed-cmux", "/repo"));
     expect(ref.attachedAt).toBe(firstAttachedAt);
   });
+
+  test("clearAttached resets attachedAt to null", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markAttached(ref.id);
+    reg.clearAttached(ref.id);
+    expect(ref.attachedAt).toBeNull();
+  });
+
+  test("clearAttached is a no-op for an unknown id, not a throw", () => {
+    const reg = new Registry();
+    expect(() => reg.clearAttached("mw_unknown")).not.toThrow();
+  });
+
+  test("clearAttached is a no-op for an already-unattached ref", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.clearAttached(ref.id);
+    expect(ref.attachedAt).toBeNull();
+  });
+
+  test("after clearAttached, a later markAttached re-attaches with a fresh timestamp", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markAttached(ref.id, "2026-01-01T00:00:00.000Z");
+    reg.clearAttached(ref.id);
+    reg.markAttached(ref.id, "2026-06-01T00:00:00.000Z");
+    expect(ref.attachedAt).toBe("2026-06-01T00:00:00.000Z");
+  });
+});
+
+describe("Registry.attachOnActivate (createGroups: on-open vs on-activate)", () => {
+  test("defaults to true (on-activate's historical behavior) for any caller that doesn't set it", () => {
+    const reg = new Registry();
+    expect(reg.attachOnActivate).toBe(true);
+  });
+
+  test("with attachOnActivate: false, a selected event still activates but does NOT attach", () => {
+    const reg = new Registry();
+    reg.attachOnActivate = false;
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const out = reg.applyEvent(ev("selected", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(reg.activeId).toBe(ref.id);
+    expect(out.find((e) => e.name === "workspace.activated")).toBeDefined();
+    expect(ref.attachedAt).toBeNull();
+  });
+
+  test("with attachOnActivate: false, activateBySourceId (window follow) still activates but does NOT attach", () => {
+    const reg = new Registry();
+    reg.attachOnActivate = false;
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const out = reg.activateBySourceId("W1");
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.activated");
+    expect(ref.attachedAt).toBeNull();
+  });
+
+  test("with attachOnActivate: true (default), a selected event attaches -- unchanged behavior", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    reg.applyEvent(ev("selected", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(typeof ref.attachedAt).toBe("string");
+  });
+
+  test("markAttached (open_url's path) still attaches even with attachOnActivate: false", () => {
+    const reg = new Registry();
+    reg.attachOnActivate = false;
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markAttached(ref.id);
+    expect(typeof ref.attachedAt).toBe("string");
+  });
 });
 
 describe("Registry.activateBySourceId", () => {
@@ -317,5 +434,158 @@ describe("Registry.activateBySourceId", () => {
     reg.activateBySourceId("W1");
     const out = reg.activateBySourceId("W1");
     expect(out).toEqual([]);
+  });
+});
+
+describe("Registry -- Phase 0: source-scoped findMatch (docs/tmux-port-plan.md §2.1)", () => {
+  test("a tmux-sourced ref and a cmux-sourced ref sharing a title never re-bind to each other", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "cmux-W1", "compliance", null));
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance" });
+    expect(reg.workspaces.size).toBe(2);
+
+    const refs = [...reg.workspaces.values()];
+    const cmuxRef = refs.find((r) => r.source === "cmux")!;
+    const tmuxRef = refs.find((r) => r.source === "tmux")!;
+    expect(cmuxRef.id).not.toBe(tmuxRef.id);
+    expect(cmuxRef.sourceId).toBe("cmux-W1");
+    expect(tmuxRef.sourceId).toBe("$1");
+  });
+
+  test("re-applying the same tmux session upserts the existing tmux ref, not the same-titled cmux ref", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "cmux-W1", "compliance", null));
+    const [firstTmux] = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance" });
+    const tmuxId = firstTmux!.workspace.id;
+
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance" });
+    expect(out).toEqual([]); // unchanged -- no re-emit
+    expect(reg.workspaces.size).toBe(2); // still two distinct refs, not merged
+    expect(reg.workspaces.get(tmuxId)?.source).toBe("tmux");
+  });
+
+  test("archiving the cmux ref never archives the same-titled tmux ref", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "cmux-W1", "compliance", null));
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance" });
+    reg.applyEvent(ev("closed", "cmux-W1", "compliance", null));
+
+    const refs = [...reg.workspaces.values()];
+    const cmuxRef = refs.find((r) => r.source === "cmux")!;
+    const tmuxRef = refs.find((r) => r.source === "tmux")!;
+    expect(cmuxRef.archived).toBe(true);
+    expect(tmuxRef.archived).toBe(false);
+  });
+});
+
+describe("Registry.applyTmuxIntent", () => {
+  test("upsertTmuxRef creates a new tmux-sourced ref", () => {
+    const reg = new Registry();
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.upserted");
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.source).toBe("tmux");
+    expect(ref.sourceId).toBe("$1");
+    expect(ref.title).toBe("wakey");
+  });
+
+  test("upsertTmuxRef with an unchanged name is a no-op", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    expect(out).toEqual([]);
+  });
+
+  test("upsertTmuxRef with a changed name retitles the same ref (id stable across a rename)", () => {
+    const reg = new Registry();
+    const [first] = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "old-name" });
+    const id = first!.workspace.id;
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "new-name" });
+    expect(out[0]!.workspace.id).toBe(id);
+    expect(out[0]!.workspace.title).toBe("new-name");
+    expect(reg.workspaces.size).toBe(1);
+  });
+
+  test("archiveTmuxRef archives the matching tmux ref and emits workspace.archived", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    const out = reg.applyTmuxIntent({ type: "archiveTmuxRef", sessionId: "$1" });
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.archived");
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.archived).toBe(true);
+  });
+
+  test("archiveTmuxRef on an unknown session id is a no-op", () => {
+    const reg = new Registry();
+    const out = reg.applyTmuxIntent({ type: "archiveTmuxRef", sessionId: "$unknown" });
+    expect(out).toEqual([]);
+  });
+
+  test("archiveTmuxRef on an already-archived ref does not re-emit", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    reg.applyTmuxIntent({ type: "archiveTmuxRef", sessionId: "$1" });
+    const out = reg.applyTmuxIntent({ type: "archiveTmuxRef", sessionId: "$1" });
+    expect(out).toEqual([]);
+  });
+});
+
+describe("Registry.reclassifyAsTmux", () => {
+  test("converts a cmux-sourced ref into the tmux-sourced ref of record, preserving its id", () => {
+    const reg = new Registry();
+    const [created] = reg.applyEvent(ev("created", "cmux-W1", "compliance", "/hub"));
+    const originalId = created!.workspace.id;
+
+    const out = reg.reclassifyAsTmux("cmux-W1", "$2", "compliance");
+    expect(out.length).toBe(1);
+    expect(out[0]!.workspace.id).toBe(originalId); // same ref, same id -- same Chrome group
+
+    const ref = reg.workspaces.get(originalId)!;
+    expect(ref.source).toBe("tmux");
+    expect(ref.sourceId).toBe("$2");
+    expect(ref.title).toBe("compliance");
+    expect(reg.workspaces.size).toBe(1); // no new ref created
+  });
+
+  test("is a no-op when no cmux ref with that sourceId exists", () => {
+    const reg = new Registry();
+    const out = reg.reclassifyAsTmux("nonexistent", "$2", "compliance");
+    expect(out).toEqual([]);
+    expect(reg.workspaces.size).toBe(0);
+  });
+
+  test("idempotent: a second call for the same cmuxSourceId is a no-op (already reclassified)", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "cmux-W1", "compliance", "/hub"));
+    reg.reclassifyAsTmux("cmux-W1", "$2", "compliance");
+    const out = reg.reclassifyAsTmux("cmux-W1", "$2", "compliance");
+    expect(out).toEqual([]);
+    expect(reg.workspaces.size).toBe(1);
+  });
+});
+
+describe("Registry.archiveBySourceId", () => {
+  test("archives a matching ref of the given source and emits workspace.archived", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "cmux-W1", "compliance", "/hub"));
+    const out = reg.archiveBySourceId("cmux", "cmux-W1");
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.archived");
+  });
+
+  test("is source-scoped -- does not archive a same-sourceId ref of a different source", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "shared-id", "compliance", "/hub"));
+    const out = reg.archiveBySourceId("tmux", "shared-id");
+    expect(out).toEqual([]);
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.archived).toBe(false);
+  });
+
+  test("unknown sourceId is a no-op", () => {
+    const reg = new Registry();
+    expect(reg.archiveBySourceId("cmux", "unknown")).toEqual([]);
   });
 });

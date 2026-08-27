@@ -93,19 +93,26 @@ describe("diffConfig", () => {
       "ports.maxPort",
       "ports.mode",
       "reverseSync",
+      "tmux.enabled",
+      "tmux.mirror",
+      "tmux.alphabetize",
+      "tmux.reattachGraceMs",
+      "tmux.spawnCwd",
+      "janitor",
+      "colorBackflow",
     ].sort();
     expect(actual).toEqual(expected);
   });
 
   test("groupBy and createGroups changes are detected and hot-applicable", () => {
-    const oldConfig = cfg({ groupBy: "title", createGroups: "lazy" });
+    const oldConfig = cfg({ groupBy: "title", createGroups: "on-activate" });
     const newConfig = cfg({ groupBy: "workspace", createGroups: "eager" });
     const changes = diffConfig(oldConfig, newConfig);
     const byKey = Object.fromEntries(changes.map((c) => [c.key, c]));
     expect(byKey.groupBy).toEqual({ key: "groupBy", oldValue: "title", newValue: "workspace", hotApplicable: true });
     expect(byKey.createGroups).toEqual({
       key: "createGroups",
-      oldValue: "lazy",
+      oldValue: "on-activate",
       newValue: "eager",
       hotApplicable: true,
     });

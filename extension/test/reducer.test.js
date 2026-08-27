@@ -164,6 +164,34 @@ describe("workspace.activated", () => {
     });
     expect(next.activeId).toBe("mw_a");
   });
+
+  // createGroups: "on-open" (docs/protocol.md, "Extension behavior"): the
+  // daemon does not filter out activation of a never-attached identity --
+  // this is safe only because activation alone never emits ensureGroup
+  // (only workspace.upserted/openUrl do), so chrome-ops's activate() is
+  // always a no-op for it (groupId stays null). New identity or existing,
+  // with or without collapseOthers -- never ensureGroup.
+  test("never emits ensureGroup, even for an identity never seen before", () => {
+    const state = makeState({ config: { collapseOthers: true, closeBehavior: "archive" } });
+    const { ops } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "workspace.activated",
+      workspace: { id: "mw_never_opened", title: "alpha", color: "blue" },
+    });
+    expect(ops.find((o) => o.op === "ensureGroup")).toBeUndefined();
+  });
+
+  test("a brand-new identity's byId entry starts with groupId: null (activate() then no-ops on it)", () => {
+    const state = makeState();
+    const { state: next } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "workspace.activated",
+      workspace: { id: "mw_never_opened", title: "alpha", color: "blue" },
+    });
+    expect(next.byId.mw_never_opened.groupId).toBeNull();
+  });
 });
 
 describe("workspace.upserted", () => {
@@ -254,7 +282,7 @@ describe("open_url", () => {
     expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com" });
   });
 
-  test("does not mutate byId or activeId", () => {
+  test("does not mutate activeId", () => {
     const state = makeState({ activeId: "mw_z" });
     const { state: next } = reduce(state, {
       type: "event",
@@ -264,6 +292,43 @@ describe("open_url", () => {
       url: "https://example.com",
     });
     expect(next.activeId).toBe("mw_z");
+  });
+
+  // createGroups: "on-open" -- open_url is often the FIRST time an
+  // identity ever reaches the extension (attachment happens only via
+  // open_url, so nothing upserted it first). Without a byId entry,
+  // chrome-ops's openUrl would have nothing to create the group around.
+  test("establishes a byId entry for a target never seen before, with groupId: null", () => {
+    const state = makeState();
+    const { state: next } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "open_url",
+      workspace: { id: "mw_a", title: "alpha", color: "blue" },
+      url: "https://example.com",
+    });
+    expect(next.byId.mw_a).toEqual({
+      title: "alpha",
+      color: "blue",
+      archived: false,
+      groupId: null,
+      lastActiveTabId: null,
+      ports: [],
+    });
+  });
+
+  test("preserves an existing entry's groupId/lastActiveTabId/ports instead of overwriting them", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 7, lastActiveTabId: 3, ports: [4000] } },
+    });
+    const { state: next } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "open_url",
+      workspace: { id: "mw_a", title: "alpha", color: "blue" },
+      url: "https://example.com",
+    });
+    expect(next.byId.mw_a).toEqual({ title: "alpha", color: "blue", archived: false, groupId: 7, lastActiveTabId: 3, ports: [4000] });
   });
 });
 
@@ -445,5 +510,242 @@ describe("ports pass-through", () => {
       workspace: { id: "mw_a", title: "alpha", color: "blue" },
     });
     expect(next.byId.mw_a.ports).toEqual([3000]);
+  });
+});
+
+describe("tab group janitor", () => {
+  test("a canonical group (matches the cached groupId) is left untouched", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [{ tabId: 1, url: "https://example.com" }] }],
+    });
+    expect(ops.find((o) => o.op === "mergeGroup" || o.op === "closeGroup" || o.op === "reportForeignGroups")).toBeUndefined();
+  });
+
+  test("a duplicate group merges into the cached canonical group", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [
+        { groupId: 10, title: "alpha", tabs: [{ tabId: 1, url: "https://example.com" }] },
+        { groupId: 11, title: "alpha", tabs: [{ tabId: 2, url: "chrome://newtab/" }] },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "mergeGroup", fromGroupId: 11, intoId: 10 });
+    expect(ops.find((o) => o.op === "mergeGroup" && o.fromGroupId === 10)).toBeUndefined();
+  });
+
+  test("multiple duplicates for the same title all merge into the one canonical group", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [
+        { groupId: 10, title: "alpha", tabs: [] },
+        { groupId: 11, title: "alpha", tabs: [] },
+        { groupId: 12, title: "alpha", tabs: [] },
+      ],
+    });
+    const merges = ops.filter((o) => o.op === "mergeGroup");
+    expect(merges).toEqual([
+      { op: "mergeGroup", fromGroupId: 11, intoId: 10 },
+      { op: "mergeGroup", fromGroupId: 12, intoId: 10 },
+    ]);
+  });
+
+  test("with no cached groupId, the first scan-order match becomes canonical and later ones merge into it", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [
+        { groupId: 20, title: "alpha", tabs: [] },
+        { groupId: 21, title: "alpha", tabs: [] },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "mergeGroup", fromGroupId: 21, intoId: 20 });
+    expect(ops.find((o) => o.op === "mergeGroup" && o.fromGroupId === 20)).toBeUndefined();
+  });
+
+  test("a blank orphan (unmanaged title, only new-tab/blank placeholder tabs) closes", () => {
+    const state = makeState();
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [
+        {
+          groupId: 30,
+          title: "orphan-from-eager-era",
+          tabs: [
+            { tabId: 5, url: "chrome://newtab/" },
+            { tabId: 6, url: "about:blank" },
+          ],
+        },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "closeGroup", groupId: 30 });
+  });
+
+  test("a foreign group (unmanaged title, real tabs) is reported, never merged or closed", () => {
+    const state = makeState();
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [
+        { groupId: 40, title: "personal banking", tabs: [{ tabId: 7, url: "https://bank.example.com" }] },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "reportForeignGroups", groups: [{ title: "personal banking", tabCount: 1 }] });
+    expect(ops.find((o) => o.op === "mergeGroup" || o.op === "closeGroup")).toBeUndefined();
+  });
+
+  test("multiple foreign groups batch into a single reportForeignGroups op", () => {
+    const state = makeState();
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [
+        { groupId: 40, title: "banking", tabs: [{ tabId: 7, url: "https://bank.example.com" }] },
+        { groupId: 41, title: "email", tabs: [{ tabId: 8, url: "https://mail.example.com" }] },
+      ],
+    });
+    expect(ops.filter((o) => o.op === "reportForeignGroups")).toHaveLength(1);
+    expect(ops).toContainEqual({
+      op: "reportForeignGroups",
+      groups: [
+        { title: "banking", tabCount: 1 },
+        { title: "email", tabCount: 1 },
+      ],
+    });
+  });
+
+  test("config.janitor: false disables the pass entirely, even with a real duplicate present", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive", janitor: false },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [
+        { groupId: 10, title: "alpha", tabs: [] },
+        { groupId: 11, title: "alpha", tabs: [] },
+      ],
+    });
+    expect(ops.find((o) => o.op === "mergeGroup" || o.op === "closeGroup" || o.op === "reportForeignGroups")).toBeUndefined();
+  });
+
+  test("an archived identity's title still counts as managed -- its duplicate still merges", () => {
+    const state = makeState({
+      byId: { mw_b: { title: "beta", color: "red", archived: true, groupId: 50, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_b", title: "beta", color: "red", archived: true }] },
+      janitorGroups: [
+        { groupId: 50, title: "beta", tabs: [] },
+        { groupId: 51, title: "beta", tabs: [{ tabId: 9, url: "chrome://newtab/" }] },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "mergeGroup", fromGroupId: 51, intoId: 50 });
+  });
+
+  test("janitor ops are ordered before ensureGroup ops so a stale duplicate can't win the re-query", () => {
+    const state = makeState();
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 30, title: "blank-orphan", tabs: [{ tabId: 1, url: "about:blank" }] }],
+    });
+    const closeIndex = ops.findIndex((o) => o.op === "closeGroup");
+    const ensureIndex = ops.findIndex((o) => o.op === "ensureGroup");
+    expect(closeIndex).toBeGreaterThanOrEqual(0);
+    expect(ensureIndex).toBeGreaterThanOrEqual(0);
+    expect(closeIndex).toBeLessThan(ensureIndex);
+  });
+
+  test("no janitorGroups on the sync message means the pass is skipped (idempotent no-op)", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+    });
+    expect(ops.find((o) => o.op === "mergeGroup" || o.op === "closeGroup" || o.op === "reportForeignGroups")).toBeUndefined();
+  });
+
+  // Interplay with createGroups: "on-open" (point 5 of the on-open task):
+  // the janitor can only ever classify a scanned group as CANONICAL/
+  // DUPLICATE against a title present in byId -- and in on-open mode, byId
+  // only ever holds identities the client has actually seen (attached via
+  // open_url, or transiently via a bare activation -- see
+  // "workspace.activated" tests above). Nothing is ever resurrected: a
+  // title truly absent from byId (never attached, never even activated
+  // this session) is orphan/foreign, dissolved like any other leftover.
+  test("a blank group whose title is absent from byId (never attached) is a BLANK ORPHAN, not resurrected", () => {
+    const state = makeState(); // empty byId -- nothing ever attached or activated
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [{ groupId: 30, title: "never-attached", tabs: [{ tabId: 1, url: "chrome://newtab/" }] }],
+    });
+    expect(ops).toContainEqual({ op: "closeGroup", groupId: 30 });
+  });
+
+  // The one wrinkle: a BARE activation (never open_url'd) still creates a
+  // byId entry with groupId: null (see "workspace.activated" tests). If a
+  // leftover blank group with that same title already exists in Chrome, it
+  // now classifies as CANONICAL (first title-match) instead of BLANK
+  // ORPHAN, and the janitor leaves it alone -- weakening point 5's cleanup
+  // guarantee for that one title until either it's actually opened or the
+  // group is closed by hand. Not a resurrection (nothing is created), but
+  // documented here since it's a real, order-dependent gap.
+  test("a blank group whose title IS present in byId (via a bare activation) is shielded from cleanup", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "activated-not-opened", color: "blue", archived: false, groupId: null, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [{ groupId: 31, title: "activated-not-opened", tabs: [{ tabId: 2, url: "chrome://newtab/" }] }],
+    });
+    expect(ops.find((o) => o.op === "closeGroup" || o.op === "mergeGroup")).toBeUndefined();
   });
 });

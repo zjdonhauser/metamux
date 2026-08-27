@@ -80,10 +80,10 @@ describe("ActuatorServer.broadcast -- groupBy: workspace (unchanged behavior)", 
   });
 });
 
-describe("ActuatorServer -- createGroups: lazy", () => {
+describe("ActuatorServer -- createGroups: on-activate (legacy 'lazy' semantics)", () => {
   test("an upserted event for a never-activated identity is suppressed until it's attached", () => {
     const registry = new Registry();
-    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "lazy" }), registry);
+    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-activate" }), registry);
 
     const created = registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
     server.broadcast(created);
@@ -92,11 +92,13 @@ describe("ActuatorServer -- createGroups: lazy", () => {
     const selected = registry.applyEvent({ name: "selected", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 2, occurredAtMs: 2 });
     server.broadcast(selected);
     expect(logs.some((l) => l.includes("workspace.activated"))).toBe(true); // activated always passes
+    // on-activate: selected also attaches, via registry's default attachOnActivate: true.
+    expect(logs.some((l) => l.includes("workspace.upserted"))).toBe(false); // no unrelated title/cwd change to re-upsert
   });
 
-  test("getState's projected view only includes active/attached identities in lazy mode", () => {
+  test("getState's projected view only includes active/attached identities in on-activate mode", () => {
     const registry = new Registry();
-    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "lazy" }), registry);
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-activate" }), registry);
 
     registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "attached-one", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
     registry.applyEvent({ name: "created", workspaceId: "SRC-B", title: "never-attached", cwd: "/b", bootId: "B1", seq: 2, occurredAtMs: 2 });
@@ -122,7 +124,7 @@ describe("ActuatorServer -- createGroups: lazy", () => {
 
   test("open_url attaches its target -- a subsequent upsert for it is no longer suppressed", () => {
     const registry = new Registry();
-    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "lazy" }), registry);
+    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-activate" }), registry);
 
     registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
     const ref = [...registry.workspaces.values()][0]!;
@@ -136,17 +138,83 @@ describe("ActuatorServer -- createGroups: lazy", () => {
   });
 });
 
+describe("ActuatorServer -- createGroups: on-open (default)", () => {
+  // main.ts sets registry.attachOnActivate = config.createGroups !== "on-open"
+  // right after construction; these tests reproduce that wiring explicitly
+  // since they drive the registry directly, bypassing main.ts.
+  function makeOnOpenRegistry(): Registry {
+    const registry = new Registry();
+    registry.attachOnActivate = false;
+    return registry;
+  }
+
+  test("selecting a never-opened workspace activates but its group stays excluded from the projected view", () => {
+    const registry = makeOnOpenRegistry();
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-open" }), registry);
+
+    const sel = registry.applyEvent({ name: "selected", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    server.broadcast(sel);
+
+    const state = server.getState();
+    expect(state.activeId).not.toBeNull(); // raw activeId is still accurate
+    expect(state.projected.activeId).not.toBeNull();
+    expect(state.projected.workspaces.length).toBe(0); // but no group for it yet
+  });
+
+  test("a brand-new workspace's FIRST selection (upserted+activated in one batch) does not leak an upserted event", () => {
+    const registry = makeOnOpenRegistry();
+    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-open" }), registry);
+
+    // "selected" on a workspace the registry has never seen produces BOTH
+    // workspace.upserted (changed: true, brand new) and workspace.activated
+    // in the SAME applyEvent call -- exactly the batch-ordering case that
+    // used to leak an empty placeholder group through the activeId shortcut.
+    const sel = registry.applyEvent({ name: "selected", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    server.broadcast(sel);
+
+    expect(logs.some((l) => l.includes("workspace.upserted"))).toBe(false);
+    expect(logs.some((l) => l.includes("workspace.activated"))).toBe(true);
+  });
+
+  test("open_url is the only thing that attaches -- afterward the group appears in the projected view", () => {
+    const registry = makeOnOpenRegistry();
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-open" }), registry);
+
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const ref = [...registry.workspaces.values()][0]!;
+    server.pushOpenUrl(ref, "https://example.test");
+
+    const state = server.getState();
+    expect(state.projected.workspaces.length).toBe(1);
+    expect(state.projected.workspaces[0]!.title).toBe("x");
+  });
+
+  test("window follow (activateBySourceId) also does not attach", () => {
+    const registry = makeOnOpenRegistry();
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "on-open" }), registry);
+
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const followed = registry.activateBySourceId("SRC-A");
+    server.broadcast(followed);
+
+    const state = server.getState();
+    expect(state.projected.activeId).not.toBeNull();
+    expect(state.projected.workspaces.length).toBe(0);
+  });
+});
+
+
 describe("ActuatorServer.getState -- raw and projected views", () => {
   test("raw workspaces always include every real ref regardless of groupBy/createGroups", () => {
     const registry = new Registry();
-    const { server } = makeServer(cfg({ groupBy: "title", createGroups: "lazy" }), registry);
+    const { server } = makeServer(cfg({ groupBy: "title", createGroups: "on-activate" }), registry);
     registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
     registry.applyEvent({ name: "created", workspaceId: "SRC-B", title: "cmux", cwd: "/b", bootId: "B1", seq: 2, occurredAtMs: 2 });
 
     const state = server.getState();
     expect(state.workspaces.length).toBe(2);
     expect(state.projected.groupBy).toBe("title");
-    expect(state.projected.createGroups).toBe("lazy");
+    expect(state.projected.createGroups).toBe("on-activate");
   });
 });
 

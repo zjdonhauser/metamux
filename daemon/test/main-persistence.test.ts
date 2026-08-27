@@ -73,11 +73,56 @@ describe("registry persistence round-trip -- attachedAt", () => {
     lazyGroups.seedFromRefs(seedSnapshot.workspaces, (ref) => groupProjection.identityFor(ref, seedSnapshot).id);
 
     const projected = groupProjection.projectState(seedSnapshot);
-    const visible = lazyGroups.filterForSync(projected.workspaces, projected.activeId);
+    const visible = lazyGroups.filterForSync(projected.workspaces);
 
     // Without seeding, this would be empty (nothing "active" this instant,
     // nothing attached this session) -- the bug this round-trip fixes.
     expect(visible.length).toBe(1);
     expect(visible[0]!.title).toBe("cmux");
+  });
+});
+
+describe("registry persistence round-trip -- paintedColor (color backflow)", () => {
+  test("a backflow-painted ref still shows paintedColor after re-hydration", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const id = [...registry.workspaces.values()][0]!.id;
+    registry.markPainted(id, "#1a73e8");
+
+    const restored = roundTrip(registry);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.paintedColor).toBe("#1a73e8");
+  });
+
+  test("a never-painted workspace still shows paintedColor: null after re-hydration", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+
+    const restored = roundTrip(registry);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.paintedColor).toBeNull();
+  });
+
+  test("a registry.json written before this feature (no paintedColor key at all) hydrates to null, not a crash", () => {
+    const legacySaved = {
+      workspaces: [
+        {
+          id: "mw_legacy",
+          title: "old-workspace",
+          cwd: "/old",
+          source: "cmux" as const,
+          sourceId: "SRC-LEGACY",
+          archived: false,
+          cmuxColor: null,
+          attachedAt: null,
+          updatedAt: new Date().toISOString(),
+          // no paintedColor field at all -- simulates a pre-feature file
+        },
+      ],
+      activeId: null,
+    };
+    const registry = hydrateRegistry(legacySaved as any, null);
+    const ref = [...registry.workspaces.values()][0]!;
+    expect(ref.paintedColor).toBeNull();
   });
 });

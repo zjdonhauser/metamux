@@ -4,7 +4,7 @@
 //
 // Wire-projection layer: raw per-workspace registry state/events are
 // projected through GroupProjection (groupBy: title-aliasing) and
-// LazyGroupTracker (createGroups: lazy inclusion) before anything reaches
+// LazyGroupTracker (createGroups: "on-open"/"on-activate" lazy inclusion) before anything reaches
 // a client. The Registry itself never sees either concern.
 
 import type { Server, ServerWebSocket } from "bun";
@@ -53,6 +53,11 @@ export interface ActuatorServerOptions {
    * `cmux rpc workspace.select` call live in main.ts -- this is just the
    * wire. */
   onUserActivatedGroup?: (id: string) => void;
+  /** Detach-on-close: called when an authed client sends
+   * `{"type":"userClosedGroup","id":"..."}` (the user closed a managed
+   * Chrome group by hand). Clearing attachedAt (registry + lazyGroups) and
+   * persisting live in main.ts -- this is just the wire. */
+  onUserClosedGroup?: (id: string) => void;
   log?: (line: string) => void;
 }
 
@@ -69,6 +74,7 @@ export class ActuatorServer {
   private lazyGroups: LazyGroupTracker;
   private portsTracker?: PortsTracker;
   private onUserActivatedGroup?: (id: string) => void;
+  private onUserClosedGroup?: (id: string) => void;
   private port: number;
   private secret: string;
 
@@ -83,6 +89,7 @@ export class ActuatorServer {
     this.lazyGroups = options.lazyGroups;
     this.portsTracker = options.portsTracker;
     this.onUserActivatedGroup = options.onUserActivatedGroup;
+    this.onUserClosedGroup = options.onUserClosedGroup;
     this.log = options.log ?? ((line: string) => console.log(line));
   }
 
@@ -228,7 +235,8 @@ export class ActuatorServer {
   /** Push an open_url event for a resolved workspace ref -- projected to
    * its alias in groupBy: "title". Shared by POST /open and the ports
    * watcher (main.ts). Returns the identity it was pushed to. Also marks
-   * the identity attached (createGroups: lazy). */
+   * the identity attached -- the ONLY attachment path in createGroups:
+   * "on-open"; also true in "on-activate", where activation attaches too. */
   pushOpenUrl(target: WorkspaceRef, urlStr: string): ActuatorWorkspace {
     const snapshot = this.currentSnapshot();
     const identity = this.groupProjection.identityFor(target, snapshot);
@@ -269,13 +277,24 @@ export class ActuatorServer {
     if (!ws.data.authed) return; // ignore anything before a valid hello
 
     if (obj.type === "state") {
-      this.log(`[client state] ${JSON.stringify(obj.groups ?? [])}`);
+      // Currently sent only by the extension's tab-group janitor, one entry
+      // per unrecognized (FOREIGN) group it left untouched.
+      const groups = Array.isArray(obj.groups) ? (obj.groups as Array<Record<string, unknown>>) : [];
+      for (const g of groups) {
+        this.log(`janitor: leaving unknown group '${g.title}' (${g.tabCount} tabs)`);
+      }
       return;
     }
 
     if (obj.type === "userActivatedGroup") {
       const id = typeof obj.id === "string" ? obj.id : null;
       if (id) this.onUserActivatedGroup?.(id);
+      return;
+    }
+
+    if (obj.type === "userClosedGroup") {
+      const id = typeof obj.id === "string" ? obj.id : null;
+      if (id) this.onUserClosedGroup?.(id);
     }
   }
 
@@ -293,14 +312,16 @@ export class ActuatorServer {
     const snapshot = this.currentSnapshot();
     const projected = this.groupProjection.projectState(snapshot);
     const workspaces =
-      this.config.createGroups === "lazy"
-        ? this.lazyGroups.filterForSync(projected.workspaces, projected.activeId)
-        : projected.workspaces;
+      this.config.createGroups !== "eager" ? this.lazyGroups.filterForSync(projected.workspaces) : projected.workspaces;
 
     return {
       type: "sync",
       seq: this.seq,
-      config: { collapseOthers: this.config.collapseOthers, closeBehavior: this.config.closeBehavior },
+      config: {
+        collapseOthers: this.config.collapseOthers,
+        closeBehavior: this.config.closeBehavior,
+        janitor: this.config.janitor,
+      },
       state: {
         activeId: projected.activeId,
         workspaces: workspaces.map((w) => ({
@@ -320,20 +341,22 @@ export class ActuatorServer {
 
   /** Broadcast raw per-workspace actuator events (from registry.applyEvent):
    * projects each through groupProjection (alias-collapsed in groupBy:
-   * "title"), marks activated identities attached, applies the lazy
-   * inclusion filter to `workspace.upserted` when createGroups is "lazy",
-   * then broadcasts what remains -- assigning monotonic seq and logging
-   * one line per event actually sent. */
+   * "title"), marks activated identities attached (createGroups:
+   * "on-activate" only -- "on-open" attaches solely via pushOpenUrl),
+   * applies the lazy inclusion filter to `workspace.upserted` unless
+   * createGroups is "eager", then broadcasts what remains -- assigning
+   * monotonic seq and logging one line per event actually sent. */
   broadcast(rawEvents: ActuatorEvent[]): void {
     const snapshot = this.currentSnapshot();
     const projected = rawEvents.flatMap((raw) => this.groupProjection.project(raw, snapshot));
 
-    for (const event of projected) {
-      if (event.name === "workspace.activated") this.lazyGroups.markAttached(event.workspace.id);
+    if (this.config.createGroups !== "on-open") {
+      for (const event of projected) {
+        if (event.name === "workspace.activated") this.lazyGroups.markAttached(event.workspace.id);
+      }
     }
 
-    const activeIdentity = this.groupProjection.currentActiveIdentity(snapshot);
-    const final = this.config.createGroups === "lazy" ? this.lazyGroups.filterEvents(projected, activeIdentity) : projected;
+    const final = this.config.createGroups !== "eager" ? this.lazyGroups.filterEvents(projected) : projected;
 
     for (const event of final) {
       this.seq++;
@@ -362,9 +385,7 @@ export class ActuatorServer {
     const snapshot = this.currentSnapshot();
     const projected = this.groupProjection.projectState(snapshot);
     const projectedWorkspaces =
-      this.config.createGroups === "lazy"
-        ? this.lazyGroups.filterForSync(projected.workspaces, projected.activeId)
-        : projected.workspaces;
+      this.config.createGroups !== "eager" ? this.lazyGroups.filterForSync(projected.workspaces) : projected.workspaces;
 
     return {
       activeId: this.registry.activeId,

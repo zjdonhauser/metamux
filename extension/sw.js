@@ -38,7 +38,7 @@ async function dispatchNow(msg) {
   const { state: next, ops } = reduce(state, msg);
   state = next;
   if (windowId == null) return; // not booted yet; state is still updated for later saveState
-  const followUps = await chromeOps.executeOps(ops, state, { windowId });
+  const followUps = await chromeOps.executeOps(ops, state, { windowId, sendFrame: ws.send });
   for (const fact of followUps) {
     await dispatchNow(fact);
   }
@@ -63,11 +63,28 @@ async function boot() {
     (id) => ws.send({ type: "userActivatedGroup", id }),
   );
   chromeOps.watchGroupRemap(() => state, /** @type {number} */ (windowId), dispatch);
+  chromeOps.watchGroupRemoved(
+    () => state,
+    /** @type {number} */ (windowId),
+    dispatch,
+    (id) => ws.send({ type: "userClosedGroup", id }),
+  );
 
   chrome.alarms.create(HEARTBEAT_ALARM, { periodInMinutes: HEARTBEAT_PERIOD_MINUTES });
 
   ws.connect({
-    onMessage: dispatch,
+    onMessage: async (msg) => {
+      // Janitor: attach a live tab-group enumeration to every "sync" frame
+      // before dispatch, so classifyJanitor's pure classification runs as
+      // part of every sync reconciliation (docs/protocol.md, "Extension
+      // behavior"). Gathering the snapshot is chrome-ops's job -- the
+      // reducer stays pure and only ever sees it as data on the message.
+      if (msg && msg.type === "sync" && windowId != null) {
+        const janitorGroups = await chromeOps.scanTabGroups(windowId);
+        msg = { ...msg, janitorGroups };
+      }
+      dispatch(msg);
+    },
     onStatus: (status) => {
       chrome.storage.local.set({ metamuxStatus: { ...status, at: Date.now() } });
     },

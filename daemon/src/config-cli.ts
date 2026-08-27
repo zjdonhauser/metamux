@@ -14,6 +14,13 @@ export const CONFIG_ALLOWED_KEYS = [
   "ports.mode",
   "ports.ignore",
   "ports.maxPort",
+  "tmux.enabled",
+  "tmux.mirror",
+  "tmux.alphabetize",
+  "tmux.reattachGraceMs",
+  "tmux.spawnCwd",
+  "janitor",
+  "colorBackflow",
 ] as const;
 
 export type ConfigKey = (typeof CONFIG_ALLOWED_KEYS)[number];
@@ -45,6 +52,8 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
       return typeof value === "number" ? { ok: true } : { ok: false, error: `${key} must be a number` };
     case "reverseSync":
     case "collapseOthers":
+    case "janitor":
+    case "colorBackflow":
       return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };
     case "closeBehavior":
       return value === "archive" || value === "close"
@@ -63,9 +72,25 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
         ? { ok: true }
         : { ok: false, error: `${key} must be "title" or "workspace"` };
     case "createGroups":
-      return value === "lazy" || value === "eager"
+      // Strict to the current 3 values -- "lazy" is tolerated only when
+      // READING an existing config file (config.ts's loadConfig), not for
+      // a fresh write here; guide callers to the current vocabulary.
+      return value === "on-open" || value === "on-activate" || value === "eager"
         ? { ok: true }
-        : { ok: false, error: `${key} must be "lazy" or "eager"` };
+        : { ok: false, error: `${key} must be "on-open", "on-activate", or "eager"` };
+    case "tmux.enabled":
+    case "tmux.alphabetize":
+      return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };
+    case "tmux.mirror":
+      return value === "windows" || value === "global"
+        ? { ok: true }
+        : { ok: false, error: `${key} must be "windows" or "global"` };
+    case "tmux.reattachGraceMs":
+      return typeof value === "number" ? { ok: true } : { ok: false, error: `${key} must be a number` };
+    case "tmux.spawnCwd":
+      return typeof value === "string" && value.length > 0
+        ? { ok: true }
+        : { ok: false, error: `${key} must be a non-empty string` };
   }
 }
 

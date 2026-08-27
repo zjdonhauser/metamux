@@ -18,11 +18,24 @@ All components conform to this file. Change this file first, code second.
     "collapseOthers": true,
     "debounceMs": 200,
     "groupBy": "title",                // "title" | "workspace" -- see Grouping
-    "createGroups": "lazy"             // "lazy" | "eager" -- see Grouping
+    "createGroups": "on-open",         // "on-open" | "on-activate" | "eager" -- see Grouping
+    "tmux": {                          // see "tmux source + cmux actuator" below
+      "enabled": false,
+      "mirror": "windows",             // "windows" | "global"
+      "alphabetize": true,
+      "reattachGraceMs": 8000,
+      "spawnCwd": "~/Documents/GitHub"
+    },
+    "colorBackflow": true              // see "Color backflow" below
   }
   ```
-  All fields optional; defaults above. `~` expansion required. `ports.*` and `reverseSync` are
-  also valid top-level keys -- see their own sections below.
+  All fields optional; defaults above. `~` expansion required. `ports.*`, `reverseSync`, and
+  `janitor` (default `true` -- extension-side tab-group janitor, "Extension behavior" below)
+  are also valid top-level keys -- see their own sections below. `tmux.mirror` falls back to the
+  `TMUX_CMUX_MIRROR` env var (tmux-cmux-sync compatibility) only when `tmux.mirror` is absent
+  from the file; an explicit file value always wins. A config file written before the
+  `createGroups` rename below and still saying `"lazy"` is read as `"on-activate"`, its exact
+  behavioral successor.
 
 ## cmux source (input)
 
@@ -50,17 +63,21 @@ interface WorkspaceRef {
   id: string;            // "mw_" + 8 random hex; stable forever
   title: string;
   cwd: string | null;
-  source: "cmux";
-  sourceId: string;      // cmux workspace UUID (per-boot stable)
+  source: "cmux" | "tmux";
+  sourceId: string;      // cmux workspace UUID (per-boot stable), OR tmux #{session_id} ("$N", stable across a rename) -- see "tmux source + cmux actuator"
   archived: boolean;
-  cmuxColor: string | null;  // resolved "#RRGGBB" hex, or null if never set/cleared
-  attachedAt: string | null; // ISO, set on first activation/open_url -- see Grouping (createGroups: lazy)
+  cmuxColor: string | null;  // resolved "#RRGGBB" hex, or null if never set/cleared (cmux-sourced refs only)
+  attachedAt: string | null; // ISO, set on first attachment (open_url always; activation too in createGroups: "on-activate"), null again after a userClosedGroup detach -- see Grouping
+  paintedColor: string | null; // hex backflow itself last painted, or null -- see "Color backflow"
   updatedAt: string;     // ISO
 }
 ```
 
-Re-bind on upsert: match by (source, sourceId); else by (title, cwd) among archived+live; else create new.
-`workspace.closed` sets `archived: true` (never delete). `workspace.renamed`/`selected` refresh title/cwd. Selected also sets registry-level `activeId` and calls `markAttached` (idempotent, first call wins) on the ref. `activateBySourceId` (window follow) does the same.
+Re-bind on upsert: match by (source, sourceId); else by (title, cwd) AMONG REFS OF THE SAME SOURCE, archived+live; else create new.
+The same-source scoping on the title/cwd fallback is required once `source: "tmux"` refs exist: a
+tmux session and an unrelated cmux tab can legitimately share a title, and without the scope they
+would wrongly re-bind to the same ref.
+`workspace.closed` sets `archived: true` (never delete). `workspace.renamed`/`selected` refresh title/cwd. Selected also sets registry-level `activeId`, and -- only when `Registry.attachOnActivate` is true (`createGroups: "on-activate"`; false for `"on-open"`; see Grouping) -- calls `markAttached` (idempotent, first call wins) on the ref. `activateBySourceId` (window follow) is gated the same way. `open_url` (server.ts's `pushOpenUrl`) always calls `markAttached`, regardless of the flag -- see Grouping.
 A `colored` event resolves its raw color (hex or named cmux.json slot, via a `namedSlots` table injected into the Registry at construction, read once from `~/.config/cmux/cmux.json`) and sets `cmuxColor` on the matching ref (found by sourceId only -- a color change carries no title/cwd to re-bind against); no-op if the workspace is unknown. Either way, `workspace.upserted` fires so the extension re-applies the group color (it already updates color on `ensureGroup`).
 Startup backfill: `set_color`/`clear_color` only appear in the JSONL log from whenever the daemon started tailing, so a color set earlier never shows up as an event. When socket features are on, right after seeding the daemon asks cmux directly (`cmux rpc window.list` + `workspace.list` per window) for every workspace's current `custom_color` and applies it once via the same path.
 
@@ -86,7 +103,13 @@ Then pushes events (monotonic `seq`, client ignores `seq <= lastSeen`):
 {"type":"event","seq":126,"name":"workspace.archived","workspace":{...}}
 {"type":"event","seq":127,"name":"open_url","workspace":{...},"url":"https://..."}
 ```
-Client MAY send `{"type":"state","groups":[{"title":"...","tabCount":3}]}` reports; server logs them.
+Client MAY send `{"type":"state","groups":[{"title":"...","tabCount":3}]}` reports; server logs them
+(sent by the extension's tab-group janitor, one entry per unrecognized FOREIGN group it left
+untouched -- server logs each as `janitor: leaving unknown group '<title>' (N tabs)`).
+
+Client MAY send `{"type":"userClosedGroup","id":"mw_..."}` (detach-on-close, see Grouping) when the
+user closes a MANAGED group by hand. No reply frame; the daemon clears attachment and the next
+sync reconciliation stops including it.
 
 `color`: one of Chrome's 9 tabGroups colors, `["grey","blue","red","yellow","green","pink","purple","cyan","orange"]`.
 When a workspace's `cmuxColor` is set, map it HUE-FIRST (humans classify color by hue, not raw RGB distance -- a dark, desaturated navy IS blue to a person even though it sits numerically closer to a dark green/grey swatch under Euclidean RGB):
@@ -103,10 +126,12 @@ When `cmuxColor` is unset (or unresolvable), fall back to a deterministic hash o
 - `GET /status?token=...` → `{"ok":true,"clients":1,"lastSeq":127,"activeId":"mw_...","workspaces":9,"cursor":{...},"skippedLines":0}`
 - `GET /state?token=...` → full registry JSON.
 
-## Grouping: groupBy + createGroups (2026-08-27, afternoon)
+## Grouping: groupBy + createGroups (2026-08-27, afternoon; createGroups reworked 2026-08-27 evening)
 
-Config: `"groupBy": "title" | "workspace"` (default `"title"`), `"createGroups": "lazy" | "eager"`
-(default `"lazy"`). Both hot-reloadable; a change pushes a fresh `sync` frame to every client.
+Config: `"groupBy": "title" | "workspace"` (default `"title"`),
+`"createGroups": "on-open" | "on-activate" | "eager"` (default `"on-open"`). Both hot-reloadable;
+a change pushes a fresh `sync` frame to every client. A legacy `"lazy"` value in an existing
+config file reads as `"on-activate"`.
 
 Both live entirely in a wire-projection layer between the Registry and the actuator wire
 (`daemon/src/group-projection.ts`, `daemon/src/lazy-groups.ts`) -- the Registry itself is
@@ -140,26 +165,76 @@ sharing a title alias to ONE canonical actuator identity before anything reaches
 `groupBy: "workspace"` is pass-through: one identity per real workspace, the pre-grouping
 behavior, unchanged.
 
-### createGroups: lazy
+### createGroups: on-open / on-activate / eager
 
 An identity (alias id in `groupBy: "title"`, real workspace id in `"workspace"`) is "attached"
-once it's been ACTIVATED or targeted by `open_url` at least once. In `createGroups: "lazy"`:
-- The sync frame's `state.workspaces` and any `workspace.upserted` event only include identities
-  that are the CURRENT active one or have ever been attached. `workspace.activated` and
-  `workspace.archived` always pass through regardless (an archive of something never attached is
-  a harmless no-op for the extension).
-- Prevents 40+ groups materializing on first connect just because the registry has seen that
-  many workspaces historically.
+once it's been marked so. What attaches it depends on the mode:
 
-`createGroups: "eager"` includes everything -- the pre-lazy behavior.
+- **`on-open`** (default): attachment happens ONLY via `open_url` (`server.ts`'s `pushOpenUrl`).
+  Activation (a `selected`/window-follow event) and mere activity never attach anything.
+  Result: a group is only ever created carrying a real tab -- switching to a workspace that was
+  never opened shows no group at all, even transiently. Zac's original complaint about "lazy"
+  ("still spawns empty groups because ACTIVATION attaches") is what this mode fixes.
+- **`on-activate`**: the exact behavioral successor to the old `"lazy"` value -- activation
+  ALSO attaches (`Registry.attachOnActivate: true`, the default for any caller that doesn't set
+  it explicitly), so switching to a workspace shows its (possibly empty) group immediately, same
+  as before this rework.
+- **`eager`**: includes everything regardless of attachment, unchanged.
+
+In both `on-open` and `on-activate` (anything but `eager`): the sync frame's `state.workspaces`
+and any `workspace.upserted` event only include identities that have ever been attached -- there
+is no "or currently active" exception (removed in the on-open rework: it used to leak an
+unattached-but-active identity's group into the very next sync, and into the SAME broadcast batch
+as a brand-new workspace's first upserted+activated pair). `workspace.activated` and
+`workspace.archived` still always pass through regardless of attachment -- an archive of
+something never attached is a harmless no-op for the extension, and a bare `workspace.activated`
+for an unattached identity is provably safe: it never carries `ensureGroup`, and the extension's
+`activate()` op is a no-op whenever the byId entry it targets has `groupId: null`, which is
+exactly the case for something never attached (this was evaluated against the alternative --
+daemon-side filtering the event instead -- and rejected: filtering would make `metamux current`/
+`GET /status`/the MCP tools' notion of "what's active" lag reality for no benefit, since the
+client-side no-op is already free).
 
 Attachment is PERSISTED on `WorkspaceRef.attachedAt` so a daemon restart does not re-hide groups
 the user already had open (the extension's offline-archive sync rule would otherwise collapse
-them the moment lazy mode re-hid their identities -- a restart must not reshuffle the browser).
-Alias-level attachment ("any member attached") falls out of that for free: on daemon start, the
-in-memory lazy tracker is seeded from every ref's persisted `attachedAt`, projected through the
-same `groupBy`-aware identity mapping used everywhere else, so a single attached member seeds
-the whole alias.
+them the moment a mode re-hid their identities -- a restart must not reshuffle the browser). This
+also means a config file carried over from the "lazy" era, with its existing attachedAt values,
+switches cleanly to `on-open`'s default: everything the user had already attached (via a past
+activation) stays visible; only NEW, never-before-attached identities get the stricter treatment
+going forward. Alias-level attachment ("any member attached") falls out of persistence for free:
+on daemon start, the in-memory lazy tracker is seeded from every ref's persisted `attachedAt`,
+projected through the same `groupBy`-aware identity mapping used everywhere else, so a single
+attached member seeds the whole alias. `Registry.attachOnActivate` itself is set from config
+immediately after construction, BEFORE the startup seed replay (a replay pushes historical
+`selected` events through the registry too; setting it any later would re-stamp `attachedAt` for
+everything with a history on every restart, silently reverting `on-open` to attach-everything).
+
+### Detach-on-close
+
+The extension watches `chrome.tabGroups.onRemoved` for the metamux window. When a MANAGED group
+is removed by the user (drag to trash, right-click "close group", closing its last tab by hand --
+including a cross-window drag-out, indistinguishable here from a close, consistent with "never
+manage groups in other windows") and it was NOT one of the extension's own removals, it sends
+`{"type":"userClosedGroup","id":"..."}` (Wire protocol, above) and locally invalidates its own
+cached `groupId` for that identity (same correction `archiveGroup`'s `"close"` behavior makes for
+itself). The daemon resolves `id` to every real `WorkspaceRef` composing it (all members sharing
+an alias's title in `groupBy: "title"`, not just the currently-active one -- otherwise a still-
+attached sibling would keep the alias included via the union rule above) and clears `attachedAt`
+on each, plus the in-memory lazy tracker. The underlying workspace(s) stay live/unarchived --
+detach only un-attaches the group; the next activation (in `on-activate`) or `open_url` (in
+either mode) reattaches and recreates it from scratch.
+
+**Echo suppression:** the extension's own group-dissolving ops -- `archiveGroup`'s `"close"`
+behavior, the janitor's `mergeGroup`/`closeGroup` (see Extension behavior, tab-group janitor) --
+mark the groupId they're about to remove in a short-lived, per-groupId map (1500ms) before acting;
+`onRemoved` checks that map first and drops the echo rather than reporting a self-inflicted
+removal as a user close.
+
+**Interplay with the janitor:** the janitor can only classify a scanned group as CANONICAL/
+DUPLICATE against a title the extension already has in `byId` -- in `on-open` mode that's exactly
+the set of identities ever attached (or transiently activated this session; see the reducer test
+suite for that one documented edge). A title truly unknown to the client is orphan/foreign,
+dissolved like any other leftover -- nothing is ever resurrected.
 
 ### Reverse sync alias resolution
 
@@ -179,8 +254,9 @@ the whole alias.
 - `workspace.upserted`: ensure a group exists (create one background `chrome://newtab` tab, `tabs.group` it, set title+color, collapse). Rename = `tabGroups.update({title})` and mapping key update.
 - `workspace.activated`: expand the group, activate `lastActiveTabId` (fallback: first tab in group) via `tabs.update(tabId, {active:true})`. If `collapseOthers`, collapse every other managed group. **NEVER call `chrome.windows.update({focused:true})`** (F3, hard rule).
 - `workspace.archived`: `closeBehavior === "archive"` → collapse + `tabGroups.move({index:-1})`; `"close"` → remove the group's tabs.
-- `open_url`: `tabs.create({windowId, url, active:true})` then group into target group. Do not focus the window.
+- `open_url`: `tabs.create({windowId, url, active:true})` then group into target group, creating one around the new tab if none exists yet -- never a separate `chrome://newtab` placeholder (that pattern is `ensureGroup`-only). In `createGroups: "on-open"`, this is often the identity's first-ever appearance client-side; the reducer establishes its `byId` entry (from the event's own title/color) before emitting the op, so there's always something to create the group around. Do not focus the window.
 - Track `lastActiveTabId` per group via `tabs.onActivated` (only for tabs in the metamux window).
+- Detach-on-close: `chrome.tabGroups.onRemoved`, metamux window only -- see Grouping, "Detach-on-close" for the full echo-suppression + daemon-resolution contract.
 - WS client with exponential backoff (500ms → 10s cap), `chrome.alarms` every 30s as resurrection heartbeat, reconnect sends `hello` again and reconciles from the fresh `sync` snapshot.
 - Options page: inputs for port + secret, saved to `storage.local`; a "Test connection" button.
 - Structure: `reducer.js` is PURE (state + event → list of chrome-op descriptors, e.g. `{op:"activateTab",tabId}`); `chrome-ops.js` executes descriptors; `sw.js` is thin glue. The reducer is unit-tested in Bun with a fake chrome adapter.
@@ -267,6 +343,181 @@ Register in Claude Code: `claude mcp add metamux -- bun <repo>/cli/metamux.ts mc
 
 `scripts/install-launchd.sh` + `scripts/com.metamux.daemon.plist` template (bun path resolved
 at install time). Socket features degrade gracefully under launchd (no cmux env): tail-only.
+
+## tmux source + cmux actuator (2026-08-27, tmux absorption)
+
+Absorbs `~/bin/tmux-cmux-sync` into metamuxd as a second source (tmux) and a second actuator
+(cmux tabs), per `docs/tmux-port-plan.md` -- one program instead of two. Off by default
+(`tmux.enabled: false`); every piece below is inert until it's turned on.
+
+### Registry model
+
+A tmux session is a first-class `WorkspaceRef`: `source: "tmux"`, `sourceId` = the session's
+`#{session_id}` ("$N" form, stable across a `tmux rename-session` for the life of the tmux
+server -- NOT `#{session_name}`, which is the mutable title), `title` = the session name. The
+cmux tabs that mirror a session across windows (`tmux.mirror: "windows"`) are NOT separate
+registry members -- they're tracked as actuator-owned attachments (window id -> tab id), the
+same way `PortsTracker`/`LazyGroupTracker` hold feature-specific side-state next to the Registry
+rather than on it. This makes the Chrome-group dedupe for a tmux session STRUCTURAL: one ref,
+one group, no `groupBy: "title"` hash-collapsing needed for tmux-backed refs (that projection
+stays in effect, unchanged, for incidental same-title collisions among plain cmux workspaces).
+
+`Registry.applyTmuxIntent({type: "upsertTmuxRef"|"archiveTmuxRef", sessionId, sessionName?})`
+mirrors `applyEvent`'s upsert/archive shape for tmux-sourced refs -- emitted every reconcile
+tick for every live session touched, idempotent by construction (same "did anything actually
+change" check `upsert` already uses for cmux refs).
+
+### tmux source adapter (`daemon/src/tmux-source.ts`)
+
+Polling, not tmux hooks (`session-created`/`session-renamed`/`session-closed` are available on
+tmux 3.6a, but persisting them means writing to `~/.tmux.conf`, a materially bigger footprint
+than anything else metamux touches, for a latency win nothing here needs -- plan §2.3). Every
+poll:
+- `tmux list-sessions -F session_id\tsession_name\tsession_attached` -> `{id, name, attached}[]`.
+- The content-based host join (`tmux list-clients` + `ps eww` for `CMUX_WORKSPACE_ID=`, exactly
+  as tmux-cmux-sync's `host_map()`, plan §1.5) -> `Map<cmuxWorkspaceUUID, tmuxSessionId>`. Never
+  title-based -- correct even when cmux has auto-retitled a tab.
+
+Tolerant of tmux being absent or having no running server: every function returns `[]`/`Map()`
+rather than throwing.
+
+### cmux actuator (`daemon/src/cmux-actuator.ts`)
+
+Direct `cmux <subcommand>` CLI calls (not `cmux rpc`) for the actions tmux-cmux-sync already
+proved live: `new-workspace` (spawn), `workspace-action --action rename` (title lock),
+`send`+`send-key Enter` (reattach), `close-workspace` (reap), `reorder-workspace`
+(alphabetize), `workspace-action --action set-color/clear-color` (crosswin badges -- ported
+as the tab-color version, not the orphaned `set-status`/pill script; see plan §1.8/§4).
+`listWindows()` reuses `cmux-rpc.ts`'s `rpc("window.list")`. Session names are validated
+(`isSafeSessionName`, alnum/space/dash/underscore only) before being interpolated into any
+`tmux new -A -s <name>` command string -- tmux-cmux-sync never did this (plan §1.10/§4);
+an unsafe name fails the action rather than building it.
+
+### Reconcile (`daemon/src/tmux-reconcile.ts`, pure)
+
+One function, `reconcile(input) -> {actions, registryIntents, nextState}`, ported faithfully
+from `tick.py`'s LIVE behavior (the bash reimplementation of the same logic is dead code,
+never called -- plan §1.1) for both mirror modes:
+
+- **`windows`** (default): every cmux window mirrors every tmux session. Per window: a hosted
+  tab (host map confirms it) gets title-locked to the session name if drifted; an unhosted tab
+  titled for a live session is reattached, throttled by `reattachGraceMs`; a session missing
+  from the window is spawned; tabs are alphabetized (pinned stay put) with zero reorder calls
+  when already sorted. A dead window drops its state with no close calls; a dead session's
+  tracked tab is explicitly reaped.
+- **`global`**: one tab per session across all windows; only sessions attached nowhere are
+  surfaced. Reattach-after-restore is implemented here too (the original tool's Python
+  `tick_global` never had it, only its dead bash twin did -- plan §1.6; this is a deliberate
+  fix, not bug-for-bug parity). A tab already titled correctly but untracked is left alone,
+  never adopted -- faithfully preserving that specific quirk of the original.
+
+Identity is id-keyed throughout (tmux `#{session_id}`), not name-keyed like `tick.py` -- since
+a session's id and name are always 1:1 at any single tick this changes no spawn/retitle/reap
+decision, it only makes state and registry intents survive a mid-flight rename instead of
+looking like a kill+recreate.
+
+`reattachGraceMs` unifies the original tool's two separately-named throttles
+(`TMUX_CMUX_GRACE` for global mode, `TMUX_CMUX_REATTACH_GRACE` for windows mode) into one
+config value.
+
+### Wiring
+
+Socket-gated like the ports watcher: window/tab listing and every actuator action go through
+the `cmux` CLI, which needs the same cmux-shell auth `cmux rpc` does. Polls every 2s (matching
+`tmux-cmux-sync`'s own `TMUX_CMUX_INTERVAL` default) on an unconditional timer -- like the
+socket-recovery probe, the timer itself always runs; `pollTmux`'s own `config.tmux.enabled` and
+socket-health checks are what actually gate it, so `tmux.enabled` is truly hot-reloadable with
+no separate timer start/stop logic. `nextState` (window/global attachments + reattach-attempt
+timestamps) is this poller's own in-memory cache, rebuilt fresh from live tmux+cmux state every
+tick -- never persisted, same "cache not ledger" philosophy as the original's state files.
+
+Self-event-loop: the actuator's own `new-workspace`/`workspace-action rename`/etc. calls
+generate ordinary `workspace.created`/`workspace.action(rename)` lines in the SAME
+`~/.cmuxterm/events.jsonl` the daemon already tails -- this is the exact reason the 500ms
+created→selected suppression rule (Rules, above) exists; absorbing tmux-cmux-sync makes
+metamuxd the direct cause of what used to be an external actor's side effect, not a new
+problem.
+
+### Config
+
+`"tmux": {"enabled": false, "mirror": "windows"|"global", "alphabetize": true,
+"reattachGraceMs": 8000, "spawnCwd": "~/Documents/GitHub"}`. All five keys hot-reloadable.
+Toggling `tmux.enabled` false->true live triggers the same one-time migration a fresh startup
+gets (below), not just a resume.
+
+### State migration (one-time, idempotent)
+
+At startup (and on a live `tmux.enabled` false->true toggle), if tmux is enabled and socket
+features are live: read `~/.local/state/tmux-cmux-sync.json` (windows-mode shape only --
+`{windowUUID: {sessionName: cmuxWorkspaceUUID}}`; the global-mode shape parses to nothing to
+migrate rather than erroring, since Zac's install has only ever run windows mode), resolve
+each session NAME to its current live `#{session_id}`, then for each live session: reclassify
+ONE of its cmux tabs (the one tmux-cmux-sync's own state names) into the tmux-sourced ref of
+record via `Registry.reclassifyAsTmux` -- preserving that ref's `mw_` id, and therefore its
+paired Chrome group -- and archive every OTHER cmux tab that mirrored the same session in a
+different window via `Registry.archiveBySourceId` (the tab itself is untouched; it's no longer
+an independent registry identity, it becomes an actuator-tracked attachment). Idempotent: a
+second run finds nothing to reclassify (the ref's `source` is already `"tmux"`), so no separate
+"already migrated" marker is needed -- this runs unconditionally every time the gate is true.
+
+## Color backflow (2026-08-27)
+
+Paints a cmux tab's own color to match its Chrome group's color, so the two visually agree at a
+glance ("a colored flag that matches the color of the browser tab the cmux tab relates to" --
+Zac). Config: `"colorBackflow": true` (default), hot-reloadable. Socket-gated (needs `cmux
+workspace-action set-color`); polls every 5s, same unconditional-timer-with-internal-gate shape
+as the tmux poller above.
+
+**Only acts on the title-hash fallback.** Backflow never invents a color for an identity the
+user already colored -- for every identity (in `groupBy: "title"`, every member sharing a
+title; in `"workspace"`, the ref itself), if ANY live member has a real `cmuxColor`, that
+identity is untouched by backflow entirely. Only when every live member's `cmuxColor` is null
+(the identity's Chrome-group color is purely the title hash) does backflow paint anything, and
+it paints EVERY member's cmux tab, not just one.
+
+**Never overwrites a user-set color.** `WorkspaceRef.paintedColor` (Registry section, above)
+tracks the hex backflow itself last painted. A ref is eligible for backflow to act on unless it
+carries a real color that ISN'T what backflow last painted there (`cmuxColor !== null &&
+cmuxColor !== paintedColor`) -- that specific combination is the only signature a user-set color
+can produce, since backflow never writes `cmuxColor` directly (only the tailed `colored` event
+does, whether it's reporting the user's action or backflow's own echo).
+
+- **Never painted** (`cmuxColor: null, paintedColor: null`) -> paint.
+- **User cleared a color backflow had painted** (`cmuxColor: null, paintedColor: <hex>`) ->
+  repaint (treated the same as never-painted -- the eligibility check doesn't distinguish them).
+- **Already matches the target** (`cmuxColor === target`) -> skip, no redundant `set-color` call.
+- **Carries backflow's own stale paint** (`cmuxColor === paintedColor`, but the target changed
+  since -- e.g. the identity gained/lost a member) -> repaint to the new target.
+- **User set a real color** (`cmuxColor !== null && cmuxColor !== paintedColor`) -> skip,
+  permanently, until the user clears it. Mirrors into Chrome exactly as any other `colored`
+  event already does -- backflow doesn't change that pipeline at all, it only stops trying to
+  paint that one tab.
+
+**Loop safety.** `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` (all 9 Chrome colors, including
+grey) is, by construction, a FIXED POINT of `nearestChromeGroupColor`: painting a ref with
+`CHROME_GROUP_REPRESENTATIVE_HEX[X]` produces a `colored` event that resolves back to the same
+`X` through the daemon's own color pipeline, so a backflow-painted color never triggers a
+different downstream color and can't chase itself in a repaint loop. Proven directly in
+`colors.test.ts`. Dedupe (`already-matches`, above) additionally means a converged identity
+issues zero `set-color` calls per poll, not just "eventually stops."
+
+`WorkspaceRef.paintedColor` is persisted (survives a daemon restart) for the same reason
+`attachedAt` is -- without it, every restart would forget what backflow owns and misclassify
+every previously-painted tab as user-owned on the very next poll.
+
+### Crosswin interplay (decision, not yet built)
+
+tick.py's crosswindow-badge indicator (plan §1.8) also colors a tab -- if it's ever ported, it
+and backflow would both want to own the same cmux tab's `custom_color`, and layering a
+TRANSIENT signal ("this session is selected in another window right now") on top of backflow's
+PERSISTENT one via the same field is fragile: it requires exact save/restore bookkeeping, and is
+race-prone if a backflow poll fires while crosswin's override is active. **Decision: when
+crosswin is eventually built, it must NOT use tab color.** It needs its own, different visual
+channel -- `cmux set-status` (the original crosswin.py's approach, before it was informally
+superseded by the tab-color version specifically because status pills weren't rendering in
+Zac's sidebar config at the time -- worth re-verifying whether that's still true) or something
+else entirely. Crosswin stays deferred (plan/BUILD-STATUS) until a non-color channel is
+confirmed workable; it will never be built as a second writer of `custom_color`.
 
 ## Testing conventions
 

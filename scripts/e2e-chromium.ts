@@ -1,23 +1,41 @@
 #!/usr/bin/env bun
 // Real-Chromium end-to-end smoke test for the metamux extension.
-// Spawns the daemon, launches the cached Playwright Chromium with the
-// extension loaded unpacked, drives the options page, then flicks a real
-// cmux workspace switch and asserts the tab groups follow it.
+// Spawns an ISOLATED daemon (own port, own state dir, own config -- see
+// "Isolation" below), launches the cached Playwright Chromium with the
+// extension loaded unpacked, drives the options page, then exercises
+// createGroups: "on-open" (activation creates no group; POST /open does)
+// and the tab-group janitor (a pre-created duplicate merges away) against
+// it.
 //
 // NEVER touches Zac's real Google Chrome or its profile: only the cached
 // Playwright Chromium build, in a throwaway profile dir under /tmp.
 //
+// Isolation: the daemon this script spawns NEVER shares a port, state dir,
+// or config file with Zac's real, already-running daemon (zshrc-ensured).
+// A prior version of this script silently failed to bind port 8377 and
+// rode whatever was already listening there -- almost always his live
+// daemon, stale relative to the code under test, and a real system to not
+// disrupt. METAMUX_PORT / METAMUX_STATE_DIR / METAMUX_CONFIG_PATH (see
+// daemon/src/paths.ts, daemon/src/config.ts) give this script a genuinely
+// separate daemon instance. The live daemon's PID is asserted UNCHANGED
+// before and after this script runs, as direct proof of zero contact.
+//
+// `cmux rpc workspace.next`/`workspace.previous` still touch Zac's REAL
+// cmux workspace focus (read-only from this daemon's perspective -- it
+// only tails the same events.jsonl, same as before isolation) and are
+// restored at the end, same as every prior version of this script.
+//
 // Usage: bun scripts/e2e-chromium.ts
 
 import { chromium } from "playwright-core";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir, homedir } from "node:os";
+import net from "node:net";
 import path from "node:path";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const EXTENSION_DIR = path.join(REPO_ROOT, "extension");
-const SECRET_PATH = path.join(homedir(), ".local/state/metamux/secret");
-const PORT = 8377;
+const DAEMON_ENTRY = path.join(REPO_ROOT, "daemon/src/main.ts");
 const CHROMIUM_EXECUTABLE = path.join(
   homedir(),
   "Library/Caches/ms-playwright/chromium-1234/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
@@ -40,11 +58,48 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForStatus(secret: string, timeoutMs = 10000): Promise<any> {
+function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === "object" && address ? address.port : null;
+      server.close(() => (port ? resolve(port) : reject(new Error("could not determine a free port"))));
+    });
+    server.on("error", reject);
+  });
+}
+
+/** PIDs of every process whose command line contains this repo's daemon
+ * entrypoint -- used to prove zero contact with Zac's real, already-
+ * running daemon (same PID set before and after this script runs). */
+async function daemonPids(): Promise<string[]> {
+  const proc = Bun.spawnSync(["pgrep", "-f", DAEMON_ENTRY]);
+  const out = new TextDecoder().decode(proc.stdout).trim();
+  return out ? out.split("\n").sort() : [];
+}
+
+/** True if something is already answering on this specific port -- any
+ * response counts, even a 401, since that still proves a listener is
+ * there. A defense-in-depth double-check after getFreePort(): the
+ * probe-then-bind window is a real (if narrow) TOCTOU race, and this
+ * script must never silently ride a listener it didn't spawn itself
+ * (isolation's entire point). */
+async function portAlreadyInUse(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/status`, { signal: AbortSignal.timeout(500) });
+    void res.status;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForStatus(port: number, secret: string, timeoutMs = 10000): Promise<any> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${PORT}/status?token=${secret}`);
+      const res = await fetch(`http://127.0.0.1:${port}/status?token=${secret}`);
       if (res.ok) return await res.json();
     } catch {
       // daemon not up yet
@@ -54,38 +109,94 @@ async function waitForStatus(secret: string, timeoutMs = 10000): Promise<any> {
   throw new Error(`daemon /status did not respond within ${timeoutMs}ms`);
 }
 
-async function getState(secret: string): Promise<any> {
-  const res = await fetch(`http://127.0.0.1:${PORT}/state?token=${secret}`);
-  if (!res.ok) throw new Error(`GET /state failed: ${res.status}`);
-  return res.json();
-}
-
 async function main() {
   let daemonProc = null;
   let context = null;
   let tmpProfileDir = null;
+  let tmpStateDir = null;
+  let tmpConfigDir = null;
+
+  const livePidsBefore = await daemonPids();
+  console.log(`live daemon PID(s) before this run: [${livePidsBefore.join(", ") || "none"}]`);
 
   try {
-    const secret = (await readFile(SECRET_PATH, "utf8")).trim();
+    // --- Isolation setup: own port, own state dir, own config. ---
+    const port = await getFreePort();
+    if (await portAlreadyInUse(port)) {
+      throw new Error(`port ${port} (just probed free) is already answering -- refusing to silently ride an unknown listener. Re-run.`);
+    }
+    tmpStateDir = await mkdtemp(path.join(tmpdir(), "metamux-e2e-state-"));
+    tmpConfigDir = await mkdtemp(path.join(tmpdir(), "metamux-e2e-config-"));
+    const configPath = path.join(tmpConfigDir, "config.json");
+    // Every behavior-relevant key this e2e depends on is explicit here,
+    // not left to DEFAULT_CONFIG, so it keeps testing today's code
+    // deterministically even if a default drifts later. collapseOthers:
+    // false is ALSO deliberate and load-bearing: this daemon still tails
+    // Zac's REAL, live events.jsonl (isolation covers port/state/config,
+    // not the event source), so an unrelated background workspace
+    // activation elsewhere is a real, observed possibility during this
+    // script's run -- with collapseOthers on, that would legitimately
+    // (and correctly) collapse the very group this script just opened,
+    // making the "is it expanded" assertion flaky for reasons that have
+    // nothing to do with the code under test.
+    await writeFile(
+      configPath,
+      JSON.stringify({ createGroups: "on-open", groupBy: "title", janitor: true, collapseOthers: false }),
+    );
 
-    console.log("--- starting daemon ---");
-    daemonProc = Bun.spawn(["bun", "daemon/src/main.ts"], {
+    console.log(`--- starting ISOLATED daemon (port ${port}, state dir ${tmpStateDir}) ---`);
+    daemonProc = Bun.spawn(["bun", DAEMON_ENTRY], {
       cwd: REPO_ROOT,
       stdout: "pipe",
       stderr: "pipe",
+      env: {
+        ...process.env,
+        METAMUX_PORT: String(port),
+        METAMUX_STATE_DIR: tmpStateDir,
+        METAMUX_CONFIG_PATH: configPath,
+      },
     });
-    const status = await waitForStatus(secret);
-    console.log("daemon /status:", JSON.stringify(status));
+
+    // The isolated daemon generates its own secret on first start, under
+    // its own isolated state dir -- wait for it rather than assuming a
+    // fixed delay.
+    const secretPath = path.join(tmpStateDir, "secret");
+    const secretDeadline = Date.now() + 10000;
+    let secret = "";
+    while (Date.now() < secretDeadline) {
+      try {
+        secret = (await readFile(secretPath, "utf8")).trim();
+        if (secret) break;
+      } catch {
+        // not written yet
+      }
+      await sleep(100);
+    }
+    if (!secret) throw new Error(`isolated daemon never wrote a secret to ${secretPath}`);
+
+    void (async () => {
+      if (!daemonProc?.stdout) return;
+      for await (const chunk of daemonProc.stdout as ReadableStream<Uint8Array>) {
+        process.stdout.write(`[daemon] ${new TextDecoder().decode(chunk)}`);
+      }
+    })();
+
+    const status = await waitForStatus(port, secret);
+    console.log("isolated daemon /status:", JSON.stringify(status));
+
+    const livePidsDuring = await daemonPids();
+    record(
+      "the live daemon's PID is still present and unchanged after spawning the isolated one",
+      livePidsBefore.length === 0 || livePidsBefore.every((p) => livePidsDuring.includes(p)),
+      `before=[${livePidsBefore.join(",")}], during=[${livePidsDuring.join(",")}]`,
+    );
 
     console.log("--- launching Chromium with extension loaded ---");
-    tmpProfileDir = await mkdtemp(path.join(tmpdir(), "metamux-e2e-"));
+    tmpProfileDir = await mkdtemp(path.join(tmpdir(), "metamux-e2e-profile-"));
     context = await chromium.launchPersistentContext(tmpProfileDir, {
       headless: false,
       executablePath: CHROMIUM_EXECUTABLE,
-      args: [
-        `--disable-extensions-except=${EXTENSION_DIR}`,
-        `--load-extension=${EXTENSION_DIR}`,
-      ],
+      args: [`--disable-extensions-except=${EXTENSION_DIR}`, `--load-extension=${EXTENSION_DIR}`],
     });
 
     let sw = context.serviceWorkers()[0];
@@ -95,58 +206,19 @@ async function main() {
     const extensionId = sw.url().split("/")[2];
     console.log("extension id:", extensionId);
 
-    console.log("--- configuring options page ---");
-    const optionsPage = await context.newPage();
-    await optionsPage.goto(`chrome-extension://${extensionId}/options.html`);
-    await optionsPage.fill("#port", String(PORT));
-    await optionsPage.fill("#secret", secret);
-    await optionsPage.click("#test");
-    await optionsPage.waitForTimeout(1000);
-    const testResultText = await optionsPage.textContent("#test-result");
-    record("options 'Test connection' reports ok", /ok/i.test(testResultText ?? ""), testResultText ?? "");
-    await optionsPage.click("button[type=submit]");
-    await optionsPage.waitForTimeout(300);
+    async function getState(): Promise<any> {
+      const res = await fetch(`http://127.0.0.1:${port}/state?token=${secret}`);
+      if (!res.ok) throw new Error(`GET /state failed: ${res.status}`);
+      return res.json();
+    }
 
-    console.log("--- waiting for extension to sync groups ---");
-    await sleep(3000);
-
-    const state1 = await getState(secret);
-    const groups1: chrome.tabGroups.TabGroup[] = await sw.evaluate(() => chrome.tabGroups.query({}));
-    console.log(
-      "groups after initial sync:",
-      groups1.map((g) => ({ title: g.title, color: g.color, collapsed: g.collapsed })),
-    );
-
-    const storedState = await sw.evaluate(() => chrome.storage.local.get("metamuxState"));
-    const byId: Record<string, any> = storedState.metamuxState?.byId ?? {};
-    console.log(
-      "byId entries for duplicate-title diagnosis:",
-      JSON.stringify(
-        Object.entries(byId).filter(([, e]) => e.title === "compliance"),
-        null,
-        2,
-      ),
-    );
-    const complianceInRegistry = state1.workspaces.filter((w: any) => w.title === "compliance");
-    console.log("registry workspaces titled 'compliance':", JSON.stringify(complianceInRegistry, null, 2));
-
-    const liveTitles = new Set(
-      state1.workspaces.filter((w: any) => !w.archived).map((w: any) => w.title),
-    );
-    const matched = groups1.some((g) => liveTitles.has(g.title));
-    record(
-      "at least one tab group title matches a live cmux workspace",
-      matched,
-      `groups: [${groups1.map((g) => g.title).join(", ")}]`,
-    );
-
-    // Resolve a workspace's real tab group by id -> groupId (via the
-    // extension's own mapping), not by title: cmux legitimately allows two
-    // different workspaces to share a display title (e.g. same dir name,
-    // different cwd), so title alone is ambiguous.
-    async function activeGroupFor(activeId: string): Promise<chrome.tabGroups.TabGroup | null> {
+    // Resolve a wire identity's real tab group via the extension's own
+    // mapping (byId is keyed by the WIRE identity -- the alias id in the
+    // default groupBy: "title" -- never the raw registry id).
+    async function activeGroupFor(identityId: string | null): Promise<chrome.tabGroups.TabGroup | null> {
+      if (!identityId) return null;
       const stored = await sw.evaluate(() => chrome.storage.local.get("metamuxState"));
-      const entry = stored.metamuxState?.byId?.[activeId];
+      const entry = stored.metamuxState?.byId?.[identityId];
       if (!entry || entry.groupId == null) return null;
       const groups = await sw.evaluate(
         (groupId) => chrome.tabGroups.query({}).then((gs) => gs.filter((g) => g.id === groupId)),
@@ -155,36 +227,129 @@ async function main() {
       return groups[0] ?? null;
     }
 
-    console.log("--- cmux rpc workspace.next ---");
+    console.log("--- configuring options page (pointed at the isolated port) ---");
+    // Reuse an existing page (launchPersistentContext typically opens one
+    // default blank page) rather than context.newPage() -- creating an
+    // extra page has been observed to open in its OWN separate Chrome
+    // window in this harness, which then confuses "the metamux window"
+    // resolution downstream.
+    const optionsPage = context.pages()[0] ?? (await context.newPage());
+    await optionsPage.goto(`chrome-extension://${extensionId}/options.html`);
+    await optionsPage.fill("#port", String(port));
+    await optionsPage.fill("#secret", secret);
+    await optionsPage.click("#test");
+    await optionsPage.waitForTimeout(1000);
+    const testResultText = await optionsPage.textContent("#test-result");
+    record("options 'Test connection' reports ok", /ok/i.test(testResultText ?? ""), testResultText ?? "");
+    await optionsPage.click("button[type=submit]");
+    await optionsPage.waitForTimeout(300);
+    // Close it: left open, Chrome/Playwright keeps re-focusing this tab
+    // over the ones the extension itself activates via
+    // tabs.update(tabId,{active:true}), which would otherwise make every
+    // "is a tab in the group active" assertion below unreliable for
+    // reasons that have nothing to do with the extension's own behavior.
+    await optionsPage.close();
+
+    console.log("--- waiting for extension to sync ---");
+    await sleep(3000);
+
+    // createGroups: "on-open" + a fresh isolated registry: NOTHING has
+    // ever been attached yet, so the sync frame's workspaces list --
+    // and therefore real Chrome tab groups -- must be empty.
+    const groupsAtBoot: chrome.tabGroups.TabGroup[] = await sw.evaluate(() => chrome.tabGroups.query({}));
+    record(
+      "on-open + fresh registry: zero tab groups exist before anything is opened",
+      groupsAtBoot.length === 0,
+      `groups: [${groupsAtBoot.map((g) => g.title).join(", ")}]`,
+    );
+
+    const stateAtBoot = await getState();
+    const openedIdentityTitle = stateAtBoot.workspaces.find((w: any) => w.id === stateAtBoot.activeId)?.title ?? null;
+    record("an active workspace exists to exercise (real cmux state)", openedIdentityTitle !== null, JSON.stringify(stateAtBoot.activeId));
+
+    console.log("--- cmux rpc workspace.next (activation alone must NOT create a group) ---");
     Bun.spawnSync(["cmux", "rpc", "workspace.next", "{}"], { cwd: REPO_ROOT });
     await sleep(1500);
-
-    const state2 = await getState(secret);
-    const activeGroup2 = await activeGroupFor(state2.activeId);
+    const groupsAfterActivationOnly: chrome.tabGroups.TabGroup[] = await sw.evaluate(() => chrome.tabGroups.query({}));
     record(
-      "after workspace.next, the newly active workspace's group is expanded",
-      !!activeGroup2 && activeGroup2.collapsed === false,
-      `activeId=${state2.activeId}, group=${JSON.stringify(activeGroup2)}`,
+      "after workspace.next (no open), still zero tab groups",
+      groupsAfterActivationOnly.length === 0,
+      `groups: [${groupsAfterActivationOnly.map((g) => g.title).join(", ")}]`,
+    );
+
+    console.log("--- POST /open (this is what creates + attaches the group) ---");
+    const openRes = await fetch(`http://127.0.0.1:${port}/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: secret, url: "https://example.com/metamux-e2e" }),
+    });
+    const openBody = await openRes.json();
+    record("POST /open reports ok", openRes.ok && openBody.ok === true, JSON.stringify(openBody));
+    await sleep(1500);
+
+    const openedIdentityId: string | null = openBody.workspace ?? null;
+    const activeGroupAfterOpen = await activeGroupFor(openedIdentityId);
+    record(
+      "after POST /open, the target workspace's group now exists and is expanded",
+      !!activeGroupAfterOpen && activeGroupAfterOpen.collapsed === false,
+      `identity=${openedIdentityId}, group=${JSON.stringify(activeGroupAfterOpen)}`,
     );
 
     let activeTabInGroup = false;
-    if (activeGroup2) {
-      const tabs = await sw.evaluate((groupId) => chrome.tabs.query({ groupId }), activeGroup2.id);
+    let openedGroupTitle: string | null = null;
+    if (activeGroupAfterOpen) {
+      openedGroupTitle = activeGroupAfterOpen.title ?? null;
+      const tabs = await sw.evaluate((groupId) => chrome.tabs.query({ groupId }), activeGroupAfterOpen.id);
       activeTabInGroup = tabs.some((t) => t.active);
     }
-    record("after workspace.next, a tab in the active group is the active tab", activeTabInGroup);
+    record("after POST /open, a tab in the group is the active tab", activeTabInGroup);
 
-    console.log("--- cmux rpc workspace.previous (restoring) ---");
+    // --- Janitor: pre-create a duplicate-titled group, assert it merges. ---
+    if (activeGroupAfterOpen && openedGroupTitle) {
+      console.log("--- janitor: pre-creating a duplicate-titled blank group ---");
+      const windowId = activeGroupAfterOpen.windowId;
+      await sw.evaluate(
+        async ({ windowId, title }) => {
+          const tab = await chrome.tabs.create({ windowId, url: "chrome://newtab/", active: false });
+          const groupId = await chrome.tabs.group({ tabIds: [tab.id as number] });
+          await chrome.tabGroups.update(groupId, { title });
+        },
+        { windowId, title: openedGroupTitle },
+      );
+
+      const groupsBeforeMerge = await sw.evaluate(
+        (title) => chrome.tabGroups.query({ title }).then((gs) => gs.length),
+        openedGroupTitle,
+      );
+      record("duplicate group actually created (2 groups share the title now)", groupsBeforeMerge === 2, String(groupsBeforeMerge));
+
+      console.log("--- triggering a fresh sync reconciliation (isolated config hot-reload) ---");
+      // Safe here specifically because the config is isolated -- toggling
+      // a real, shared config.json to force a sync was never an option in
+      // earlier rounds. closeBehavior (not collapseOthers) is the toggle:
+      // collapseOthers stays false for the whole run (see above).
+      await writeFile(
+        configPath,
+        JSON.stringify({ createGroups: "on-open", groupBy: "title", janitor: true, collapseOthers: false, closeBehavior: "close" }),
+      );
+      await sleep(2000);
+
+      const groupsAfterMerge = await sw.evaluate(
+        (title) => chrome.tabGroups.query({ title }).then((gs) => gs.length),
+        openedGroupTitle,
+      );
+      record(
+        "janitor merges the duplicate away -- exactly one group with that title remains",
+        groupsAfterMerge === 1,
+        `count=${groupsAfterMerge}`,
+      );
+    } else {
+      record("janitor merge assertion (skipped -- no group was created to duplicate)", false, "see POST /open assertions above");
+    }
+
+    console.log("--- cmux rpc workspace.previous (restoring real cmux focus) ---");
     Bun.spawnSync(["cmux", "rpc", "workspace.previous", "{}"], { cwd: REPO_ROOT });
-    await sleep(1500);
-
-    const state3 = await getState(secret);
-    const activeGroup3 = await activeGroupFor(state3.activeId);
-    record(
-      "after workspace.previous, restored workspace's group is expanded again",
-      !!activeGroup3 && activeGroup3.collapsed === false,
-      `activeId=${state3.activeId}, group=${JSON.stringify(activeGroup3)}`,
-    );
+    await sleep(500);
   } finally {
     console.log("\n--- cleanup ---");
     if (context) {
@@ -193,10 +358,23 @@ async function main() {
     if (tmpProfileDir) {
       await rm(tmpProfileDir, { recursive: true, force: true }).catch(() => {});
     }
+    if (tmpStateDir) {
+      await rm(tmpStateDir, { recursive: true, force: true }).catch(() => {});
+    }
+    if (tmpConfigDir) {
+      await rm(tmpConfigDir, { recursive: true, force: true }).catch(() => {});
+    }
     if (daemonProc) {
       daemonProc.kill();
       await daemonProc.exited.catch(() => {});
     }
+
+    const livePidsAfter = await daemonPids();
+    record(
+      "zero contact with the live daemon: its PID set is unchanged after this script exits",
+      JSON.stringify(livePidsAfter) === JSON.stringify(livePidsBefore),
+      `before=[${livePidsBefore.join(",")}], after=[${livePidsAfter.join(",")}]`,
+    );
   }
 
   console.log("\n=== SUMMARY ===");

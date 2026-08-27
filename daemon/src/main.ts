@@ -3,7 +3,9 @@
 // effects).
 
 import { appendFile } from "node:fs/promises";
+import * as cmuxActuator from "./cmux-actuator.ts";
 import { loadCmuxNamedColorSlots } from "./cmux-config.ts";
+import { computeBackflowCandidates, planBackflow, type BackflowRef } from "./color-backflow.ts";
 import * as cmuxRpc from "./cmux-rpc.ts";
 import { diffConfig } from "./config-diff.ts";
 import { ConfigWatcher } from "./config-watch.ts";
@@ -19,9 +21,20 @@ import { shouldReverseSyncSelect } from "./reverse-sync.ts";
 import { ActuatorServer } from "./server.ts";
 import { SocketHealthMonitor } from "./socket-health.ts";
 import { Tailer } from "./tail.ts";
+import * as tmuxSource from "./tmux-source.ts";
+import { loadLegacyState, planMigration } from "./tmux-migration.ts";
+import {
+  emptyReconcileState,
+  reconcile,
+  type CmuxActuatorAction,
+  type ReconcileInput,
+  type ReconcileState,
+} from "./tmux-reconcile.ts";
 
 const PORTS_POLL_INTERVAL_MS = 4000;
 const SOCKET_PROBE_INTERVAL_MS = 30_000;
+const TMUX_POLL_INTERVAL_MS = 2000; // matches tmux-cmux-sync's own TMUX_CMUX_INTERVAL default
+const COLOR_BACKFLOW_INTERVAL_MS = 5000;
 
 interface CursorState {
   bootId: string;
@@ -68,8 +81,13 @@ export function hydrateRegistry(
   const registry = new Registry(namedSlots);
   if (!saved) return registry;
   for (const ref of saved.workspaces ?? []) {
-    // registry.json written before these features has no cmuxColor/attachedAt field.
-    registry.workspaces.set(ref.id, { ...ref, cmuxColor: ref.cmuxColor ?? null, attachedAt: ref.attachedAt ?? null });
+    // registry.json written before these features has no cmuxColor/attachedAt/paintedColor field.
+    registry.workspaces.set(ref.id, {
+      ...ref,
+      cmuxColor: ref.cmuxColor ?? null,
+      attachedAt: ref.attachedAt ?? null,
+      paintedColor: ref.paintedColor ?? null,
+    });
   }
   registry.activeId = saved.activeId ?? null;
   return registry;
@@ -94,6 +112,12 @@ async function runDaemon(): Promise<void> {
   // Plain local file read -- doesn't need socket features.
   const namedColorSlots = await loadCmuxNamedColorSlots();
   const registry = hydrateRegistry(savedRegistry, namedColorSlots);
+  // Must be set before ANY applyEvent call, including the seed replay
+  // below: replay pushes historical `selected` events through the
+  // registry too, and attachOnActivate gates whether those re-stamp
+  // attachedAt. Left at its default (true) this far, on-open would
+  // silently degenerate back to attach-everything on every restart.
+  registry.attachOnActivate = config.createGroups !== "on-open";
 
   const stats = { skippedLines: 0 };
 
@@ -138,17 +162,19 @@ async function runDaemon(): Promise<void> {
     }
   };
 
-  // groupBy (title-aliasing) and createGroups (lazy inclusion) both live
-  // here so main.ts's reverse-sync resolution and server.ts's broadcast/
-  // buildSync/getState share the exact same projection state.
+  // groupBy (title-aliasing) and createGroups ("on-open"/"on-activate"
+  // lazy inclusion) both live here so main.ts's reverse-sync resolution
+  // and server.ts's broadcast/buildSync/getState share the exact same
+  // projection state.
   const groupProjection = new GroupProjection(config.groupBy);
   const lazyGroups = new LazyGroupTracker();
 
   // Seed lazy-inclusion attachment from registry.json's persisted
   // attachedAt fields -- otherwise every daemon restart would re-hide
-  // every group in createGroups: "lazy" mode until re-activated, and the
-  // extension's offline-archive sync rule would then collapse groups the
-  // user had open. A restart should not reshuffle the browser.
+  // every group in createGroups: "on-open"/"on-activate" mode until
+  // re-attached, and the extension's offline-archive sync rule would then
+  // collapse groups the user had open. A restart should not reshuffle the
+  // browser.
   {
     const seedSnapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
     lazyGroups.seedFromRefs(seedSnapshot.workspaces, (ref) => groupProjection.identityFor(ref, seedSnapshot).id);
@@ -167,9 +193,27 @@ async function runDaemon(): Promise<void> {
     onUserActivatedGroup: (id) => {
       void handleUserActivatedGroup(id);
     },
+    onUserClosedGroup: (id) => {
+      handleUserClosedGroup(id);
+    },
     log,
   });
   server.start();
+
+  // Detach-on-close: the user closed a managed Chrome group by hand.
+  // Clears attachedAt for every real workspace composing the wire
+  // identity (registry + in-memory lazyGroups), so future syncs stop
+  // including it until it's reopened. The underlying workspace itself
+  // stays live/unarchived -- this only un-attaches its group.
+  const handleUserClosedGroup = (id: string): void => {
+    const snapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
+    const memberIds = groupProjection.membersOf(id, snapshot);
+    if (memberIds.length === 0) return;
+    for (const memberId of memberIds) registry.clearAttached(memberId);
+    lazyGroups.clearAttached(id);
+    log(`[detach] ${id} closed by user, cleared attachment for ${memberIds.length} workspace(s)`);
+    void persist();
+  };
 
   const handleUserActivatedGroup = async (id: string): Promise<void> => {
     const snapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
@@ -199,6 +243,40 @@ async function runDaemon(): Promise<void> {
   let pendingTimer: ReturnType<typeof setTimeout> | null = null;
   let portsPollTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Moved ahead of applyConfigChanges (was originally defined further
+  // down, alongside applyAndMaybeEmit) so the tmux.enabled hot-reload
+  // path below can call runTmuxMigration, which needs it.
+  const persist = async () => {
+    await atomicWriteJson(registryPath(), serializeRegistry(registry));
+    await atomicWriteJson(cursorPath(), cursor);
+  };
+
+  // One-time tmux state migration (docs/tmux-port-plan.md §3.1(b)/§5
+  // Phase 5): reclassifies cmux tabs tmux-cmux-sync already created into
+  // tmux-sourced refs, preserving their mw_ id (and Chrome group).
+  // Idempotent -- Registry.reclassifyAsTmux/archiveBySourceId are no-ops
+  // on a second run (the cmux ref's source is already "tmux" by then), so
+  // this is safe to call on every startup AND every live tmux.enabled
+  // false->true toggle, with no separate "already migrated" marker.
+  // Socket-gated: needs both live cmux window/tab state and live tmux
+  // session state to plan anything.
+  const runTmuxMigration = async (): Promise<void> => {
+    if (!config.tmux.enabled || socketHealth.getState() !== "enabled") return;
+    const [legacy, sessions] = await Promise.all([loadLegacyState(), tmuxSource.listSessions()]);
+    const sessionsByName = new Map(sessions.map((s) => [s.name, s.id] as const));
+    const plan = planMigration(legacy, sessionsByName);
+    if (plan.reclassify.length === 0 && plan.archive.length === 0) return;
+
+    const derived: ActuatorEvent[] = [];
+    for (const r of plan.reclassify) derived.push(...registry.reclassifyAsTmux(r.cmuxSourceId, r.sessionId, r.sessionName));
+    for (const a of plan.archive) derived.push(...registry.archiveBySourceId(a.source, a.cmuxSourceId));
+    if (derived.length > 0) {
+      server.broadcast(derived);
+      await persist();
+      log(`[tmux migration] reclassified ${plan.reclassify.length}, archived ${plan.archive.length} legacy cmux ref(s)`);
+    }
+  };
+
   // Config hot-reload: menubar toggles apply without a daemon restart.
   // `config` is mutated in place (never reassigned) so every closure that
   // already captured it (server, pollPorts, the /focus & /open handlers)
@@ -215,7 +293,13 @@ async function runDaemon(): Promise<void> {
         continue;
       }
       log(`config reloaded: ${change.key} ${JSON.stringify(change.oldValue)} -> ${JSON.stringify(change.newValue)}`);
-      if (change.key === "collapseOthers" || change.key === "closeBehavior" || change.key === "groupBy" || change.key === "createGroups") {
+      if (
+        change.key === "collapseOthers" ||
+        change.key === "closeBehavior" ||
+        change.key === "groupBy" ||
+        change.key === "createGroups" ||
+        change.key === "janitor"
+      ) {
         extensionAffected = true;
       }
     }
@@ -231,19 +315,31 @@ async function runDaemon(): Promise<void> {
       config.groupBy = newConfig.groupBy;
       groupProjection.setGroupBy(newConfig.groupBy);
     }
-    if (changes.some((c) => c.hotApplicable && c.key === "createGroups")) config.createGroups = newConfig.createGroups;
+    if (changes.some((c) => c.hotApplicable && c.key === "createGroups")) {
+      config.createGroups = newConfig.createGroups;
+      registry.attachOnActivate = newConfig.createGroups !== "on-open";
+    }
     if (changes.some((c) => c.hotApplicable && c.key === "ports.mode")) config.ports.mode = newConfig.ports.mode;
     if (changes.some((c) => c.hotApplicable && c.key === "ports.ignore")) config.ports.ignore = newConfig.ports.ignore;
     if (changes.some((c) => c.hotApplicable && c.key === "ports.maxPort")) config.ports.maxPort = newConfig.ports.maxPort;
+    if (changes.some((c) => c.hotApplicable && c.key === "tmux.mirror")) config.tmux.mirror = newConfig.tmux.mirror;
+    if (changes.some((c) => c.hotApplicable && c.key === "tmux.alphabetize")) config.tmux.alphabetize = newConfig.tmux.alphabetize;
+    if (changes.some((c) => c.hotApplicable && c.key === "tmux.reattachGraceMs")) config.tmux.reattachGraceMs = newConfig.tmux.reattachGraceMs;
+    if (changes.some((c) => c.hotApplicable && c.key === "tmux.spawnCwd")) config.tmux.spawnCwd = newConfig.tmux.spawnCwd;
+    if (changes.some((c) => c.hotApplicable && c.key === "tmux.enabled")) {
+      const wasEnabled = config.tmux.enabled;
+      config.tmux.enabled = newConfig.tmux.enabled;
+      // A live false->true toggle needs the same one-time migration a
+      // fresh startup gets -- otherwise the next reconcile tick would
+      // spawn duplicate tabs for sessions tmux-cmux-sync already mirrored.
+      if (!wasEnabled && config.tmux.enabled) void runTmuxMigration();
+    }
+    if (changes.some((c) => c.hotApplicable && c.key === "colorBackflow")) config.colorBackflow = newConfig.colorBackflow;
+    if (changes.some((c) => c.hotApplicable && c.key === "janitor")) config.janitor = newConfig.janitor;
 
     if (extensionAffected) server.pushSyncToAll();
   };
   const configWatcher = new ConfigWatcher(CONFIG_PATH, config);
-
-  const persist = async () => {
-    await atomicWriteJson(registryPath(), serializeRegistry(registry));
-    await atomicWriteJson(cursorPath(), cursor);
-  };
 
   const applyAndMaybeEmit = (event: CmuxWorkspaceEvent, emit: boolean) => {
     const derived = registry.applyEvent(event);
@@ -313,6 +409,139 @@ async function runDaemon(): Promise<void> {
         `[ports] new port ${port} on ${targetRef.title} (${targetRef.id}) -- http://localhost:${port} (per-cycle cap reached, not auto-opened)`,
       );
     }
+  };
+
+  // tmux source + cmux actuator (docs/tmux-port-plan.md §2): mirrors
+  // tmux sessions into cmux tabs and registers them as tmux-sourced
+  // WorkspaceRefs, replacing tmux-cmux-sync as one program instead of two.
+  // `nextState` (windowAttachments/globalAttachments/reattachAttempts) is
+  // this poller's own cache, analogous to registry.json for the main
+  // registry -- rebuilt fresh from live tmux+cmux state every tick, never
+  // persisted (a restart just re-derives it, same as tmux-cmux-sync.json
+  // being a cache rather than a ledger).
+  let tmuxReconcileState: ReconcileState = emptyReconcileState();
+
+  const executeTmuxAction = async (action: CmuxActuatorAction): Promise<void> => {
+    switch (action.type) {
+      case "spawn": {
+        const result = await cmuxActuator.spawnTab({ windowId: action.windowId, sessionName: action.sessionName, cwd: action.cwd });
+        reportSocketCallOutcome(result.ok);
+        log(
+          result.ok
+            ? `[tmux] spawn ${action.sessionName} -> ${result.tabRef ?? "?"} (win ${action.windowId ?? "any"})`
+            : `[tmux] spawn FAILED ${action.sessionName}: ${result.error}`,
+        );
+        break;
+      }
+      case "retitle": {
+        const result = await cmuxActuator.retitleTab({ workspaceRef: action.workspaceRef, title: action.title });
+        reportSocketCallOutcome(result.ok);
+        if (result.ok) log(`[tmux] retitle ${action.workspaceRef} -> ${action.title}`);
+        break;
+      }
+      case "reattach": {
+        const result = await cmuxActuator.reattachTab({ workspaceRef: action.workspaceRef, sessionName: action.sessionName });
+        reportSocketCallOutcome(result.ok);
+        if (result.ok) log(`[tmux] reattach ${action.sessionName} -> ${action.workspaceRef}`);
+        break;
+      }
+      case "reap": {
+        const result = await cmuxActuator.closeTab(action.workspaceRef);
+        reportSocketCallOutcome(result.ok);
+        if (result.ok) log(`[tmux] reap ${action.workspaceRef}`);
+        break;
+      }
+      case "reorder": {
+        const result = await cmuxActuator.reorderTabs({ windowId: action.windowId, orderedWorkspaceRefs: action.orderedWorkspaceRefs });
+        reportSocketCallOutcome(result.ok);
+        if (result.ok) log(`[tmux] reorder win ${action.windowId}`);
+        break;
+      }
+    }
+  };
+
+  // Socket-gated like pollPorts (window/tab listing and every actuator
+  // action go through the cmux CLI, which needs the same auth); tmux-
+  // source.ts itself has no such dependency, but there's nothing useful
+  // to actuate with tmux state alone while cmux is unreachable. Runs
+  // unconditionally on its own timer (like the socket recovery probe) so
+  // config.tmux.enabled is truly hot-reloadable with no separate
+  // start/stop wiring -- this function just early-returns when disabled.
+  const pollTmux = async (): Promise<void> => {
+    if (!config.tmux.enabled) return;
+    if (socketHealth.getState() !== "enabled") return;
+
+    const [sessions, hostMap, windows] = await Promise.all([tmuxSource.listSessions(), tmuxSource.hostMap(), cmuxActuator.listWindows()]);
+
+    const reconcileConfig = {
+      mirrorMode: config.tmux.mirror,
+      alphabetize: config.tmux.alphabetize,
+      reattachGraceMs: config.tmux.reattachGraceMs,
+      spawnCwd: config.tmux.spawnCwd,
+      now: Date.now(),
+    };
+
+    let input: ReconcileInput;
+    if (config.tmux.mirror === "windows") {
+      const windowsWithTabs = await Promise.all(windows.map(async (w) => ({ id: w.id, tabs: await cmuxActuator.listTabs(w.id) })));
+      input = { mode: "windows", sessions, hostMap, windows: windowsWithTabs, state: tmuxReconcileState, config: reconcileConfig };
+    } else {
+      const allTabs = (await Promise.all(windows.map((w) => cmuxActuator.listTabs(w.id)))).flat();
+      input = { mode: "global", sessions, hostMap, allTabs, state: tmuxReconcileState, config: reconcileConfig };
+    }
+
+    const result = reconcile(input);
+    tmuxReconcileState = result.nextState;
+
+    const derived: ActuatorEvent[] = [];
+    for (const intent of result.registryIntents) derived.push(...registry.applyTmuxIntent(intent));
+    if (derived.length > 0) {
+      server.broadcast(derived);
+      void persist();
+    }
+
+    for (const action of result.actions) {
+      await executeTmuxAction(action);
+    }
+  };
+
+  // Color backflow (docs/protocol.md's "Color backflow" section): paints
+  // a cmux tab's own color to match its Chrome group when that group's
+  // color is the title-hash fallback -- never a user-set one. Socket-gated
+  // like pollTmux (set-color goes through the cmux CLI); the decision
+  // logic itself (color-backflow.ts) is pure, this is just the poll +
+  // execute wrapper. Runs unconditionally on its own timer for the same
+  // hot-reload reason pollTmux does.
+  const pollColorBackflow = async (): Promise<void> => {
+    if (!config.colorBackflow) return;
+    if (socketHealth.getState() !== "enabled") return;
+
+    const refs: BackflowRef[] = [...registry.workspaces.values()].map((ref) => ({
+      id: ref.id,
+      source: ref.source,
+      sourceId: ref.sourceId,
+      title: ref.title,
+      cmuxColor: ref.cmuxColor,
+      paintedColor: ref.paintedColor,
+      archived: ref.archived,
+    }));
+    const candidates = computeBackflowCandidates(refs, config.groupBy);
+    const actions = planBackflow(candidates);
+    if (actions.length === 0) return;
+
+    let anyPainted = false;
+    for (const action of actions) {
+      const result = await cmuxActuator.setTabColor({ workspaceRef: action.cmuxWorkspaceId, color: action.targetHex });
+      reportSocketCallOutcome(result.ok);
+      if (result.ok) {
+        registry.markPainted(action.refId, action.targetHex);
+        anyPainted = true;
+        log(`[color-backflow] painted ${action.cmuxWorkspaceId} -> ${action.targetHex}`);
+      } else {
+        log(`[color-backflow] paint FAILED ${action.cmuxWorkspaceId}: ${result.error}`);
+      }
+    }
+    if (anyPainted) void persist();
   };
 
   // F7 window follow (best effort, live-tail only -- see report for why
@@ -400,6 +629,7 @@ async function runDaemon(): Promise<void> {
     }
   };
   if (initialProbe) await runColorBackfill();
+  if (initialProbe) await runTmuxMigration();
 
   // Live tail from here on.
   tailer.start((lines) => {
@@ -434,6 +664,19 @@ async function runDaemon(): Promise<void> {
     void trySocketRecovery();
   }, SOCKET_PROBE_INTERVAL_MS);
 
+  // Unconditional, like socketProbeTimer -- pollTmux's own internal
+  // config.tmux.enabled/socketHealth checks are what actually gate it, so
+  // config.tmux.enabled stays hot-reloadable with no separate timer
+  // start/stop dance.
+  const tmuxPollTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    void pollTmux();
+  }, TMUX_POLL_INTERVAL_MS);
+
+  // Same unconditional-timer-with-internal-gate shape as tmuxPollTimer.
+  const colorBackflowTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    void pollColorBackflow();
+  }, COLOR_BACKFLOW_INTERVAL_MS);
+
   configWatcher.start(applyConfigChanges);
 
   const shutdown = async () => {
@@ -442,6 +685,8 @@ async function runDaemon(): Promise<void> {
     if (pendingTimer) clearTimeout(pendingTimer);
     if (portsPollTimer) clearInterval(portsPollTimer);
     clearInterval(socketProbeTimer);
+    clearInterval(tmuxPollTimer);
+    clearInterval(colorBackflowTimer);
     await persist();
     server.stop();
     process.exit(0);

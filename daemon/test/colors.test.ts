@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { nearestChromeGroupColor, resolveCmuxColor, TAB_GROUP_COLORS } from "../src/colors.ts";
+import { CHROME_GROUP_REPRESENTATIVE_HEX, nearestChromeGroupColor, resolveCmuxColor, TAB_GROUP_COLORS } from "../src/colors.ts";
 
 describe("nearestChromeGroupColor -- hue-first mapping", () => {
   test("cmux.json's real 'Navy' slot (#152744) maps to blue (hue 217.0 vs swatch blue 214.1, dist 2.9)", () => {
@@ -55,6 +55,17 @@ describe("nearestChromeGroupColor -- hue-first mapping", () => {
     };
     for (const name of Object.keys(representatives) as (keyof typeof representatives)[]) {
       expect(nearestChromeGroupColor(representatives[name])).toBe(name);
+    }
+  });
+
+  test("CHROME_GROUP_REPRESENTATIVE_HEX is a fixed point for every one of the 9 colors -- color backflow's loop-safety proof", () => {
+    // If a backflow-painted hex didn't map back to the SAME Chrome color,
+    // the daemon's own color pipeline (colored event -> cmuxColor ->
+    // colorFor) would compute a DIFFERENT group color than what was
+    // painted, triggering another backflow paint next tick -- a repaint
+    // loop. This is the guarantee that can't happen.
+    for (const name of TAB_GROUP_COLORS) {
+      expect(nearestChromeGroupColor(CHROME_GROUP_REPRESENTATIVE_HEX[name])).toBe(name);
     }
   });
 

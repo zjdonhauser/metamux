@@ -50,6 +50,21 @@ const CHROMATIC_REPRESENTATIVE_HEX: Record<Exclude<ChromeGroupColor, "grey">, st
   orange: "#fa903e",
 };
 
+/** All 9 Chrome tabGroups colors' representative hexes, grey included --
+ * used by color backflow (daemon/src/color-backflow.ts) to paint a cmux
+ * tab to match its Chrome group. Every entry is a FIXED POINT of
+ * nearestChromeGroupColor by construction (grey's hex is a real,
+ * near-zero-saturation grey; the 8 chromatic hexes literally define
+ * SWATCH_HUES, so each has distance 0 to its own swatch and no other
+ * swatch can beat that) -- this is what makes backflow-painted colors
+ * round-trip through the daemon's own color pipeline without churn
+ * instead of chasing themselves in a repaint loop; see
+ * colors.test.ts's fixed-point test for the proof. */
+export const CHROME_GROUP_REPRESENTATIVE_HEX: Record<ChromeGroupColor, string> = {
+  grey: "#9aa0a6",
+  ...CHROMATIC_REPRESENTATIVE_HEX,
+};
+
 interface Hsl {
   h: number; // 0-360
   s: number; // 0-1

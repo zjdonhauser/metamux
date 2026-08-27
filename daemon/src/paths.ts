@@ -11,8 +11,13 @@ export function expandHome(p: string): string {
   return p;
 }
 
-export const STATE_DIR = expandHome("~/.local/state/metamux");
-export const CONFIG_PATH = expandHome("~/.config/metamux/config.json");
+// METAMUX_STATE_DIR / METAMUX_CONFIG_PATH: tolerant overrides (real
+// isolation for scripts/e2e-chromium.ts and other throwaway daemon runs --
+// without them, a spawned test daemon would read/write Zac's real
+// registry.json/cursor.json/secret/daemon.log/config.json, live-affecting
+// his actual running system). Absent env -> the normal, unchanged default.
+export const STATE_DIR = expandHome(process.env.METAMUX_STATE_DIR || "~/.local/state/metamux");
+export const CONFIG_PATH = expandHome(process.env.METAMUX_CONFIG_PATH || "~/.config/metamux/config.json");
 
 export function registryPath(): string {
   return join(STATE_DIR, "registry.json");

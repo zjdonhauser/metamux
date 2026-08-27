@@ -15,7 +15,14 @@ export type ConfigChangeKey =
   | "createGroups"
   | "ports.mode"
   | "ports.ignore"
-  | "ports.maxPort";
+  | "ports.maxPort"
+  | "tmux.enabled"
+  | "tmux.mirror"
+  | "tmux.alphabetize"
+  | "tmux.reattachGraceMs"
+  | "tmux.spawnCwd"
+  | "janitor"
+  | "colorBackflow";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -37,6 +44,13 @@ export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set(
   "ports.maxPort",
   "ports.mode",
   "reverseSync",
+  "tmux.enabled",
+  "tmux.mirror",
+  "tmux.alphabetize",
+  "tmux.reattachGraceMs",
+  "tmux.spawnCwd",
+  "janitor",
+  "colorBackflow",
 ]);
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -63,6 +77,13 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "ports.mode", oldValue: oldConfig.ports.mode, newValue: newConfig.ports.mode },
     { key: "ports.ignore", oldValue: oldConfig.ports.ignore, newValue: newConfig.ports.ignore },
     { key: "ports.maxPort", oldValue: oldConfig.ports.maxPort, newValue: newConfig.ports.maxPort },
+    { key: "tmux.enabled", oldValue: oldConfig.tmux.enabled, newValue: newConfig.tmux.enabled },
+    { key: "tmux.mirror", oldValue: oldConfig.tmux.mirror, newValue: newConfig.tmux.mirror },
+    { key: "tmux.alphabetize", oldValue: oldConfig.tmux.alphabetize, newValue: newConfig.tmux.alphabetize },
+    { key: "tmux.reattachGraceMs", oldValue: oldConfig.tmux.reattachGraceMs, newValue: newConfig.tmux.reattachGraceMs },
+    { key: "tmux.spawnCwd", oldValue: oldConfig.tmux.spawnCwd, newValue: newConfig.tmux.spawnCwd },
+    { key: "janitor", oldValue: oldConfig.janitor, newValue: newConfig.janitor },
+    { key: "colorBackflow", oldValue: oldConfig.colorBackflow, newValue: newConfig.colorBackflow },
   ];
 
   return candidates

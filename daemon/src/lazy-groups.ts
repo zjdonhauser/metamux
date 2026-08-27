@@ -1,11 +1,14 @@
-// Pure lazy-inclusion filter for createGroups: "lazy". Independent of
-// group-projection.ts's title-aliasing -- this operates on whatever
-// identity ids it's given (real workspace ids in groupBy: "workspace",
-// alias ids in groupBy: "title"), so the two compose freely.
+// Pure lazy-inclusion filter for createGroups: "on-open" | "on-activate".
+// Independent of group-projection.ts's title-aliasing -- this operates on
+// whatever identity ids it's given (real workspace ids in groupBy:
+// "workspace", alias ids in groupBy: "title"), so the two compose freely.
 //
-// An identity is "attached" once it's been activated or open_url'd at
-// least once. In-memory only (like Gate's pending-select and PortsTracker's
-// dedupe state) -- resets each daemon restart, not persisted to disk.
+// An identity is "attached" once markAttached is called for it -- always
+// via open_url; also via activation/window follow in "on-activate" mode
+// (registry.ts's attachOnActivate / server.ts's broadcast()). In-memory
+// only (like Gate's pending-select and PortsTracker's dedupe state) --
+// resets each daemon restart, not persisted to disk (WorkspaceRef.attachedAt
+// is the persisted counterpart; seedFromRefs below re-derives this from it).
 
 import type { ActuatorEvent, ActuatorWorkspace, WorkspaceRef } from "./registry.ts";
 
@@ -19,7 +22,7 @@ export class LazyGroupTracker {
   }
 
   /** Seeds attachment from persisted WorkspaceRef.attachedAt timestamps at
-   * daemon startup, so createGroups: "lazy" doesn't re-hide a group the
+   * daemon startup, so createGroups doesn't re-hide a group the
    * user already had open just because the daemon restarted (registry.json
    * survives the restart; this in-memory tracker otherwise wouldn't).
    * `identityFor` maps each ref to its wire identity (itself in groupBy:
@@ -41,22 +44,37 @@ export class LazyGroupTracker {
     return this.attachedAt.get(id) ?? null;
   }
 
-  /** For the sync frame / GET /state: only identities that are currently
-   * active or have ever been attached. */
-  filterForSync(identities: ActuatorWorkspace[], activeId: string | null): ActuatorWorkspace[] {
-    return identities.filter((i) => i.id === activeId || this.attachedAt.has(i.id));
+  /** Detach-on-close (userClosedGroup) counterpart to markAttached: removes
+   * the in-memory attachment record so filterForSync/filterEvents stop
+   * including this identity until it's reopened. No-op if already
+   * unattached. */
+  clearAttached(id: string): void {
+    this.attachedAt.delete(id);
+  }
+
+  /** For the sync frame / GET /state: only identities that have ever been
+   * attached. No "or currently active" shortcut -- createGroups: "on-open"
+   * requires that a group is only ever created carrying a real tab, and an
+   * identity can be active without ever having been opened. This is a
+   * no-op change for "on-activate" mode: activation attaches synchronously
+   * there (registry.ts/server.ts), so by the time this runs the identity
+   * is already genuinely attached. */
+  filterForSync(identities: ActuatorWorkspace[]): ActuatorWorkspace[] {
+    return identities.filter((i) => this.attachedAt.has(i.id));
   }
 
   /** For a broadcast batch: suppress `workspace.upserted` for an identity
-   * that isn't active/attached (that's the event that would otherwise
-   * make the extension create a group). `workspace.activated` and
-   * `workspace.archived` always pass through -- activated always means
-   * the identity IS now active, and an archive of something never
-   * attached is a harmless no-op for the extension either way. */
-  filterEvents(events: ActuatorEvent[], activeId: string | null): ActuatorEvent[] {
+   * that isn't attached (that's the event that would otherwise make the
+   * extension create a group). `workspace.activated` and
+   * `workspace.archived` always pass through -- an archive of something
+   * never attached is a harmless no-op for the extension either way, and
+   * activation alone never creates a group (chrome-ops's activate() is a
+   * no-op on a groupless entry) -- see docs/protocol.md, createGroups. No
+   * "or currently active" shortcut, for the same reason as filterForSync. */
+  filterEvents(events: ActuatorEvent[]): ActuatorEvent[] {
     return events.filter((e) => {
       if (e.name !== "workspace.upserted") return true;
-      return e.workspace.id === activeId || this.attachedAt.has(e.workspace.id);
+      return this.attachedAt.has(e.workspace.id);
     });
   }
 }

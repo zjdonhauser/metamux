@@ -16,6 +16,7 @@ function ref(overrides: Partial<WorkspaceRef> = {}): WorkspaceRef {
     archived: overrides.archived ?? false,
     cmuxColor: overrides.cmuxColor ?? null,
     attachedAt: overrides.attachedAt ?? null,
+    paintedColor: overrides.paintedColor ?? null,
     updatedAt: overrides.updatedAt ?? new Date().toISOString(),
   };
 }
@@ -46,31 +47,60 @@ describe("LazyGroupTracker.markAttached / isAttached", () => {
 });
 
 describe("LazyGroupTracker.filterForSync", () => {
-  test("includes the currently active identity even if never attached", () => {
+  // createGroups: "on-open" requires that a group is only ever created
+  // carrying a real tab -- filterForSync has no "or currently active"
+  // shortcut, since an identity can be active without ever having been
+  // opened. This is a no-op change for "on-activate" mode: activation
+  // attaches synchronously there, so the identity is already genuinely
+  // attached by the time this runs.
+  test("excludes the currently active identity if it was never attached", () => {
     const tracker = new LazyGroupTracker();
     const identities = [ws("id1"), ws("id2")];
-    const result = tracker.filterForSync(identities, "id1");
-    expect(result.map((i) => i.id)).toEqual(["id1"]);
+    const result = tracker.filterForSync(identities);
+    expect(result).toEqual([]);
   });
 
-  test("includes a previously-attached identity even if not currently active", () => {
+  test("includes a previously-attached identity regardless of which is active", () => {
     const tracker = new LazyGroupTracker();
     tracker.markAttached("id2");
-    const result = tracker.filterForSync([ws("id1"), ws("id2")], "id1");
-    expect(result.map((i) => i.id).sort()).toEqual(["id1", "id2"]);
-  });
-
-  test("excludes an identity that is neither active nor ever attached", () => {
-    const tracker = new LazyGroupTracker();
-    const result = tracker.filterForSync([ws("id1"), ws("id2"), ws("id3")], "id1");
-    expect(result.map((i) => i.id)).toEqual(["id1"]);
-  });
-
-  test("with a null activeId, only previously-attached identities are included", () => {
-    const tracker = new LazyGroupTracker();
-    tracker.markAttached("id2");
-    const result = tracker.filterForSync([ws("id1"), ws("id2")], null);
+    const result = tracker.filterForSync([ws("id1"), ws("id2")]);
     expect(result.map((i) => i.id)).toEqual(["id2"]);
+  });
+
+  test("excludes an identity that has never been attached", () => {
+    const tracker = new LazyGroupTracker();
+    const result = tracker.filterForSync([ws("id1"), ws("id2"), ws("id3")]);
+    expect(result).toEqual([]);
+  });
+
+  test("includes every attached identity, excludes every unattached one", () => {
+    const tracker = new LazyGroupTracker();
+    tracker.markAttached("id2");
+    const result = tracker.filterForSync([ws("id1"), ws("id2")]);
+    expect(result.map((i) => i.id)).toEqual(["id2"]);
+  });
+});
+
+describe("LazyGroupTracker.clearAttached", () => {
+  test("removes attachment for a previously-attached identity", () => {
+    const tracker = new LazyGroupTracker();
+    tracker.markAttached("id1");
+    tracker.clearAttached("id1");
+    expect(tracker.isAttached("id1")).toBe(false);
+  });
+
+  test("is a no-op for an identity that was never attached", () => {
+    const tracker = new LazyGroupTracker();
+    expect(() => tracker.clearAttached("id1")).not.toThrow();
+    expect(tracker.isAttached("id1")).toBe(false);
+  });
+
+  test("a re-attach after clearing records a fresh timestamp", () => {
+    const tracker = new LazyGroupTracker();
+    tracker.markAttached("id1", "2026-01-01T00:00:00.000Z");
+    tracker.clearAttached("id1");
+    tracker.markAttached("id1", "2026-06-01T00:00:00.000Z");
+    expect(tracker.attachedAtFor("id1")).toBe("2026-06-01T00:00:00.000Z");
   });
 });
 
@@ -116,23 +146,32 @@ describe("LazyGroupTracker.seedFromRefs", () => {
 });
 
 describe("LazyGroupTracker.filterEvents", () => {
-  test("suppresses an upserted event for an identity that is neither active nor attached", () => {
+  test("suppresses an upserted event for an identity that was never attached", () => {
     const tracker = new LazyGroupTracker();
     const events: ActuatorEvent[] = [{ name: "workspace.upserted", workspace: ws("id1") }];
-    expect(tracker.filterEvents(events, null)).toEqual([]);
+    expect(tracker.filterEvents(events)).toEqual([]);
   });
 
-  test("passes an upserted event through when the identity is currently active", () => {
+  // No "or currently active" shortcut: an upserted event for the just-
+  // activated-but-never-attached identity must still be suppressed in
+  // createGroups: "on-open" -- this is exactly the case that used to leak
+  // an empty placeholder group through on a brand-new workspace's first
+  // selection (upserted+activated land in the same broadcast batch).
+  test("still suppresses an upserted event even when the identity has just become active", () => {
     const tracker = new LazyGroupTracker();
-    const events: ActuatorEvent[] = [{ name: "workspace.upserted", workspace: ws("id1") }];
-    expect(tracker.filterEvents(events, "id1")).toEqual(events);
+    const events: ActuatorEvent[] = [
+      { name: "workspace.upserted", workspace: ws("id1") },
+      { name: "workspace.activated", workspace: ws("id1") },
+    ];
+    const result = tracker.filterEvents(events);
+    expect(result).toEqual([{ name: "workspace.activated", workspace: ws("id1") }]);
   });
 
   test("passes an upserted event through when the identity was already attached", () => {
     const tracker = new LazyGroupTracker();
     tracker.markAttached("id1");
     const events: ActuatorEvent[] = [{ name: "workspace.upserted", workspace: ws("id1") }];
-    expect(tracker.filterEvents(events, null)).toEqual(events);
+    expect(tracker.filterEvents(events)).toEqual(events);
   });
 
   test("activated and archived events always pass through regardless of attach status", () => {
@@ -141,7 +180,7 @@ describe("LazyGroupTracker.filterEvents", () => {
       { name: "workspace.activated", workspace: ws("id1") },
       { name: "workspace.archived", workspace: ws("id2") },
     ];
-    expect(tracker.filterEvents(events, null)).toEqual(events);
+    expect(tracker.filterEvents(events)).toEqual(events);
   });
 
   test("a mixed batch keeps non-upserted events and filters only unattached upserted ones", () => {
@@ -149,10 +188,10 @@ describe("LazyGroupTracker.filterEvents", () => {
     tracker.markAttached("id1");
     const events: ActuatorEvent[] = [
       { name: "workspace.upserted", workspace: ws("id1") }, // attached -- kept
-      { name: "workspace.upserted", workspace: ws("id2") }, // not attached, not active -- dropped
+      { name: "workspace.upserted", workspace: ws("id2") }, // never attached -- dropped
       { name: "workspace.activated", workspace: ws("id2") }, // always kept
     ];
-    const result = tracker.filterEvents(events, null);
+    const result = tracker.filterEvents(events);
     expect(result.length).toBe(2);
     expect(result[0]!.workspace.id).toBe("id1");
     expect(result[1]!.name).toBe("workspace.activated");

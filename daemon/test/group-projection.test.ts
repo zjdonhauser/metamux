@@ -12,6 +12,7 @@ function ref(overrides: Partial<WorkspaceRef> = {}): WorkspaceRef {
     archived: overrides.archived ?? false,
     cmuxColor: overrides.cmuxColor ?? null,
     attachedAt: overrides.attachedAt ?? null,
+    paintedColor: overrides.paintedColor ?? null,
     updatedAt: overrides.updatedAt ?? new Date().toISOString(),
   };
 }
@@ -240,6 +241,42 @@ describe("GroupProjection -- identityFor / resolveIdentityToWorkspaceId (title m
     const gp = new GroupProjection("title");
     const a = ref({ id: "mw_a", title: "cmux" });
     expect(gp.resolveIdentityToWorkspaceId("t_deadbeef", snapshot([a]))).toBeNull();
+  });
+});
+
+describe("GroupProjection.membersOf (detach-on-close)", () => {
+  test("workspace mode: returns the id itself when it exists", () => {
+    const gp = new GroupProjection("workspace");
+    const a = ref({ id: "mw_a", title: "cmux" });
+    expect(gp.membersOf("mw_a", snapshot([a]))).toEqual(["mw_a"]);
+  });
+
+  test("workspace mode: returns [] for an unknown id", () => {
+    const gp = new GroupProjection("workspace");
+    expect(gp.membersOf("mw_unknown", snapshot([]))).toEqual([]);
+  });
+
+  test("title mode: returns every real workspace sharing the alias's title", () => {
+    const gp = new GroupProjection("title");
+    const a = ref({ id: "mw_a", title: "cmux" });
+    const b = ref({ id: "mw_b", title: "cmux" });
+    const c = ref({ id: "mw_c", title: "other" });
+    const members = gp.membersOf(titleAliasId("cmux"), snapshot([a, b, c]));
+    expect(members.sort()).toEqual(["mw_a", "mw_b"]);
+  });
+
+  test("title mode: includes archived members too (a close detaches the whole alias)", () => {
+    const gp = new GroupProjection("title");
+    const a = ref({ id: "mw_a", title: "cmux", archived: false });
+    const b = ref({ id: "mw_b", title: "cmux", archived: true });
+    const members = gp.membersOf(titleAliasId("cmux"), snapshot([a, b]));
+    expect(members.sort()).toEqual(["mw_a", "mw_b"]);
+  });
+
+  test("title mode: returns [] for an alias id with no current members", () => {
+    const gp = new GroupProjection("title");
+    const a = ref({ id: "mw_a", title: "cmux" });
+    expect(gp.membersOf("t_deadbeef", snapshot([a]))).toEqual([]);
   });
 });
 

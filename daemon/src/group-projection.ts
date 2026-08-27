@@ -89,6 +89,25 @@ export class GroupProjection {
     return null;
   }
 
+  /** Real workspace ids composing a wire identity (detach-on-close,
+   * userClosedGroup): itself in workspace mode (if it exists), else `[]`;
+   * in title mode, every real workspace sharing that alias's title, live
+   * OR archived. Closing the aggregate group clears attachment for the
+   * whole alias, not just its currently-active member -- otherwise a
+   * still-attached sibling would keep the alias included via the union
+   * rule (docs/protocol.md, groupBy: "title" -- "any member attached"),
+   * and the group would never actually disappear. */
+  membersOf(id: string, snapshot: GroupProjectionSnapshot): string[] {
+    if (this.groupBy === "workspace") {
+      return snapshot.workspaces.some((w) => w.id === id) ? [id] : [];
+    }
+    for (const candidate of snapshot.workspaces) {
+      if (titleAliasId(candidate.title) !== id) continue;
+      return snapshot.workspaces.filter((w) => w.title === candidate.title).map((w) => w.id);
+    }
+    return [];
+  }
+
   /** The wire id of the currently active identity: registry.activeId
    * itself in workspace mode; its alias in title mode. */
   currentActiveIdentity(snapshot: GroupProjectionSnapshot): string | null {

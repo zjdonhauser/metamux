@@ -20,6 +20,7 @@
  * @typedef {Object} Config
  * @property {boolean} collapseOthers
  * @property {"archive"|"close"} closeBehavior
+ * @property {boolean} [janitor]  default true when absent -- see the janitor section below
  */
 
 /**
@@ -41,11 +42,27 @@
  */
 
 /**
+ * @typedef {Object} JanitorTab
+ * @property {number} tabId
+ * @property {string} url
+ */
+
+/**
+ * @typedef {Object} JanitorGroupSnapshot  one real chrome tab group in the metamux window
+ * @property {number} groupId
+ * @property {string} title
+ * @property {JanitorTab[]} tabs
+ */
+
+/**
  * @typedef {Object} SyncMsg
  * @property {"sync"} type
  * @property {number} seq
  * @property {Config} config
  * @property {{activeId: string|null, workspaces: SyncWorkspace[]}} state
+ * @property {JanitorGroupSnapshot[]} [janitorGroups]  live tab-group enumeration, attached
+ *   locally by sw.js before dispatch -- see the janitor section below. Absent (e.g. in older
+ *   test fixtures) means "skip the janitor pass this reconciliation".
  */
 
 /**
@@ -89,6 +106,10 @@
  * @property {string} [exceptId]
  * @property {"archive"|"close"} [behavior]
  * @property {string} [url]
+ * @property {number} [fromGroupId]  mergeGroup: the duplicate group to dissolve
+ * @property {number} [intoId]      mergeGroup: the canonical group to merge into
+ * @property {number} [groupId]     closeGroup: the blank-orphan group to remove
+ * @property {{title: string, tabCount: number}[]} [groups]  reportForeignGroups
  */
 
 /**
@@ -100,7 +121,7 @@ export function initialState() {
     lastSeq: 0,
     windowId: null,
     activeId: null,
-    config: { collapseOthers: true, closeBehavior: "archive" },
+    config: { collapseOthers: true, closeBehavior: "archive", janitor: true },
   };
 }
 
@@ -151,6 +172,16 @@ function reduceSync(state, msg) {
     }
   }
 
+  // Tab group janitor (2026-08-27): runs on every sync reconciliation,
+  // idempotent, honors config.janitor (default true). Prepended ahead of
+  // the ensureGroup/archiveGroup ops above so any merge/close resolves
+  // BEFORE ensureGroup's own tabGroups.query({title}) runs -- by execution
+  // time only one group per managed title remains, so that query can't
+  // pick a stale duplicate. See docs/protocol.md ("Extension behavior").
+  if (msg.config.janitor !== false && Array.isArray(msg.janitorGroups)) {
+    ops.unshift(...classifyJanitor(byId, msg.janitorGroups));
+  }
+
   if (msg.state.activeId) {
     ops.push({ op: "activate", id: msg.state.activeId });
     ops.push({ op: "markServerActivation", id: msg.state.activeId });
@@ -169,6 +200,82 @@ function reduceSync(state, msg) {
     config: msg.config,
   };
   return { state: nextState, ops };
+}
+
+const BLANK_TAB_URLS = new Set(["chrome://newtab/", "chrome://newtab", "about:blank"]);
+
+/**
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isBlankTabUrl(url) {
+  return BLANK_TAB_URLS.has(url);
+}
+
+/**
+ * Classifies every real chrome tab group against the current managed-identity
+ * set (title -> the identity carrying that title, live or archived). A
+ * group is:
+ *  - CANONICAL: the cached groupId for a managed identity, or -- when no
+ *    cached groupId is present among the scanned groups -- the first
+ *    scan-order group with a matching title, which becomes bound. Left alone.
+ *  - DUPLICATE: title matches a managed identity but isn't the canonical
+ *    group for it -> merges into canonical (never discards a tab).
+ *  - BLANK ORPHAN: title matches no managed identity and every tab is a
+ *    new-tab/blank placeholder -> closes.
+ *  - FOREIGN: title matches no managed identity and it has real tabs ->
+ *    left untouched, reported.
+ * Pure: the enumeration snapshot is passed in as data, not gathered here.
+ * @param {Object<string, WorkspaceEntry>} byId
+ * @param {JanitorGroupSnapshot[]} groups
+ * @returns {Op[]}
+ */
+function classifyJanitor(byId, groups) {
+  /** @type {Object<string, string>} */
+  const idByTitle = {};
+  for (const [id, entry] of Object.entries(byId)) {
+    idByTitle[entry.title] = id;
+  }
+
+  /** @type {Object<string, number>} */
+  const canonicalGroupIdByTitle = {};
+  for (const group of groups) {
+    const id = idByTitle[group.title];
+    if (id !== undefined && byId[id].groupId === group.groupId) {
+      canonicalGroupIdByTitle[group.title] = group.groupId;
+    }
+  }
+  for (const group of groups) {
+    const id = idByTitle[group.title];
+    if (id === undefined || canonicalGroupIdByTitle[group.title] !== undefined) continue;
+    canonicalGroupIdByTitle[group.title] = group.groupId;
+  }
+
+  /** @type {Op[]} */
+  const ops = [];
+  /** @type {{title: string, tabCount: number}[]} */
+  const foreign = [];
+
+  for (const group of groups) {
+    const id = idByTitle[group.title];
+    if (id !== undefined) {
+      const canonicalGroupId = canonicalGroupIdByTitle[group.title];
+      if (group.groupId !== canonicalGroupId) {
+        ops.push({ op: "mergeGroup", fromGroupId: group.groupId, intoId: canonicalGroupId });
+      }
+      continue;
+    }
+    if (group.tabs.every((t) => isBlankTabUrl(t.url))) {
+      ops.push({ op: "closeGroup", groupId: group.groupId });
+    } else {
+      foreign.push({ title: group.title, tabCount: group.tabs.length });
+    }
+  }
+
+  if (foreign.length > 0) {
+    ops.push({ op: "reportForeignGroups", groups: foreign });
+  }
+  return ops;
 }
 
 /**
@@ -247,6 +354,15 @@ function reduceUpserted(state, msg) {
  * @returns {{state: State, ops: Op[]}}
  */
 function reduceActivated(state, msg) {
+  // createGroups: "on-open" decision (docs/protocol.md): activation of an
+  // identity that was never open_url'd still reaches here as a bare
+  // workspace.activated -- the daemon does NOT filter it out. Safe by
+  // construction: this never emits ensureGroup (only ensureGroup/openUrl
+  // do), and chrome-ops's activate() is a no-op whenever the byId entry
+  // it targets has groupId: null, which is exactly the case for a
+  // never-attached identity (the branch below, when `existing` is
+  // undefined, always sets groupId: null). A bare activation can never
+  // create a group.
   const ws = /** @type {EventWorkspace} */ (msg.workspace);
   const existing = state.byId[ws.id];
   const byId = existing
@@ -306,8 +422,27 @@ function reduceArchived(state, msg) {
  */
 function reduceOpenUrl(state, msg) {
   const ws = /** @type {EventWorkspace} */ (msg.workspace);
+  const existing = state.byId[ws.id];
+  // createGroups: "on-open" can target an identity the extension has never
+  // seen before (attachment happens only via open_url, so nothing upserted
+  // it first) -- establish the byId entry here, same shape as
+  // reduceActivated's "new identity" branch, so chrome-ops's openUrl always
+  // has an entry to create the group around instead of orphaning the tab.
+  const byId = existing
+    ? state.byId
+    : {
+        ...state.byId,
+        [ws.id]: {
+          title: ws.title,
+          color: ws.color,
+          archived: false,
+          groupId: null,
+          lastActiveTabId: null,
+          ports: resolvePorts(ws, existing),
+        },
+      };
   const ops = [{ op: "openUrl", id: ws.id, url: /** @type {string} */ (msg.url) }];
-  return { state, ops };
+  return { state: { ...state, byId }, ops };
 }
 
 /**

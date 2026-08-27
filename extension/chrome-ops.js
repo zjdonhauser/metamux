@@ -25,10 +25,26 @@ const TAB_GROUP_ID_NONE = -1;
 const ECHO_SUPPRESS_MS = 1500;
 let lastServerActivationAt = 0;
 
+// Detach-on-close echo suppression: after WE dissolve a group ourselves
+// (archiveGroup's "close" behavior, the janitor's mergeGroup/closeGroup),
+// tabGroups.onRemoved fires for it. Mark it here so watchGroupRemoved
+// below doesn't mistake our own removal for the user closing the group by
+// hand. Per-groupId (not a single global timestamp like
+// lastServerActivationAt) since one batch can dissolve several groups at
+// once -- a merge pass, or several archiveGroup(close) ops in one sync.
+const GROUP_REMOVE_ECHO_SUPPRESS_MS = 1500;
+/** @type {Map<number, number>} groupId -> Date.now() when WE removed it */
+const serverRemovedGroupIds = new Map();
+
+/** @param {number} groupId */
+function markServerRemoval(groupId) {
+  serverRemovedGroupIds.set(groupId, Date.now());
+}
+
 /**
  * @param {Op[]} ops
  * @param {State} state  the state AFTER the reduce() call that produced these ops
- * @param {{windowId: number}} ctx
+ * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
  * @returns {Promise<Msg[]>} follow-up local facts to feed back into reduce()
  */
 export async function executeOps(ops, state, ctx) {
@@ -47,7 +63,7 @@ export async function executeOps(ops, state, ctx) {
 /**
  * @param {Op} op
  * @param {State} state
- * @param {{windowId: number}} ctx
+ * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
  * @returns {Promise<Msg|null>}
  */
 function executeOp(op, state, ctx) {
@@ -68,6 +84,12 @@ function executeOp(op, state, ctx) {
       return focusWindow(ctx);
     case "markServerActivation":
       return markServerActivation();
+    case "mergeGroup":
+      return mergeGroup(op);
+    case "closeGroup":
+      return closeGroup(op);
+    case "reportForeignGroups":
+      return reportForeignGroups(op, ctx);
     default:
       return Promise.resolve(null);
   }
@@ -143,6 +165,7 @@ async function archiveGroup(op, state) {
   const entry = state.byId[/** @type {string} */ (op.id)];
   if (!entry || entry.groupId == null) return null;
   if (op.behavior === "close") {
+    markServerRemoval(entry.groupId);
     const tabs = await chrome.tabs.query({ groupId: entry.groupId });
     if (tabs.length > 0) {
       await chrome.tabs.remove(/** @type {number[]} */ (tabs.map((t) => t.id)));
@@ -156,6 +179,11 @@ async function archiveGroup(op, state) {
 }
 
 /**
+ * createGroups: "on-open" -- open_url is often the FIRST time an identity
+ * ever reaches the extension (attachment happens only here, not on
+ * activation), so reducer.js's reduceOpenUrl always establishes a byId
+ * entry before this runs; the group forms around the real tab just
+ * opened, never a separate chrome://newtab placeholder.
  * @param {Op} op
  * @param {State} state
  * @param {{windowId: number}} ctx
@@ -164,7 +192,6 @@ async function archiveGroup(op, state) {
 async function openUrl(op, state, ctx) {
   const entry = state.byId[/** @type {string} */ (op.id)];
   const tab = await chrome.tabs.create({ windowId: ctx.windowId, url: op.url, active: true });
-  if (!entry) return null;
 
   let groupId = entry.groupId;
   if (groupId == null) {
@@ -214,6 +241,55 @@ async function focusWindow(ctx) {
  */
 async function markServerActivation() {
   lastServerActivationAt = Date.now();
+  return null;
+}
+
+/**
+ * Janitor: merges a duplicate group's tabs into the canonical group for the
+ * same managed title. tabs.group into an existing groupId dissolves the
+ * now-empty source group automatically -- no explicit close, and no tab is
+ * ever discarded.
+ * @param {Op} op
+ * @returns {Promise<null>}
+ */
+async function mergeGroup(op) {
+  markServerRemoval(/** @type {number} */ (op.fromGroupId));
+  const tabs = await chrome.tabs.query({ groupId: /** @type {number} */ (op.fromGroupId) });
+  if (tabs.length > 0) {
+    await chrome.tabs.group({
+      tabIds: /** @type {number[]} */ (tabs.map((t) => t.id)),
+      groupId: /** @type {number} */ (op.intoId),
+    });
+  }
+  return null;
+}
+
+/**
+ * Janitor: removes a blank orphan group's placeholder tabs; the group
+ * dissolves once its last tab is gone.
+ * @param {Op} op
+ * @returns {Promise<null>}
+ */
+async function closeGroup(op) {
+  markServerRemoval(/** @type {number} */ (op.groupId));
+  const tabs = await chrome.tabs.query({ groupId: /** @type {number} */ (op.groupId) });
+  if (tabs.length > 0) {
+    await chrome.tabs.remove(/** @type {number[]} */ (tabs.map((t) => t.id)));
+  }
+  return null;
+}
+
+/**
+ * Janitor: reports unrecognized, non-blank groups back to the daemon via
+ * the existing client->server "state" frame (docs/protocol.md, Wire
+ * protocol) so it can log them for the human to review. The janitor never
+ * touches a group it doesn't recognize.
+ * @param {Op} op
+ * @param {{sendFrame?: (frame: Record<string, any>) => void}} ctx
+ * @returns {Promise<null>}
+ */
+async function reportForeignGroups(op, ctx) {
+  ctx.sendFrame?.({ type: "state", groups: op.groups });
   return null;
 }
 
@@ -287,6 +363,28 @@ export function watchTabActivation(windowId, getState, onFact, onUserActivation)
 }
 
 /**
+ * Enumerates every real chrome tab group in the metamux window plus its
+ * tabs, for the janitor's pure classification pass (reducer.js
+ * classifyJanitor). Only ever scans the metamux window -- the marker tab
+ * (panel.html) is never grouped, so it's excluded automatically.
+ * @param {number} windowId
+ * @returns {Promise<import("./reducer.js").JanitorGroupSnapshot[]>}
+ */
+export async function scanTabGroups(windowId) {
+  const groups = await chrome.tabGroups.query({ windowId });
+  const snapshot = [];
+  for (const group of groups) {
+    const tabs = await chrome.tabs.query({ groupId: group.id });
+    snapshot.push({
+      groupId: group.id,
+      title: group.title ?? "",
+      tabs: tabs.map((t) => ({ tabId: /** @type {number} */ (t.id), url: t.url ?? "" })),
+    });
+  }
+  return snapshot;
+}
+
+/**
  * Cross-window moves fire tabGroups.onCreated with a new groupId for a group
  * we already track by title. Detect that and correct the cache.
  * @param {() => State} getState
@@ -301,5 +399,38 @@ export function watchGroupRemap(getState, windowId, onFact) {
     if (match && match[1].groupId !== group.id) {
       onFact({ type: "local", name: "groupCreated", id: match[0], groupId: group.id });
     }
+  });
+}
+
+/**
+ * Detach-on-close: when the user closes a MANAGED group by hand (drags it
+ * to the trash, right-click "Close group", closes its last tab, ...),
+ * invalidates its cached groupId locally (the same correction
+ * archiveGroup's own "close" behavior makes for itself) and reports it to
+ * the daemon so attachedAt clears and future syncs stop including it.
+ * Echo-suppressed against our own archiveGroup(close)/mergeGroup/
+ * closeGroup removals via markServerRemoval, called by those three
+ * functions. Note: dragging a managed group into a DIFFERENT window also
+ * fires this in the metamux window (a cross-window move looks identical to
+ * a removal here) -- treated as a close, consistent with "never manage
+ * groups in other windows."
+ * @param {() => State} getState
+ * @param {number} windowId
+ * @param {(fact: Msg) => void} onFact
+ * @param {(id: string) => void} onUserClosedGroup
+ */
+export function watchGroupRemoved(getState, windowId, onFact, onUserClosedGroup) {
+  chrome.tabGroups.onRemoved.addListener((group) => {
+    if (group.windowId !== windowId) return;
+    const suppressedAt = serverRemovedGroupIds.get(group.id);
+    serverRemovedGroupIds.delete(group.id);
+    if (suppressedAt !== undefined && Date.now() - suppressedAt < GROUP_REMOVE_ECHO_SUPPRESS_MS) return;
+
+    const state = getState();
+    const match = Object.entries(state.byId).find(([, entry]) => entry.groupId === group.id);
+    if (!match) return;
+    const [id] = match;
+    onFact({ type: "local", name: "groupCreated", id, groupId: null });
+    onUserClosedGroup(id);
   });
 }

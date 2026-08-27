@@ -3,12 +3,34 @@
 
 import { readFile } from "node:fs/promises";
 import { CONFIG_PATH, expandHome } from "./paths.ts";
+import { resolveMirrorMode, type MirrorMode } from "./tmux-source.ts";
 
 export interface PortsConfig {
   mode: "auto" | "notify" | "off";
   ignore: number[];
   /** Ports > maxPort are never auto-opened (macOS ephemeral range). */
   maxPort: number;
+}
+
+export interface TmuxConfig {
+  /** Master switch for the tmux source adapter + cmux actuator
+   * (docs/tmux-port-plan.md §2). Off by default -- absorbing
+   * tmux-cmux-sync is an opt-in cutover, not automatic on upgrade. */
+  enabled: boolean;
+  /** "windows": every cmux window mirrors every tmux session (true
+   * mirroring, one client per window -- plan §1.2). "global": one tab
+   * per session across all windows, unattended sessions only. */
+  mirror: MirrorMode;
+  /** Pinned tabs stay put; unpinned tabs sort case-insensitively by
+   * title (plan §1.6). */
+  alphabetize: boolean;
+  /** Throttle (ms) before a reattach is retried for the same tab/session
+   * -- unifies the original tool's two separately-named grace periods
+   * (TMUX_CMUX_GRACE, TMUX_CMUX_REATTACH_GRACE; plan §4). */
+  reattachGraceMs: number;
+  /** --cwd for a spawned tab's `tmux new -A -s` command -- a fixed
+   * directory, not "the session's real cwd" (plan §1.10/§2.1). */
+  spawnCwd: string;
 }
 
 export interface MetamuxConfig {
@@ -24,11 +46,23 @@ export interface MetamuxConfig {
    * registry legitimately holds several same-titled workspaces).
    * "workspace" preserves one identity per real workspace. */
   groupBy: "title" | "workspace";
-  /** "lazy" only includes identities that are active or have been
-   * attached (activated/open_url'd) at least once -- avoids materializing
-   * a group for every workspace the daemon has ever seen on first
-   * connect. "eager" includes everything, as before. */
-  createGroups: "lazy" | "eager";
+  /** "on-open" (default): a group is only ever created carrying a real
+   * tab -- attachment happens ONLY via open_url, never activation/window
+   * follow. "on-activate": the old "lazy" semantics -- activation also
+   * attaches, so switching to a workspace shows its (possibly empty)
+   * group. "eager": includes everything regardless of attachment, as
+   * before. A config file's legacy "lazy" value reads as "on-activate". */
+  createGroups: "on-open" | "on-activate" | "eager";
+  tmux: TmuxConfig;
+  /** Extension-side tab-group janitor: merges duplicate-titled groups and
+   * closes blank orphans left over from the pre-dedupe/eager eras, on every
+   * sync reconciliation. Default true. */
+  janitor: boolean;
+  /** Color backflow (daemon/src/color-backflow.ts): paints a cmux tab's
+   * own color to match its Chrome group's color when that color is the
+   * title-hash fallback (never overwrites a user-set cmux color). Default
+   * true. */
+  colorBackflow: boolean;
 }
 
 export const DEFAULT_CONFIG: MetamuxConfig = {
@@ -40,7 +74,10 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   ports: { mode: "auto", ignore: [], maxPort: 49151 },
   reverseSync: false,
   groupBy: "title",
-  createGroups: "lazy",
+  createGroups: "on-open",
+  tmux: { enabled: false, mirror: "windows", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
+  janitor: true,
+  colorBackflow: true,
 };
 
 export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxConfig> {
@@ -59,8 +96,29 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
   const ignore = Array.isArray(portsObj.ignore) ? portsObj.ignore.filter((p): p is number => typeof p === "number") : [];
   const maxPort = typeof portsObj.maxPort === "number" ? portsObj.maxPort : DEFAULT_CONFIG.ports.maxPort;
 
+  const tmuxObj = (obj.tmux && typeof obj.tmux === "object") ? (obj.tmux as Record<string, unknown>) : {};
+  // TMUX_CMUX_MIRROR env compatibility: only consulted when config.json
+  // doesn't explicitly set tmux.mirror -- an explicit file value always
+  // wins over the env, matching every other config key's precedence.
+  const mirror =
+    tmuxObj.mirror === "global" || tmuxObj.mirror === "windows" ? tmuxObj.mirror : resolveMirrorMode(DEFAULT_CONFIG.tmux.mirror);
+  const tmux = {
+    enabled: typeof tmuxObj.enabled === "boolean" ? tmuxObj.enabled : DEFAULT_CONFIG.tmux.enabled,
+    mirror,
+    alphabetize: typeof tmuxObj.alphabetize === "boolean" ? tmuxObj.alphabetize : DEFAULT_CONFIG.tmux.alphabetize,
+    reattachGraceMs: typeof tmuxObj.reattachGraceMs === "number" ? tmuxObj.reattachGraceMs : DEFAULT_CONFIG.tmux.reattachGraceMs,
+    spawnCwd: typeof tmuxObj.spawnCwd === "string" ? tmuxObj.spawnCwd : DEFAULT_CONFIG.tmux.spawnCwd,
+  };
+
+  // METAMUX_PORT: tolerant override, same isolation purpose as paths.ts's
+  // METAMUX_STATE_DIR/METAMUX_CONFIG_PATH -- takes precedence over the
+  // config file's own `port` (env is the more explicit, per-invocation
+  // signal a spawned test daemon sets deliberately).
+  const envPort = process.env.METAMUX_PORT ? Number(process.env.METAMUX_PORT) : null;
+  const port = envPort !== null && Number.isFinite(envPort) ? envPort : typeof obj.port === "number" ? obj.port : DEFAULT_CONFIG.port;
+
   const config: MetamuxConfig = {
-    port: typeof obj.port === "number" ? obj.port : DEFAULT_CONFIG.port,
+    port,
     eventsPath: typeof obj.eventsPath === "string" ? obj.eventsPath : DEFAULT_CONFIG.eventsPath,
     closeBehavior: obj.closeBehavior === "close" ? "close" : "archive",
     collapseOthers: typeof obj.collapseOthers === "boolean" ? obj.collapseOthers : DEFAULT_CONFIG.collapseOthers,
@@ -68,9 +126,20 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
     ports: { mode, ignore, maxPort },
     reverseSync: typeof obj.reverseSync === "boolean" ? obj.reverseSync : DEFAULT_CONFIG.reverseSync,
     groupBy: obj.groupBy === "workspace" ? "workspace" : "title",
-    createGroups: obj.createGroups === "eager" ? "eager" : "lazy",
+    // Back-compat: a config file written before this rename still says
+    // "lazy" -- read it as "on-activate", its exact behavioral successor.
+    createGroups:
+      obj.createGroups === "eager"
+        ? "eager"
+        : obj.createGroups === "on-activate" || obj.createGroups === "lazy"
+          ? "on-activate"
+          : DEFAULT_CONFIG.createGroups,
+    tmux,
+    janitor: typeof obj.janitor === "boolean" ? obj.janitor : DEFAULT_CONFIG.janitor,
+    colorBackflow: typeof obj.colorBackflow === "boolean" ? obj.colorBackflow : DEFAULT_CONFIG.colorBackflow,
   };
 
   config.eventsPath = expandHome(config.eventsPath);
+  config.tmux.spawnCwd = expandHome(config.tmux.spawnCwd);
   return config;
 }

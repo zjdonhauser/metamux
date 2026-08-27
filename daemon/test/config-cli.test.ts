@@ -95,10 +95,47 @@ describe("validateConfigValue", () => {
     expect(validateConfigValue("groupBy", "sourceId").ok).toBe(false);
   });
 
-  test("createGroups only accepts lazy or eager", () => {
-    expect(validateConfigValue("createGroups", "lazy").ok).toBe(true);
+  test("createGroups accepts on-open, on-activate, or eager", () => {
+    expect(validateConfigValue("createGroups", "on-open").ok).toBe(true);
+    expect(validateConfigValue("createGroups", "on-activate").ok).toBe(true);
     expect(validateConfigValue("createGroups", "eager").ok).toBe(true);
     expect(validateConfigValue("createGroups", "immediate").ok).toBe(false);
+  });
+
+  // Strict here: "lazy" is tolerated only when READING an existing config
+  // file (config.ts's loadConfig back-compat), not for a fresh CLI write --
+  // `metamux config set` should guide callers to the current vocabulary.
+  test("createGroups rejects the legacy 'lazy' value on a fresh write", () => {
+    expect(validateConfigValue("createGroups", "lazy").ok).toBe(false);
+  });
+
+  test("tmux.enabled and tmux.alphabetize require booleans", () => {
+    expect(validateConfigValue("tmux.enabled", true).ok).toBe(true);
+    expect(validateConfigValue("tmux.enabled", "true").ok).toBe(false);
+    expect(validateConfigValue("tmux.alphabetize", false).ok).toBe(true);
+    expect(validateConfigValue("tmux.alphabetize", 0).ok).toBe(false);
+  });
+
+  test("tmux.mirror only accepts windows or global", () => {
+    expect(validateConfigValue("tmux.mirror", "windows").ok).toBe(true);
+    expect(validateConfigValue("tmux.mirror", "global").ok).toBe(true);
+    expect(validateConfigValue("tmux.mirror", "everywhere").ok).toBe(false);
+  });
+
+  test("tmux.reattachGraceMs requires a number", () => {
+    expect(validateConfigValue("tmux.reattachGraceMs", 8000).ok).toBe(true);
+    expect(validateConfigValue("tmux.reattachGraceMs", "8000").ok).toBe(false);
+  });
+
+  test("tmux.spawnCwd requires a non-empty string", () => {
+    expect(validateConfigValue("tmux.spawnCwd", "~/Documents/GitHub").ok).toBe(true);
+    expect(validateConfigValue("tmux.spawnCwd", "").ok).toBe(false);
+    expect(validateConfigValue("tmux.spawnCwd", 123).ok).toBe(false);
+  });
+
+  test("colorBackflow requires a boolean", () => {
+    expect(validateConfigValue("colorBackflow", true).ok).toBe(true);
+    expect(validateConfigValue("colorBackflow", "true").ok).toBe(false);
   });
 
   test("failed validations include a human-readable error", () => {
