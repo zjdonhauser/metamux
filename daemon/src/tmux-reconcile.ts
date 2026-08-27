@@ -16,7 +16,11 @@
 // No I/O, no subprocess calls, no registry import -- see registry
 // intents below for why.
 
-export type MirrorMode = "windows" | "global";
+/** "partition" (docs/protocol.md, "Window pairing") is the new DEFAULT:
+ * one tab per session, period -- no mirroring. "windows" (true mirroring)
+ * and "global" (unattended-only) remain for compatibility but are
+ * deprecated. */
+export type MirrorMode = "windows" | "global" | "partition";
 
 export interface ReconcileSession {
   id: string; // tmux #{session_id}, stable across a rename
@@ -33,10 +37,15 @@ export interface ReconcileTab {
   title: string;
   pinned: boolean;
   index: number;
+  /** Currently the active tab within ITS window (a per-window property).
+   * Partition mode only -- windows/global mode ignore it. */
+  selected: boolean;
 }
 
 export interface ReconcileWindow {
   id: string;
+  /** Window ordering, for partition mode's lowest-index fallback. */
+  index: number;
   tabs: ReconcileTab[];
 }
 
@@ -46,22 +55,33 @@ export interface ReconcileWindow {
  * persists and feeds back in, never a source of truth: every field here
  * is re-derivable from a fresh poll, same as the originals (plan §1.4,
  * §3.4). */
+export interface PartitionAttachment {
+  tabId: string;
+  windowId: string;
+}
+
 export interface ReconcileState {
   /** windows mode: windowId -> sessionId -> the cmux tab id last known to
    * host that session in that window. */
   windowAttachments: Map<string, Map<string, string>>;
   /** global mode: sessionId -> the cmux tab id tracked for it. */
   globalAttachments: Map<string, string>;
-  /** Reattach throttle, unified across both modes (plan §4 -- the
+  /** partition mode: sessionId -> the ONE cmux tab (and its window)
+   * tracked for it. Recomputed fresh from live state every tick (never
+   * diffed against the old value to decide anything) -- this is what
+   * makes a user-dragged tab's new window "just work": the next tick's
+   * live snapshot already shows it there. */
+  partitionAttachments: Map<string, PartitionAttachment>;
+  /** Reattach throttle, unified across all three modes (plan §4 -- the
    * original's two separately-named grace periods, TMUX_CMUX_GRACE and
    * TMUX_CMUX_REATTACH_GRACE, collapse to one config value here).
-   * Windows mode keys on "windowId|tabId"; global mode keys on the
-   * sessionId. Value is the epoch ms of the last reattach attempt. */
+   * Windows/partition mode key on "windowId|tabId"; global mode keys on
+   * the sessionId. Value is the epoch ms of the last reattach attempt. */
   reattachAttempts: Map<string, number>;
 }
 
 export function emptyReconcileState(): ReconcileState {
-  return { windowAttachments: new Map(), globalAttachments: new Map(), reattachAttempts: new Map() };
+  return { windowAttachments: new Map(), globalAttachments: new Map(), partitionAttachments: new Map(), reattachAttempts: new Map() };
 }
 
 export interface ReconcileConfig {
@@ -99,7 +119,7 @@ export type CmuxActuatorAction =
  * detected, so the registry side can decide idempotently what actually
  * changed, exactly like every other event it already consumes. */
 export type RegistryIntent =
-  | { type: "upsertTmuxRef"; sessionId: string; sessionName: string }
+  | { type: "upsertTmuxRef"; sessionId: string; sessionName: string; cmuxWindowId?: string }
   | { type: "archiveTmuxRef"; sessionId: string };
 
 export interface ReconcileWindowsInput {
@@ -123,7 +143,19 @@ export interface ReconcileGlobalInput {
   config: ReconcileConfig;
 }
 
-export type ReconcileInput = ReconcileWindowsInput | ReconcileGlobalInput;
+export interface ReconcilePartitionInput {
+  mode: "partition";
+  sessions: ReconcileSession[];
+  hostMap: HostMap;
+  windows: ReconcileWindow[];
+  /** `cmux current-window` -- where a session with no existing tab spawns.
+   * null if unavailable (falls back to the lowest-index window). */
+  focusedWindowId: string | null;
+  state: ReconcileState;
+  config: ReconcileConfig;
+}
+
+export type ReconcileInput = ReconcileWindowsInput | ReconcileGlobalInput | ReconcilePartitionInput;
 
 export interface ReconcileOutput {
   actions: CmuxActuatorAction[];
@@ -239,7 +271,12 @@ function reconcileWindows(input: ReconcileWindowsInput): ReconcileOutput {
   return {
     actions,
     registryIntents,
-    nextState: { windowAttachments: nextWindowAttachments, globalAttachments: new Map(state.globalAttachments), reattachAttempts: nextReattachAttempts },
+    nextState: {
+      windowAttachments: nextWindowAttachments,
+      globalAttachments: new Map(state.globalAttachments),
+      partitionAttachments: new Map(state.partitionAttachments),
+      reattachAttempts: nextReattachAttempts,
+    },
   };
 }
 
@@ -292,13 +329,180 @@ function reconcileGlobal(input: ReconcileGlobalInput): ReconcileOutput {
   return {
     actions,
     registryIntents,
-    nextState: { windowAttachments: cloneWindowAttachments(state.windowAttachments), globalAttachments: nextGlobalAttachments, reattachAttempts: nextReattachAttempts },
+    nextState: {
+      windowAttachments: cloneWindowAttachments(state.windowAttachments),
+      globalAttachments: nextGlobalAttachments,
+      partitionAttachments: new Map(state.partitionAttachments),
+      reattachAttempts: nextReattachAttempts,
+    },
+  };
+}
+
+interface PartitionCandidate {
+  tab: ReconcileTab;
+  windowId: string;
+}
+
+/** Picks which duplicate tab survives when a session has candidates in
+ * MULTIPLE windows (mirror-era legacy convergence, docs/protocol.md's
+ * "Window pairing": "keeps the most-recently-selected one (fallback
+ * lowest window index)"). "Most-recently-selected" reduces to "currently
+ * selected" here: cmux's `selected` flag is an instantaneous per-window
+ * fact (`cmux workspace list --json`), not a selection-history timestamp
+ * -- there's nothing to rank duplicates by beyond "is it the active tab
+ * in its window right now." When exactly one candidate is selected, it
+ * wins outright. When zero or MULTIPLE are (routine in mirror mode: the
+ * same session can easily be the frontmost tab in more than one window
+ * simultaneously), the contract's own explicitly-stated fallback --
+ * lowest window index -- breaks the tie. Deterministic either way. */
+function pickCanonical(candidates: PartitionCandidate[], windowIndexById: Map<string, number>): PartitionCandidate {
+  const selected = candidates.filter((c) => c.tab.selected);
+  const pool = selected.length > 0 ? selected : candidates;
+  return [...pool].sort(
+    (a, b) => (windowIndexById.get(a.windowId) ?? Number.POSITIVE_INFINITY) - (windowIndexById.get(b.windowId) ?? Number.POSITIVE_INFINITY),
+  )[0]!;
+}
+
+function lowestIndexWindowId(windows: ReconcileWindow[]): string | null {
+  if (windows.length === 0) return null;
+  return [...windows].sort((a, b) => a.index - b.index)[0]!.id;
+}
+
+/** Partition mode (docs/protocol.md, "Window pairing"): one tab per
+ * session, no mirroring. Per session, every tick:
+ *  - Gather every LIVE candidate tab for it across ALL windows: hosted
+ *    (a real tmux client attached, via hostMap) or title-matched-but-
+ *    unhosted (restored/detached, same warmup concept as windows mode).
+ *  - Zero candidates -> spawn ONE tab in the focused window (fallback
+ *    lowest-index window).
+ *  - One candidate -> that's the tab. Title-locked/reattached exactly
+ *    like windows mode's single-tab case.
+ *  - Multiple candidates (mirror-era leftovers, or a duplicate spawn
+ *    race) -> pickCanonical keeps ONE, every other candidate is reaped.
+ *    One-time convergence: once only one tab remains, later ticks only
+ *    ever see one candidate again.
+ * A tracked tab moving to a different window is respected implicitly --
+ * this function never compares against the OLD attachment to decide
+ * anything, it only ever derives the canonical tab fresh from the live
+ * windows/tabs snapshot, so a moved tab's new window is just where it's
+ * found this tick. Alphabetizes every window that hosts at least one of
+ * our tabs, same as windows mode (not explicitly contracted for partition
+ * mode, kept for UX parity -- see the port plan report). */
+function reconcilePartition(input: ReconcilePartitionInput): ReconcileOutput {
+  const { sessions, hostMap, windows, focusedWindowId, state, config } = input;
+  const sessionsById = new Map(sessions.map((s) => [s.id, s] as const));
+  const liveSessionIds = new Set(sessions.map((s) => s.id));
+  const windowIndexById = new Map(windows.map((w) => [w.id, w.index] as const));
+  const tabsByWindow = new Map(windows.map((w) => [w.id, w.tabs] as const));
+
+  const actions: CmuxActuatorAction[] = [];
+  const upsertedWindowBySession = new Map<string, string>();
+  const nextPartitionAttachments = new Map<string, PartitionAttachment>();
+  const nextReattachAttempts = new Map(state.reattachAttempts);
+  const windowsNeedingReorder = new Set<string>();
+
+  for (const session of sessions) {
+    const hosted: PartitionCandidate[] = [];
+    const titleMatched: PartitionCandidate[] = [];
+    for (const window of windows) {
+      for (const tab of window.tabs) {
+        const hostedSessionId = hostMap.get(tab.id);
+        if (hostedSessionId === session.id) {
+          hosted.push({ tab, windowId: window.id });
+        } else if (hostedSessionId === undefined && tab.title === session.name) {
+          titleMatched.push({ tab, windowId: window.id });
+        }
+      }
+    }
+
+    if (hosted.length > 0) {
+      const canonical = pickCanonical(hosted, windowIndexById);
+      nextPartitionAttachments.set(session.id, { tabId: canonical.tab.id, windowId: canonical.windowId });
+      upsertedWindowBySession.set(session.id, canonical.windowId);
+      windowsNeedingReorder.add(canonical.windowId);
+      if (canonical.tab.title !== session.name) {
+        actions.push({ type: "retitle", workspaceRef: canonical.tab.id, title: session.name });
+      }
+      for (const other of hosted) {
+        if (other.tab.id === canonical.tab.id) continue;
+        actions.push({ type: "reap", workspaceRef: other.tab.id });
+      }
+      continue;
+    }
+
+    if (titleMatched.length > 0) {
+      const canonical = pickCanonical(titleMatched, windowIndexById);
+      upsertedWindowBySession.set(session.id, canonical.windowId);
+      const key = `${canonical.windowId}|${canonical.tab.id}`;
+      const lastAttempt = state.reattachAttempts.get(key) ?? 0;
+      if (config.now - lastAttempt >= config.reattachGraceMs) {
+        actions.push({ type: "reattach", workspaceRef: canonical.tab.id, sessionName: session.name });
+        nextReattachAttempts.set(key, config.now);
+      } else {
+        nextReattachAttempts.set(key, lastAttempt);
+      }
+      // No partitionAttachment recorded yet -- same "warmup" precedent as
+      // windows mode: the tracked tabId only lands once hostMap confirms
+      // a real client attached, on a later tick.
+      for (const other of titleMatched) {
+        if (other.tab.id === canonical.tab.id) continue;
+        actions.push({ type: "reap", workspaceRef: other.tab.id });
+      }
+      continue;
+    }
+
+    const targetWindowId = focusedWindowId && windowIndexById.has(focusedWindowId) ? focusedWindowId : lowestIndexWindowId(windows);
+    if (targetWindowId) {
+      actions.push({ type: "spawn", windowId: targetWindowId, sessionId: session.id, sessionName: session.name, cwd: config.spawnCwd });
+      upsertedWindowBySession.set(session.id, targetWindowId);
+    }
+  }
+
+  if (config.alphabetize) {
+    for (const windowId of windowsNeedingReorder) {
+      const tabs = tabsByWindow.get(windowId) ?? [];
+      const desired = desiredTabOrder(tabs);
+      const current = currentTabOrder(tabs);
+      if (desired.join(",") !== current.join(",")) {
+        actions.push({ type: "reorder", windowId, orderedWorkspaceRefs: desired });
+      }
+    }
+  }
+
+  const archivedSessionIds = new Set<string>();
+  for (const [sessionId, attachment] of state.partitionAttachments) {
+    if (liveSessionIds.has(sessionId)) continue;
+    actions.push({ type: "reap", workspaceRef: attachment.tabId });
+    archivedSessionIds.add(sessionId);
+  }
+
+  const registryIntents: RegistryIntent[] = [];
+  for (const [sessionId, cmuxWindowId] of upsertedWindowBySession) {
+    const session = sessionsById.get(sessionId);
+    if (session) registryIntents.push({ type: "upsertTmuxRef", sessionId: session.id, sessionName: session.name, cmuxWindowId });
+  }
+  for (const sessionId of archivedSessionIds) {
+    registryIntents.push({ type: "archiveTmuxRef", sessionId });
+  }
+
+  return {
+    actions,
+    registryIntents,
+    nextState: {
+      windowAttachments: cloneWindowAttachments(state.windowAttachments),
+      globalAttachments: new Map(state.globalAttachments),
+      partitionAttachments: nextPartitionAttachments,
+      reattachAttempts: nextReattachAttempts,
+    },
   };
 }
 
 /** One reconcile tick. Dispatches on `input.mode`; see reconcileWindows /
- * reconcileGlobal for the two modes' semantics (plan §1.6). Pure: same
- * input always produces the same output, no I/O. */
+ * reconcileGlobal / reconcilePartition for the modes' semantics (plan
+ * §1.6, docs/protocol.md's "Window pairing"). Pure: same input always
+ * produces the same output, no I/O. */
 export function reconcile(input: ReconcileInput): ReconcileOutput {
-  return input.mode === "windows" ? reconcileWindows(input) : reconcileGlobal(input);
+  if (input.mode === "windows") return reconcileWindows(input);
+  if (input.mode === "global") return reconcileGlobal(input);
+  return reconcilePartition(input);
 }

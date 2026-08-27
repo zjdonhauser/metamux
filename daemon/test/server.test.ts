@@ -15,7 +15,11 @@ function cfg(overrides: Partial<MetamuxConfig> = {}): MetamuxConfig {
   return { ...DEFAULT_CONFIG, ports: { ...DEFAULT_CONFIG.ports }, ...overrides };
 }
 
-function makeServer(config: MetamuxConfig, registry: Registry) {
+function makeServer(
+  config: MetamuxConfig,
+  registry: Registry,
+  callbacks: { onGroupPlacement?: (id: string, chromeWindowId: string | null) => void; onWindowPairing?: (cmuxWindowId: string, chromeWindowId: string) => void } = {},
+) {
   const logs: string[] = [];
   const server = new ActuatorServer({
     port: 0,
@@ -26,6 +30,7 @@ function makeServer(config: MetamuxConfig, registry: Registry) {
     stats: { skippedLines: 0 },
     groupProjection: new GroupProjection(config.groupBy),
     lazyGroups: new LazyGroupTracker(),
+    ...callbacks,
     log: (line) => logs.push(line),
   });
   return { server, logs };
@@ -312,5 +317,145 @@ describe("ActuatorServer.pushOpenUrl -- groupBy: title routes to the alias", () 
     const identity = server.pushOpenUrl(memberA, "https://example.test");
     expect(identity.id).toMatch(/^t_[0-9a-f]{8}$/);
     expect(logs.some((l) => l.includes("open_url") && l.includes(identity.id))).toBe(true);
+  });
+});
+
+describe("ActuatorServer -- window pairing (docs/protocol.md, 'Window pairing')", () => {
+  test("getState's raw view carries a tmux-sourced ref's cmuxWindowId/placementOverride natively (full-fidelity WorkspaceRef fields)", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+    const { server } = makeServer(cfg({ groupBy: "workspace" }), registry);
+
+    const state = server.getState();
+    expect(state.workspaces[0]!.cmuxWindowId).toBe("win-1");
+    expect(state.workspaces[0]!.placementOverride).toBeNull();
+  });
+
+  test("getState's projected view resolves homeChromeWindowId from the registry's windowPairings map", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+    registry.setWindowPairing("win-1", "chrome-win-a");
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+
+    const state = server.getState();
+    expect(state.projected.workspaces[0]!.homeChromeWindowId).toBe("chrome-win-a");
+  });
+
+  test("an unpaired cmux window resolves homeChromeWindowId to null", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-unpaired" });
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+
+    const state = server.getState();
+    expect(state.projected.workspaces[0]!.homeChromeWindowId).toBeNull();
+  });
+
+  test("groupBy: title resolves homeChromeWindowId from the first live member carrying a cmuxWindowId", () => {
+    const registry = new Registry();
+    // A cmux-sourced sibling under the same title carries no cmuxWindowId at all.
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "compliance", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+    registry.setWindowPairing("win-1", "chrome-win-a");
+    const { server } = makeServer(cfg({ groupBy: "title", createGroups: "eager" }), registry);
+
+    const state = server.getState();
+    expect(state.projected.workspaces[0]!.homeChromeWindowId).toBe("chrome-win-a");
+  });
+
+  test("placementOverride surfaces through the projected view", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const ref = [...registry.workspaces.values()][0]!;
+    registry.setPlacementOverride(ref.id, "chrome-win-b");
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+
+    const state = server.getState();
+    expect(state.projected.workspaces[0]!.placementOverride).toBe("chrome-win-b");
+  });
+
+  test("pushOpenUrl's broadcast event carries the target's homeChromeWindowId", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+    registry.setWindowPairing("win-1", "chrome-win-a");
+    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+    const ref = [...registry.workspaces.values()][0]!;
+
+    server.pushOpenUrl(ref, "https://example.test");
+    expect(logs.some((l) => l.includes("open_url") && l.includes("[win chrome-win-a]"))).toBe(true);
+  });
+
+  test("pushOpenUrl for an unpaired window omits the window suffix", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const { server, logs } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+    const ref = [...registry.workspaces.values()][0]!;
+
+    server.pushOpenUrl(ref, "https://example.test");
+    const openUrlLine = logs.find((l) => l.includes("open_url"))!;
+    expect(openUrlLine).not.toContain("[win ");
+  });
+});
+
+describe("ActuatorServer -- groupPlacement / windowPairing ws frames", () => {
+  // handleWsMessage is private; constructing a minimal fake authed
+  // ServerWebSocket and invoking it via a bracket-notation cast mirrors
+  // this file's own handlePrune convention (see its comment above) --
+  // the frame-parsing dispatch itself has no other test seam.
+  interface FakeWs {
+    data: { authed: boolean; client: string | null };
+    send: (s: string) => void;
+  }
+
+  function fakeWs(): FakeWs {
+    return { data: { authed: true, client: "extension" }, send: () => {} };
+  }
+
+  function sendMessage(server: ActuatorServer, payload: unknown): void {
+    (server as unknown as { handleWsMessage(ws: FakeWs, message: string): void }).handleWsMessage(fakeWs(), JSON.stringify(payload));
+  }
+
+  test("groupPlacement calls onGroupPlacement with the id and chromeWindowId", () => {
+    const registry = new Registry();
+    const calls: Array<[string, string | null]> = [];
+    const { server } = makeServer(cfg(), registry, { onGroupPlacement: (id, chromeWindowId) => calls.push([id, chromeWindowId]) });
+
+    sendMessage(server, { type: "groupPlacement", id: "mw_abc123", chromeWindowId: "chrome-win-z" });
+    expect(calls).toEqual([["mw_abc123", "chrome-win-z"]]);
+  });
+
+  test("groupPlacement with chromeWindowId: null clears the override", () => {
+    const registry = new Registry();
+    const calls: Array<[string, string | null]> = [];
+    const { server } = makeServer(cfg(), registry, { onGroupPlacement: (id, chromeWindowId) => calls.push([id, chromeWindowId]) });
+
+    sendMessage(server, { type: "groupPlacement", id: "mw_abc123", chromeWindowId: null });
+    expect(calls).toEqual([["mw_abc123", null]]);
+  });
+
+  test("groupPlacement with no id is ignored", () => {
+    const registry = new Registry();
+    let called = false;
+    const { server } = makeServer(cfg(), registry, { onGroupPlacement: () => (called = true) });
+
+    sendMessage(server, { type: "groupPlacement", chromeWindowId: "chrome-win-z" });
+    expect(called).toBe(false);
+  });
+
+  test("windowPairing calls onWindowPairing with both ids", () => {
+    const registry = new Registry();
+    const calls: Array<[string, string]> = [];
+    const { server } = makeServer(cfg(), registry, { onWindowPairing: (cmuxWindowId, chromeWindowId) => calls.push([cmuxWindowId, chromeWindowId]) });
+
+    sendMessage(server, { type: "windowPairing", cmuxWindowId: "win-1", chromeWindowId: "chrome-win-a" });
+    expect(calls).toEqual([["win-1", "chrome-win-a"]]);
+  });
+
+  test("windowPairing missing either id is ignored", () => {
+    const registry = new Registry();
+    let called = false;
+    const { server } = makeServer(cfg(), registry, { onWindowPairing: () => (called = true) });
+
+    sendMessage(server, { type: "windowPairing", cmuxWindowId: "win-1" });
+    expect(called).toBe(false);
   });
 });

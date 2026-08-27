@@ -116,9 +116,10 @@ describe("validateConfigValue", () => {
     expect(validateConfigValue("tmux.alphabetize", 0).ok).toBe(false);
   });
 
-  test("tmux.mirror only accepts windows or global", () => {
+  test("tmux.mirror only accepts windows, global, or partition", () => {
     expect(validateConfigValue("tmux.mirror", "windows").ok).toBe(true);
     expect(validateConfigValue("tmux.mirror", "global").ok).toBe(true);
+    expect(validateConfigValue("tmux.mirror", "partition").ok).toBe(true);
     expect(validateConfigValue("tmux.mirror", "everywhere").ok).toBe(false);
   });
 

@@ -593,6 +593,111 @@ describe("Registry.applyTmuxIntent", () => {
     const out = reg.applyTmuxIntent({ type: "archiveTmuxRef", sessionId: "$1" });
     expect(out).toEqual([]);
   });
+
+  test("upsertTmuxRef with cmuxWindowId stamps it on a fresh ref", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey", cmuxWindowId: "win-1" });
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.cmuxWindowId).toBe("win-1");
+  });
+
+  test("upsertTmuxRef with a changed cmuxWindowId (tab moved between windows) re-upserts and updates it", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey", cmuxWindowId: "win-1" });
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey", cmuxWindowId: "win-2" });
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.upserted");
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.cmuxWindowId).toBe("win-2");
+  });
+
+  test("upsertTmuxRef with no cmuxWindowId (legacy windows/global mode) leaves an existing one untouched", () => {
+    const reg = new Registry();
+    reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey", cmuxWindowId: "win-1" });
+    const out = reg.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "wakey" });
+    expect(out).toEqual([]); // no change -- cmuxWindowId wasn't passed, so it isn't compared
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.cmuxWindowId).toBe("win-1");
+  });
+
+  test("a cmux-sourced ref never carries a cmuxWindowId", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "ws-1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.cmuxWindowId).toBeNull();
+  });
+});
+
+describe("Registry.setPlacementOverride", () => {
+  test("sets placementOverride and emits workspace.upserted", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "ws-1", "cmux", "/repo"));
+    const id = [...reg.workspaces.values()][0]!.id;
+    const out = reg.setPlacementOverride(id, "chrome-win-2");
+    expect(out.length).toBe(1);
+    expect(out[0]!.name).toBe("workspace.upserted");
+    expect(reg.workspaces.get(id)!.placementOverride).toBe("chrome-win-2");
+  });
+
+  test("clearing back to null also emits", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "ws-1", "cmux", "/repo"));
+    const id = [...reg.workspaces.values()][0]!.id;
+    reg.setPlacementOverride(id, "chrome-win-2");
+    const out = reg.setPlacementOverride(id, null);
+    expect(out.length).toBe(1);
+    expect(reg.workspaces.get(id)!.placementOverride).toBeNull();
+  });
+
+  test("an unchanged value is a no-op", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "ws-1", "cmux", "/repo"));
+    const id = [...reg.workspaces.values()][0]!.id;
+    reg.setPlacementOverride(id, "chrome-win-2");
+    const out = reg.setPlacementOverride(id, "chrome-win-2");
+    expect(out).toEqual([]);
+  });
+
+  test("an unknown id is a no-op", () => {
+    const reg = new Registry();
+    const out = reg.setPlacementOverride("mw_nope", "chrome-win-2");
+    expect(out).toEqual([]);
+  });
+
+  test("clearAttached (detach-on-close) also clears placementOverride, per the contract's 'override clears with detach'", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "ws-1", "cmux", "/repo"));
+    const id = [...reg.workspaces.values()][0]!.id;
+    reg.markAttached(id);
+    reg.setPlacementOverride(id, "chrome-win-2");
+    reg.clearAttached(id);
+    expect(reg.workspaces.get(id)!.placementOverride).toBeNull();
+  });
+});
+
+describe("Registry window pairing (windowPairings / homeChromeWindowId)", () => {
+  test("an unpaired cmux window resolves to null", () => {
+    const reg = new Registry();
+    expect(reg.homeChromeWindowId("win-1")).toBeNull();
+  });
+
+  test("a null cmuxWindowId (cmux-sourced ref, or legacy mode) resolves to null", () => {
+    const reg = new Registry();
+    expect(reg.homeChromeWindowId(null)).toBeNull();
+  });
+
+  test("setWindowPairing then homeChromeWindowId round-trips", () => {
+    const reg = new Registry();
+    reg.setWindowPairing("win-1", "chrome-win-a");
+    expect(reg.homeChromeWindowId("win-1")).toBe("chrome-win-a");
+  });
+
+  test("re-pairing the same cmux window overwrites the previous pairing", () => {
+    const reg = new Registry();
+    reg.setWindowPairing("win-1", "chrome-win-a");
+    reg.setWindowPairing("win-1", "chrome-win-b");
+    expect(reg.homeChromeWindowId("win-1")).toBe("chrome-win-b");
+  });
 });
 
 describe("Registry.reclassifyAsTmux", () => {

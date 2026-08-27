@@ -5,9 +5,11 @@ import {
   type CmuxActuatorAction,
   type ReconcileConfig,
   type ReconcileGlobalInput,
+  type ReconcilePartitionInput,
   type ReconcileSession,
   type ReconcileState,
   type ReconcileTab,
+  type ReconcileWindow,
   type ReconcileWindowsInput,
 } from "../src/tmux-reconcile.ts";
 
@@ -21,8 +23,12 @@ function session(id: string, name: string, attached = 1): ReconcileSession {
   return { id, name, attached };
 }
 
-function tab(id: string, title: string, opts: Partial<Pick<ReconcileTab, "pinned" | "index">> = {}): ReconcileTab {
-  return { id, title, pinned: opts.pinned ?? false, index: opts.index ?? 0 };
+function tab(id: string, title: string, opts: Partial<Pick<ReconcileTab, "pinned" | "index" | "selected">> = {}): ReconcileTab {
+  return { id, title, pinned: opts.pinned ?? false, index: opts.index ?? 0, selected: opts.selected ?? false };
+}
+
+function win(id: string, tabs: ReconcileTab[], index = 0): ReconcileWindow {
+  return { id, index, tabs };
 }
 
 function actionsOfType<T extends CmuxActuatorAction["type"]>(actions: CmuxActuatorAction[], type: T) {
@@ -35,7 +41,7 @@ describe("reconcile -- windows mode: spawn", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(),
-      windows: [{ id: "win-1", tabs: [] }],
+      windows: [win("win-1", [])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -49,7 +55,7 @@ describe("reconcile -- windows mode: spawn", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -62,10 +68,7 @@ describe("reconcile -- windows mode: spawn", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(),
-      windows: [
-        { id: "win-1", tabs: [] },
-        { id: "win-2", tabs: [] },
-      ],
+      windows: [win("win-1", []), win("win-2", [])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -81,7 +84,7 @@ describe("reconcile -- windows mode: title drift / title lock", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "some other title")] }],
+      windows: [win("win-1", [tab("tab-a", "some other title")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -94,7 +97,7 @@ describe("reconcile -- windows mode: title drift / title lock", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -109,7 +112,7 @@ describe("reconcile -- windows mode: reattach after restore", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(), // no client -- restored/detached
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -123,7 +126,7 @@ describe("reconcile -- windows mode: reattach after restore", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state,
       config: config({ reattachGraceMs: 8000 }),
     };
@@ -139,7 +142,7 @@ describe("reconcile -- windows mode: reattach after restore", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state,
       config: config({ reattachGraceMs: 8000 }),
     };
@@ -153,7 +156,7 @@ describe("reconcile -- windows mode: reattach after restore", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map(),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -169,7 +172,7 @@ describe("reconcile -- windows mode: reap", () => {
       mode: "windows",
       sessions: [], // $1 is gone
       hostMap: new Map(),
-      windows: [{ id: "win-1", tabs: [] }], // the tab itself is also already gone from cmux's own listing
+      windows: [win("win-1", [])], // the tab itself is also already gone from cmux's own listing
       state,
       config: config(),
     };
@@ -199,7 +202,7 @@ describe("reconcile -- windows mode: reap", () => {
       mode: "windows",
       sessions: [session("$1", "compliance")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "compliance")] }],
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
       state,
       config: config(),
     };
@@ -217,15 +220,12 @@ describe("reconcile -- windows mode: alphabetize", () => {
       ["tab-mmm", "$3"],
     ]);
     const windows = [
-      {
-        id: "win-1",
-        tabs: [
-          tab("tab-pinned", "pinned-one", { pinned: true, index: 0 }),
-          tab("tab-zzz", "zzz", { index: 1 }),
-          tab("tab-aaa", "Aaa", { index: 2 }),
-          tab("tab-mmm", "mmm", { index: 3 }),
-        ],
-      },
+      win("win-1", [
+        tab("tab-pinned", "pinned-one", { pinned: true, index: 0 }),
+        tab("tab-zzz", "zzz", { index: 1 }),
+        tab("tab-aaa", "Aaa", { index: 2 }),
+        tab("tab-mmm", "mmm", { index: 3 }),
+      ]),
     ];
     const input: ReconcileWindowsInput = { mode: "windows", sessions, hostMap, windows, state: emptyReconcileState(), config: config() };
     const out = reconcile(input);
@@ -240,7 +240,7 @@ describe("reconcile -- windows mode: alphabetize", () => {
       ["tab-aaa", "$1"],
       ["tab-bbb", "$2"],
     ]);
-    const windows = [{ id: "win-1", tabs: [tab("tab-aaa", "aaa", { index: 0 }), tab("tab-bbb", "bbb", { index: 1 })] }];
+    const windows = [win("win-1", [tab("tab-aaa", "aaa", { index: 0 }), tab("tab-bbb", "bbb", { index: 1 })])];
     const input: ReconcileWindowsInput = { mode: "windows", sessions, hostMap, windows, state: emptyReconcileState(), config: config() };
     const out = reconcile(input);
     expect(actionsOfType(out.actions, "reorder")).toEqual([]);
@@ -252,7 +252,7 @@ describe("reconcile -- windows mode: alphabetize", () => {
       ["tab-zzz", "$1"],
       ["tab-aaa", "$2"],
     ]);
-    const windows = [{ id: "win-1", tabs: [tab("tab-zzz", "zzz", { index: 0 }), tab("tab-aaa", "aaa", { index: 1 })] }];
+    const windows = [win("win-1", [tab("tab-zzz", "zzz", { index: 0 }), tab("tab-aaa", "aaa", { index: 1 })])];
     const input: ReconcileWindowsInput = {
       mode: "windows",
       sessions,
@@ -273,7 +273,7 @@ describe("reconcile -- windows mode: rename survives via id-keyed state", () => 
       mode: "windows",
       sessions: [session("$1", "old-name")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "old-name")] }],
+      windows: [win("win-1", [tab("tab-a", "old-name")])],
       state: emptyReconcileState(),
       config: config(),
     };
@@ -286,7 +286,7 @@ describe("reconcile -- windows mode: rename survives via id-keyed state", () => 
       mode: "windows",
       sessions: [session("$1", "new-name")],
       hostMap: new Map([["tab-a", "$1"]]),
-      windows: [{ id: "win-1", tabs: [tab("tab-a", "old-name")] }],
+      windows: [win("win-1", [tab("tab-a", "old-name")])],
       state: out1.nextState,
       config: config(),
     };
@@ -388,5 +388,430 @@ describe("reconcile -- global mode", () => {
     expect(out.actions).toEqual([{ type: "reap", workspaceRef: "tab-a" }]);
     expect(out.registryIntents).toContainEqual({ type: "archiveTmuxRef", sessionId: "$1" });
     expect(out.nextState.globalAttachments.has("$1")).toBe(false);
+  });
+});
+
+describe("reconcile -- partition mode: spawn placement", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", ...overrides });
+  }
+
+  test("a session with no tab anywhere spawns in the FOCUSED window", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(),
+      windows: [win("win-1", [], 0), win("win-2", [], 1)],
+      focusedWindowId: "win-2",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "spawn", windowId: "win-2", sessionId: "$1", sessionName: "compliance", cwd: "/hub" }]);
+    expect(out.registryIntents).toEqual([{ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-2" }]);
+  });
+
+  test("no focused window falls back to the LOWEST-INDEX window", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(),
+      windows: [win("win-b", [], 5), win("win-a", [], 1)],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "spawn", windowId: "win-a", sessionId: "$1", sessionName: "compliance", cwd: "/hub" }]);
+  });
+
+  test("a focusedWindowId that no longer exists (window closed) also falls back to lowest-index", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(),
+      windows: [win("win-a", [], 0), win("win-b", [], 1)],
+      focusedWindowId: "win-stale",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "spawn", windowId: "win-a", sessionId: "$1", sessionName: "compliance", cwd: "/hub" }]);
+  });
+
+  test("zero windows at all -- nothing to spawn into, no crash", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(),
+      windows: [],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([]);
+    expect(out.registryIntents).toEqual([]);
+  });
+
+  test("an already-present single tab is not re-spawned", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([["tab-a", "$1"]]),
+      windows: [win("win-1", [tab("tab-a", "compliance", { selected: true })])],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "spawn")).toEqual([]);
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-a", windowId: "win-1" });
+  });
+});
+
+describe("reconcile -- partition mode: title lock and reattach (single-candidate case)", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", ...overrides });
+  }
+
+  test("a hosted tab whose title drifted is retitled", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([["tab-a", "$1"]]),
+      windows: [win("win-1", [tab("tab-a", "some other title", { selected: true })])],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "retitle", workspaceRef: "tab-a", title: "compliance" }]);
+  });
+
+  test("a title-matched but unhosted tab is reattached, throttled", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(), // no client -- restored/detached
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "reattach", workspaceRef: "tab-a", sessionName: "compliance" }]);
+    // not recorded as a confirmed attachment yet -- same warmup precedent as windows mode
+    expect(out.nextState.partitionAttachments.has("$1")).toBe(false);
+  });
+
+  test("reattach throttled within the grace window is not repeated", () => {
+    const state: ReconcileState = { ...emptyReconcileState(), reattachAttempts: new Map([["win-1|tab-a", NOW - 1000]]) };
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(),
+      windows: [win("win-1", [tab("tab-a", "compliance")])],
+      focusedWindowId: "win-1",
+      state,
+      config: partitionConfig({ reattachGraceMs: 8000 }),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reattach")).toEqual([]);
+  });
+});
+
+describe("reconcile -- partition mode: multi-window legacy convergence (the one that matters most)", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", alphabetize: false, ...overrides });
+  }
+
+  test("exactly one duplicate is selected -- IT survives, the other is reaped", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([
+        ["tab-in-win1", "$1"],
+        ["tab-in-win2", "$1"],
+      ]),
+      windows: [
+        win("win-1", [tab("tab-in-win1", "compliance", { selected: false })], 0),
+        win("win-2", [tab("tab-in-win2", "compliance", { selected: true })], 1),
+      ],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reap")).toEqual([{ type: "reap", workspaceRef: "tab-in-win1" }]);
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-in-win2", windowId: "win-2" });
+  });
+
+  test("BOTH duplicates selected (routine in mirror mode) -- falls back to lowest window index", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([
+        ["tab-in-win5", "$1"],
+        ["tab-in-win2", "$1"],
+      ]),
+      windows: [
+        win("win-5", [tab("tab-in-win5", "compliance", { selected: true })], 5),
+        win("win-2", [tab("tab-in-win2", "compliance", { selected: true })], 2),
+      ],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    // win-2 has the lower index (2 < 5) -- its tab survives
+    expect(actionsOfType(out.actions, "reap")).toEqual([{ type: "reap", workspaceRef: "tab-in-win5" }]);
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-in-win2", windowId: "win-2" });
+  });
+
+  test("NEITHER duplicate selected -- falls back to lowest window index", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([
+        ["tab-in-win3", "$1"],
+        ["tab-in-win0", "$1"],
+      ]),
+      windows: [win("win-3", [tab("tab-in-win3", "compliance")], 3), win("win-0", [tab("tab-in-win0", "compliance")], 0)],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reap")).toEqual([{ type: "reap", workspaceRef: "tab-in-win3" }]);
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-in-win0", windowId: "win-0" });
+  });
+
+  test("THREE-way duplicate (a real mirror-era shape): exactly one survives, the other two reap in the same tick", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([
+        ["tab-w0", "$1"],
+        ["tab-w1", "$1"],
+        ["tab-w2", "$1"],
+      ]),
+      windows: [
+        win("win-0", [tab("tab-w0", "compliance")], 0),
+        win("win-1", [tab("tab-w1", "compliance", { selected: true })], 1),
+        win("win-2", [tab("tab-w2", "compliance")], 2),
+      ],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    // win-1's tab is the only one selected -- it wins regardless of index
+    expect(actionsOfType(out.actions, "reap").map((a) => a.workspaceRef).sort()).toEqual(["tab-w0", "tab-w2"]);
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-w1", windowId: "win-1" });
+  });
+
+  test("one-time convergence: the NEXT tick after reaping sees only one candidate and reaps nothing further", () => {
+    const tick1: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([
+        ["tab-in-win1", "$1"],
+        ["tab-in-win2", "$1"],
+      ]),
+      windows: [win("win-1", [tab("tab-in-win1", "compliance")], 0), win("win-2", [tab("tab-in-win2", "compliance", { selected: true })], 1)],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out1 = reconcile(tick1);
+    expect(actionsOfType(out1.actions, "reap")).toHaveLength(1);
+
+    // Tick 2: the reaped tab is actually gone now (cmux caught up).
+    const tick2: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([["tab-in-win2", "$1"]]),
+      windows: [win("win-1", []), win("win-2", [tab("tab-in-win2", "compliance", { selected: true })], 1)],
+      focusedWindowId: null,
+      state: out1.nextState,
+      config: partitionConfig(),
+    };
+    const out2 = reconcile(tick2);
+    expect(actionsOfType(out2.actions, "reap")).toEqual([]);
+  });
+
+  test("title-matched (unhosted) duplicates also converge -- multiple restored/detached copies reap down to one", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map(), // neither has a live client
+      windows: [win("win-3", [tab("tab-w3", "compliance")], 3), win("win-1", [tab("tab-w1", "compliance")], 1)],
+      focusedWindowId: null,
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reap")).toEqual([{ type: "reap", workspaceRef: "tab-w3" }]);
+    expect(actionsOfType(out.actions, "reattach")).toEqual([{ type: "reattach", workspaceRef: "tab-w1", sessionName: "compliance" }]);
+  });
+});
+
+describe("reconcile -- partition mode: user tab move between windows is respected", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", alphabetize: false, ...overrides });
+  }
+
+  test("a tracked tab found in a DIFFERENT window this tick updates the attachment -- nothing moves it back", () => {
+    const state: ReconcileState = { ...emptyReconcileState(), partitionAttachments: new Map([["$1", { tabId: "tab-a", windowId: "win-1" }]]) };
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([["tab-a", "$1"]]),
+      // Same tab id, now reported under win-2 (the user dragged it there).
+      windows: [win("win-1", [], 0), win("win-2", [tab("tab-a", "compliance", { selected: true })], 1)],
+      focusedWindowId: "win-1",
+      state,
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    // No spawn (it's still present, just elsewhere), no reap (only one candidate).
+    expect(out.actions.find((a) => a.type === "spawn" || a.type === "reap")).toBeUndefined();
+    expect(out.nextState.partitionAttachments.get("$1")).toEqual({ tabId: "tab-a", windowId: "win-2" });
+  });
+});
+
+describe("reconcile -- partition mode: reap on session death", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", ...overrides });
+  }
+
+  test("a tracked session no longer live has its tab reaped and archived", () => {
+    const state: ReconcileState = { ...emptyReconcileState(), partitionAttachments: new Map([["$1", { tabId: "tab-a", windowId: "win-1" }]]) };
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [], // $1 is gone
+      hostMap: new Map(),
+      windows: [win("win-1", [])],
+      focusedWindowId: null,
+      state,
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(out.actions).toEqual([{ type: "reap", workspaceRef: "tab-a" }]);
+    expect(out.registryIntents).toEqual([{ type: "archiveTmuxRef", sessionId: "$1" }]);
+    expect(out.nextState.partitionAttachments.has("$1")).toBe(false);
+  });
+
+  test("a still-live session's tracked tab is never reaped", () => {
+    const state: ReconcileState = { ...emptyReconcileState(), partitionAttachments: new Map([["$1", { tabId: "tab-a", windowId: "win-1" }]]) };
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "compliance")],
+      hostMap: new Map([["tab-a", "$1"]]),
+      windows: [win("win-1", [tab("tab-a", "compliance", { selected: true })])],
+      focusedWindowId: "win-1",
+      state,
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reap")).toEqual([]);
+  });
+});
+
+describe("reconcile -- partition mode: alphabetize (UX parity, not explicitly contracted)", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", ...overrides });
+  }
+
+  test("a window hosting one of our tabs is alphabetized alongside its other tabs", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "zzz")],
+      hostMap: new Map([["tab-zzz", "$1"]]),
+      windows: [win("win-1", [tab("tab-zzz", "zzz", { index: 0, selected: true }), tab("tab-aaa", "aaa", { index: 1 })])],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reorder")).toEqual([
+      { type: "reorder", windowId: "win-1", orderedWorkspaceRefs: ["tab-aaa", "tab-zzz"] },
+    ]);
+  });
+
+  test("disabled via config.alphabetize -- no reorder actions", () => {
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions: [session("$1", "zzz")],
+      hostMap: new Map([["tab-zzz", "$1"]]),
+      windows: [win("win-1", [tab("tab-zzz", "zzz", { index: 0, selected: true }), tab("tab-aaa", "aaa", { index: 1 })])],
+      focusedWindowId: "win-1",
+      state: emptyReconcileState(),
+      config: partitionConfig({ alphabetize: false }),
+    };
+    const out = reconcile(input);
+    expect(actionsOfType(out.actions, "reorder")).toEqual([]);
+  });
+});
+
+describe("reconcile -- partition mode: Zac's real shape (8 sessions x 2 windows, one-tick convergence)", () => {
+  function partitionConfig(overrides: Partial<ReconcileConfig> = {}) {
+    return config({ mirrorMode: "partition", alphabetize: false, ...overrides });
+  }
+
+  test("every session with duplicates in both windows converges to exactly one tab each, in a single tick", () => {
+    const sessionNames = ["cmux", "compliance", "mh-accounts", "oprey-ingest", "plugins", "wakey", "data-request", "julia-reviews"];
+    const sessions = sessionNames.map((name, i) => session(`$${i}`, name));
+
+    const hostMap = new Map<string, string>();
+    const win1Tabs: ReconcileTab[] = [];
+    const win2Tabs: ReconcileTab[] = [];
+    sessionNames.forEach((name, i) => {
+      const tabA = `tab-${name}-w1`;
+      const tabB = `tab-${name}-w2`;
+      hostMap.set(tabA, `$${i}`);
+      hostMap.set(tabB, `$${i}`);
+      // Exactly one session ("cmux", index 0) is the one actively selected
+      // in window 2 -- everything else has no clear winner (mirrors a
+      // real "nothing is selected in most tabs right now" snapshot).
+      win1Tabs.push(tab(tabA, name, { index: i }));
+      win2Tabs.push(tab(tabB, name, { index: i, selected: name === "cmux" }));
+    });
+
+    const input: ReconcilePartitionInput = {
+      mode: "partition",
+      sessions,
+      hostMap,
+      windows: [win("win-1", win1Tabs, 0), win("win-2", win2Tabs, 1)],
+      focusedWindowId: "win-2",
+      state: emptyReconcileState(),
+      config: partitionConfig(),
+    };
+    const out = reconcile(input);
+
+    // Exactly 8 reaps (one per session -- the OTHER window's duplicate).
+    expect(actionsOfType(out.actions, "reap")).toHaveLength(8);
+    // No spawns, no reattaches -- every session already had a live tab.
+    expect(actionsOfType(out.actions, "spawn")).toEqual([]);
+    expect(actionsOfType(out.actions, "reattach")).toEqual([]);
+    // Exactly one partitionAttachment per session.
+    expect(out.nextState.partitionAttachments.size).toBe(8);
+    // "cmux" is selected in win-2 -- it wins outright, regardless of index.
+    expect(out.nextState.partitionAttachments.get("$0")).toEqual({ tabId: "tab-cmux-w2", windowId: "win-2" });
+    // Every other session has no selected duplicate -- lowest window index
+    // (win-1, index 0) wins for all of them.
+    for (let i = 1; i < sessionNames.length; i++) {
+      const name = sessionNames[i]!;
+      expect(out.nextState.partitionAttachments.get(`$${i}`)).toEqual({ tabId: `tab-${name}-w1`, windowId: "win-1" });
+    }
+    // Every registry intent carries the correct home window.
+    const upserts = out.registryIntents.filter((r) => r.type === "upsertTmuxRef");
+    expect(upserts).toHaveLength(8);
+    for (const u of upserts) {
+      if (u.type !== "upsertTmuxRef") continue;
+      const attachment = out.nextState.partitionAttachments.get(u.sessionId);
+      expect(u.cmuxWindowId).toBe(attachment!.windowId);
+    }
   });
 });

@@ -131,8 +131,12 @@ Then pushes events (monotonic `seq`, client ignores `seq <= lastSeen`):
 {"type":"event","seq":124,"name":"workspace.activated","workspace":{"id":"...","title":"...","color":"..."}}
 {"type":"event","seq":125,"name":"workspace.upserted","workspace":{...}}          // create OR rename (title changed) OR unarchive
 {"type":"event","seq":126,"name":"workspace.archived","workspace":{...}}
-{"type":"event","seq":127,"name":"open_url","workspace":{...},"url":"https://..."}
+{"type":"event","seq":127,"name":"open_url","workspace":{...},"url":"https://...","homeChromeWindowId":"<uuid>"|null}
 ```
+Every sync/state-frame workspace object and every `open_url` event also carry `homeChromeWindowId`
+and (sync/state only) `placementOverride` -- see "Window pairing" below. Both are computed at
+serialization time (like `ports`), NOT stored on `ActuatorWorkspace` itself.
+
 Client MAY send `{"type":"state","groups":[{"title":"...","tabCount":3}]}` reports; server logs them
 (sent by the extension's tab-group janitor, one entry per unrecognized FOREIGN group it left
 untouched -- server logs each as `janitor: leaving unknown group '<title>' (N tabs)`).
@@ -140,6 +144,18 @@ untouched -- server logs each as `janitor: leaving unknown group '<title>' (N ta
 Client MAY send `{"type":"userClosedGroup","id":"mw_..."}` (detach-on-close, see Grouping) when the
 user closes a MANAGED group by hand. No reply frame; the daemon clears attachment and the next
 sync reconciliation stops including it.
+
+Client MAY send `{"type":"groupPlacement","id":"mw_...","chromeWindowId":"<uuid>"|null}` (Placement
+ownership, see "Window pairing" below) when the user moves a MANAGED group to a Chrome window
+other than its home, or `null` when it's back home. No reply frame; the daemon persists the
+override and broadcasts the identity's `workspace.upserted`.
+
+Client MAY send `{"type":"windowPairing","cmuxWindowId":"<uuid>","chromeWindowId":"<uuid>"}` (Chrome
+window pairing, see "Window pairing" below) once it resolves or creates the paired Chrome window
+for a cmux window, via its per-window marker tab. No reply frame; the daemon persists the pairing
+and pushes a fresh `sync` to every client (pairing-dependent fields are computed at serialization
+time, not carried by individual events, so already-connected clients need an explicit sync to see
+a new pairing).
 
 `color`: one of Chrome's 9 tabGroups colors, `["grey","blue","red","yellow","green","pink","purple","cyan","orange"]`.
 When a workspace's `cmuxColor` is set, map it HUE-FIRST (humans classify color by hue, not raw RGB distance -- a dark, desaturated navy IS blue to a person even though it sits numerically closer to a dark green/grey swatch under Euclidean RGB):
@@ -741,3 +757,40 @@ Chrome group. Chrome windows pair 1:1 with cmux windows (per-monitor fullscreen 
   home window disagrees with reality AND that were not observed as user-moved (default
   posture after a fresh boot with no observations: adopt reality as override rather
   than move things — never fight placement we didn't watch happen).
+
+### Implementation notes (daemon half, 2026-08-27 evening)
+
+- `WorkspaceRef.cmuxWindowId` is scoped to `source: "tmux"` refs only — stamped exclusively by
+  partition-mode `tmux-reconcile.ts` via `RegistryIntent.upsertTmuxRef.cmuxWindowId`, carried
+  through `Registry.upsert`'s `changed` check (so a tab MOVING between windows re-broadcasts).
+  A cmux-sourced ref never carries one — its own activation/window-follow events report no
+  window id at all. `Registry.windowPairings: Map<cmuxWindowId, chromeWindowId>` +
+  `homeChromeWindowId()`/`setWindowPairing()` are the persisted pairing map. Both are
+  per-ref/per-map fields, JSON-round-tripped in `registry.json` (`windowPairings` as a plain
+  object, defensively `?? null`/`?? {}` backfilled for a pre-feature file).
+- `homeChromeWindowId`/`placementOverride` deliberately follow the SAME wire pattern as `ports`
+  (`server.ts`'s `portsForIdentity`): computed from the raw `Registry`/snapshot at serialization
+  time (`buildSync`/`getState`/`pushOpenUrl`), never added to the core `ActuatorWorkspace` type
+  or to `group-projection.ts`'s identity/dedup logic. In `groupBy: "title"`, the representative
+  value is the first LIVE member carrying a non-null value (same "first live member wins" rule
+  `representativeColorInputs` already uses for `cmuxColor`/`paletteIndex`) — unambiguous in
+  partition mode's steady state (at most one live tmux-sourced member per title) and correctly
+  `null` for legacy windows/global-mode sessions, which never stamp `cmuxWindowId` at all.
+- `open_url` carries `homeChromeWindowId` (not just sync/state) because group CREATION happens
+  at that exact moment ("Group creation (on-open) happens in the home window") — the extension
+  needs the target window right then, not on the next sync.
+- The `windowPairing` ext→daemon frame (Wire protocol, above) is NOT part of this section's
+  original contract, which specifies only the persisted map and that it's "resolved by marker
+  tab" — this frame is the reporting mechanism the marker-tab flow needs to actually populate
+  that map. Shape mirrors `groupPlacement`'s.
+- `Registry.clearAttached` (detach-on-close) also clears `placementOverride`, matching "override
+  clears with detach" above.
+- Partition mode keeps `config.tmux.alphabetize` (not in this section's original scope, but the
+  existing windows/global-mode UX parity was cheap to preserve): a window that received one of
+  our tabs this tick gets re-sorted the same way windows mode already does.
+- `tmux.mirror`'s new DEFAULT of `"partition"` is NOT live-activated by this change alone —
+  `config.tmux.enabled` still gates the whole tmux source/actuator subsystem and defaults to
+  `false`; a fresh install or an existing `tmux.enabled: false` config sees no behavior change.
+  An EXISTING `tmux.enabled: true` config with no explicit `tmux.mirror` key, however, picks up
+  `"partition"` on its next daemon restart (or the next `TMUX_CMUX_MIRROR`-unset config reload)
+  — see BUILD-STATUS.md for the runbook and why this daemon half stops short of activating it.

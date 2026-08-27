@@ -196,3 +196,72 @@ describe("registry persistence round-trip -- paletteIndex (palette allocation)",
     expect(ref.paletteIndex).toBeNull();
   });
 });
+
+describe("registry persistence round-trip -- window pairing (docs/protocol.md, 'Window pairing')", () => {
+  test("a tmux-sourced ref's cmuxWindowId survives a restart", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+
+    const restored = roundTrip(registry);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.cmuxWindowId).toBe("win-1");
+  });
+
+  test("a cmux-sourced ref still shows cmuxWindowId: null after re-hydration", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+
+    const restored = roundTrip(registry);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.cmuxWindowId).toBeNull();
+  });
+
+  test("placementOverride survives a restart", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const id = [...registry.workspaces.values()][0]!.id;
+    registry.setPlacementOverride(id, "chrome-win-b");
+
+    const restored = roundTrip(registry);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.placementOverride).toBe("chrome-win-b");
+  });
+
+  test("the windowPairings map survives a restart", () => {
+    const registry = new Registry();
+    registry.setWindowPairing("win-1", "chrome-win-a");
+    registry.setWindowPairing("win-2", "chrome-win-b");
+
+    const restored = roundTrip(registry);
+    expect(restored.homeChromeWindowId("win-1")).toBe("chrome-win-a");
+    expect(restored.homeChromeWindowId("win-2")).toBe("chrome-win-b");
+  });
+
+  test("a registry.json written before this feature (no cmuxWindowId/placementOverride/windowPairings at all) hydrates cleanly, not a crash", () => {
+    const legacySaved = {
+      workspaces: [
+        {
+          id: "mw_legacy",
+          title: "old-workspace",
+          cwd: "/old",
+          source: "cmux" as const,
+          sourceId: "SRC-LEGACY",
+          archived: false,
+          cmuxColor: null,
+          attachedAt: null,
+          paintedColor: null,
+          paletteIndex: null,
+          updatedAt: new Date().toISOString(),
+          // no cmuxWindowId/placementOverride field at all -- simulates a pre-feature file
+        },
+      ],
+      activeId: null,
+      // no windowPairings key at all either
+    };
+    const registry = hydrateRegistry(legacySaved as any, null);
+    const ref = [...registry.workspaces.values()][0]!;
+    expect(ref.cmuxWindowId).toBeNull();
+    expect(ref.placementOverride).toBeNull();
+    expect(registry.homeChromeWindowId("win-1")).toBeNull();
+  });
+});

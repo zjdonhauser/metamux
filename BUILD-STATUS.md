@@ -334,9 +334,86 @@ what hex gets painted for it.
 - Not activated live -- supervisor's call (a daemon restart repaints every backflow-owned tab to
   the matching swatch hex).
 
+## Window pairing (partition model, replaces mirroring) -- daemon half (2026-08-27 evening)
+
+Zac's directive: mirroring dies. Each tmux session lives in exactly one cmux tab and one Chrome
+group; Chrome windows pair 1:1 with cmux windows. Full contract in `docs/protocol.md`'s "Window
+pairing" section. This round is the DAEMON HALF ONLY, per the task's explicit scope -- the
+extension half (marker-tab-per-window, per-window group creation/activation/janitor, the
+`groupPlacement`/`windowPairing` frame senders) is a separate follow-up task.
+
+- [x] `tmux-reconcile.ts` gains `"partition"` mirror mode: a session with no cmux tab spawns ONE
+      tab in the FOCUSED cmux window (fallback: lowest-index window, and zero-windows is a safe
+      no-op). A session with tabs in MULTIPLE windows (mirror-era legacy, or the routine "both
+      windows happen to have `selected: true`" case) converges to ONE: prefers a `selected: true`
+      candidate; if none or more than one, falls back to lowest window index. Reaps every other
+      duplicate the same tick. A tab moving between windows (user drag) is respected -- the
+      tracked attachment just updates to wherever it's actually found. `alphabetize` is kept
+      (UX parity with windows mode, not in the original contract text but cheap to preserve).
+- [x] `cmux-actuator.ts`: `listWindows()` now returns `index`; new `getFocusedWindowId()` (`cmux
+      current-window`); `listTabs()` now returns `selected`.
+- [x] TDD, including a dedicated "Zac's real shape" test: 8 sessions x 2 windows, every session
+      duplicated in both, one session selected in the non-focused window -- asserts exactly 8
+      reaps (one per session), zero spawns/reattaches, and every survivor is the selected one (or
+      lowest-index window for the rest) in a SINGLE tick. This is the scenario the task flagged
+      as highest-scrutiny (it runs against Zac's actual live setup on activation) -- verified pure
+      or not at all, no live run performed.
+- [x] Registry: `WorkspaceRef.cmuxWindowId` (tmux-sourced refs only, stamped by partition-mode
+      reconcile) and `.placementOverride` (ext-reported, via `groupPlacement`); `windowPairings:
+      Map<cmuxWindowId, chromeWindowId>` + `setWindowPairing`/`homeChromeWindowId`; both new ref
+      fields flow through `upsert`'s `changed` check (a window move re-broadcasts) and are
+      persisted in `registry.json` (`windowPairings` as a plain object), defensively backfilled
+      for a pre-feature file. `clearAttached` also clears `placementOverride` ("override clears
+      with detach").
+- [x] `server.ts`: `homeChromeWindowId`/`placementOverride` spread onto sync/state workspace
+      objects AND `open_url` events at serialization time -- deliberately following the exact
+      same pattern as `ports` (computed from the raw snapshot, never added to the core
+      `ActuatorWorkspace` type or to `group-projection.ts`'s identity/dedup logic; see
+      docs/protocol.md's new "Implementation notes" for why this made a planned
+      `group-projection.ts` extension unnecessary). New ext->daemon frames `groupPlacement`
+      (in the original contract) and `windowPairing` (my own addition -- the contract specifies
+      only the persisted map and "resolved by marker tab", not how the daemon learns a pairing;
+      this is that reporting frame, shaped like `groupPlacement`).
+- [x] `main.ts`: `pollTmux` branches to `partition` mode (fetches `focusedWindowId` alongside
+      windows/tabs); new `handleGroupPlacement`/`handleWindowPairing` wired into `server.ts`'s
+      new callbacks, resolving wire identity -> real ref via the same
+      `groupProjection.resolveIdentityToWorkspaceId()` pattern as every other ext->daemon frame;
+      `hydrateRegistry`/`serializeRegistry` extended for the new persisted fields.
+- [x] Config: `tmux.mirror` gains `"partition"` (config.ts type/validation/CLI validation), and
+      it's the new DEFAULT (`DEFAULT_CONFIG.tmux.mirror`). `tmux-source.ts`'s own (separate)
+      `MirrorMode` type widened to match -- `TMUX_CMUX_MIRROR` env compat stays windows/global-only
+      (the legacy tool never had a `"partition"` env value).
+- [x] `docs/protocol.md` updated: Wire protocol section gains the two new frames and the
+      `homeChromeWindowId`/`placementOverride` fields; "Window pairing" section gains an
+      "Implementation notes" subsection covering every decision/deviation above.
+- [x] `bun test`: 532 pass, 0 fail (up from 502 at the start of this round). `bunx tsc --noEmit`:
+      clean.
+- **Not activated live.** `config.tmux.enabled` still defaults `false`, so this round changes
+  nothing for anyone not already running the tmux absorption live. For an EXISTING
+  `tmux.enabled: true` config with no explicit `tmux.mirror`, the new `"partition"` default takes
+  effect on the next daemon restart/config reload and will immediately run the multi-window
+  convergence reap against whatever real tmux/cmux state exists at that moment -- per the task's
+  explicit instruction, this was not triggered here (same category of live/destructive action as
+  the tmux cutover itself: a teammate's relayed "the user confirmed" is not the user's own
+  authorization for reaping real tabs on Zac's live setup). To activate deliberately: either set
+  `tmux.mirror: "partition"` explicitly (or leave it unset with `tmux.enabled: true` and restart/
+  reload), from a moment where Zac is watching, since the very next `pollTmux` tick after the
+  switch performs the one-time legacy convergence live.
+- **Extension half needed next** (not started, out of this round's scope): per-window marker tab
+  (`panel.html?win=<cmuxWindowId>`) to discover/create the paired Chrome window and report it via
+  the new `windowPairing` frame; honoring `homeChromeWindowId` on group creation (`open_url`) and
+  `placementOverride` on the janitor's cross-window recovery (skip overridden groups); sending
+  `groupPlacement` when a `tabGroups.onCreated`-in-other-window move is observed with a managed
+  title and no server-driven move marker; per-window activation/collapse scoping ("switching cmux
+  tabs in window W activates/collapses groups ONLY within W's paired Chrome window").
+
 ## Blockers
 
 - tmux absorption live cutover (kill the real tmux-cmux-sync process, edit real `.zshrc`,
   restart the real daemon against Zac's live tmux/cmux state) needs Zac's direct go-ahead --
   see "tmux absorption -- code complete, LIVE CUTOVER NOT PERFORMED" above. Everything else on
   `tmux-absorption` is done, tested, and ready to execute against.
+- Window pairing (partition model) live activation (see above) -- an EXISTING `tmux.enabled: true`
+  config's next restart/reload now defaults to `"partition"` and performs a one-time multi-window
+  convergence reap against real state; needs Zac watching when it happens, same category as the
+  tmux cutover itself.

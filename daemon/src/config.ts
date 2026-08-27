@@ -17,9 +17,12 @@ export interface TmuxConfig {
    * (docs/tmux-port-plan.md §2). Off by default -- absorbing
    * tmux-cmux-sync is an opt-in cutover, not automatic on upgrade. */
   enabled: boolean;
-  /** "windows": every cmux window mirrors every tmux session (true
-   * mirroring, one client per window -- plan §1.2). "global": one tab
-   * per session across all windows, unattended sessions only. */
+  /** "partition" (default): each tmux session lives in exactly one cmux
+   * tab, in exactly one cmux window (docs/protocol.md, "Window pairing").
+   * "windows": every cmux window mirrors every tmux session (true
+   * mirroring, one client per window -- plan §1.2, legacy). "global": one
+   * tab per session across all windows, unattended sessions only
+   * (legacy). */
   mirror: MirrorMode;
   /** Pinned tabs stay put; unpinned tabs sort case-insensitively by
    * title (plan §1.6). */
@@ -95,7 +98,7 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   reverseSync: false,
   groupBy: "title",
   createGroups: "on-open",
-  tmux: { enabled: false, mirror: "windows", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
+  tmux: { enabled: false, mirror: "partition", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
   janitor: true,
   janitorCrossWindow: true,
   colorBackflow: true,
@@ -124,7 +127,9 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
   // doesn't explicitly set tmux.mirror -- an explicit file value always
   // wins over the env, matching every other config key's precedence.
   const mirror =
-    tmuxObj.mirror === "global" || tmuxObj.mirror === "windows" ? tmuxObj.mirror : resolveMirrorMode(DEFAULT_CONFIG.tmux.mirror);
+    tmuxObj.mirror === "global" || tmuxObj.mirror === "windows" || tmuxObj.mirror === "partition"
+      ? tmuxObj.mirror
+      : resolveMirrorMode(DEFAULT_CONFIG.tmux.mirror);
   const tmux = {
     enabled: typeof tmuxObj.enabled === "boolean" ? tmuxObj.enabled : DEFAULT_CONFIG.tmux.enabled,
     mirror,

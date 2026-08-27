@@ -76,7 +76,7 @@ function extractRawIdentity(line: string): { bootId: string | null; seq: number 
 }
 
 export function hydrateRegistry(
-  saved: { workspaces: WorkspaceRef[]; activeId: string | null } | null,
+  saved: { workspaces: WorkspaceRef[]; activeId: string | null; windowPairings?: Record<string, string> } | null,
   namedSlots: Record<string, string> | null,
   palette: PaletteEntry[] = [],
 ): Registry {
@@ -84,21 +84,31 @@ export function hydrateRegistry(
   if (!saved) return registry;
   for (const ref of saved.workspaces ?? []) {
     // registry.json written before these features has no
-    // cmuxColor/attachedAt/paintedColor/paletteIndex field.
+    // cmuxColor/attachedAt/paintedColor/paletteIndex/cmuxWindowId/
+    // placementOverride field.
     registry.workspaces.set(ref.id, {
       ...ref,
       cmuxColor: ref.cmuxColor ?? null,
       attachedAt: ref.attachedAt ?? null,
       paintedColor: ref.paintedColor ?? null,
       paletteIndex: ref.paletteIndex ?? null,
+      cmuxWindowId: ref.cmuxWindowId ?? null,
+      placementOverride: ref.placementOverride ?? null,
     });
   }
   registry.activeId = saved.activeId ?? null;
+  for (const [cmuxWindowId, chromeWindowId] of Object.entries(saved.windowPairings ?? {})) {
+    registry.setWindowPairing(cmuxWindowId, chromeWindowId);
+  }
   return registry;
 }
 
 export function serializeRegistry(registry: Registry) {
-  return { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
+  return {
+    workspaces: [...registry.workspaces.values()],
+    activeId: registry.activeId,
+    windowPairings: Object.fromEntries(registry.windowPairings),
+  };
 }
 
 async function runDaemon(): Promise<void> {
@@ -107,7 +117,11 @@ async function runDaemon(): Promise<void> {
   const secret = await ensureSecret();
 
   const cursor = await readJsonOrDefault<CursorState>(cursorPath(), DEFAULT_CURSOR);
-  const savedRegistry = await readJsonOrDefault<{ workspaces: WorkspaceRef[]; activeId: string | null } | null>(
+  const savedRegistry = await readJsonOrDefault<{
+    workspaces: WorkspaceRef[];
+    activeId: string | null;
+    windowPairings?: Record<string, string>;
+  } | null>(
     registryPath(),
     null,
   );
@@ -223,6 +237,12 @@ async function runDaemon(): Promise<void> {
     onUserClosedGroup: (id) => {
       handleUserClosedGroup(id);
     },
+    onGroupPlacement: (id, chromeWindowId) => {
+      handleGroupPlacement(id, chromeWindowId);
+    },
+    onWindowPairing: (cmuxWindowId, chromeWindowId) => {
+      handleWindowPairing(cmuxWindowId, chromeWindowId);
+    },
     onPrune: () => persist(),
     log,
   });
@@ -240,6 +260,36 @@ async function runDaemon(): Promise<void> {
     for (const memberId of memberIds) registry.clearAttached(memberId);
     lazyGroups.clearAttached(id);
     log(`[detach] ${id} closed by user, cleared attachment for ${memberIds.length} workspace(s)`);
+    void persist();
+  };
+
+  // Placement ownership (docs/protocol.md, "Placement ownership"): the
+  // user moved a group's Chrome window by hand (or it returned home,
+  // chromeWindowId: null). `id` is a wire identity (an alias in groupBy:
+  // "title", a real workspace id in "workspace") -- resolved to the real
+  // ref the same way every other ext->daemon frame resolves identity
+  // (F9 reverse sync, detach-on-close).
+  const handleGroupPlacement = (id: string, chromeWindowId: string | null): void => {
+    const snapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
+    const targetWorkspaceId = groupProjection.resolveIdentityToWorkspaceId(id, snapshot);
+    if (!targetWorkspaceId) return;
+    const derived = registry.setPlacementOverride(targetWorkspaceId, chromeWindowId);
+    if (derived.length === 0) return;
+    server.broadcast(derived);
+    log(`[placement] ${id} -> ${chromeWindowId ?? "home"}`);
+    void persist();
+  };
+
+  // Chrome window pairing (docs/protocol.md, "Chrome window pairing"): the
+  // extension resolved (or created) the paired Chrome window for a cmux
+  // window via its per-window marker tab. Pushes a fresh sync afterward --
+  // homeChromeWindowId is computed at serialization time (server.ts), not
+  // carried by individual broadcast events, so a pairing change needs an
+  // explicit sync to reach already-connected clients.
+  const handleWindowPairing = (cmuxWindowId: string, chromeWindowId: string): void => {
+    registry.setWindowPairing(cmuxWindowId, chromeWindowId);
+    log(`[windowPairing] ${cmuxWindowId} -> ${chromeWindowId}`);
+    server.pushSyncToAll();
     void persist();
   };
 
@@ -520,8 +570,24 @@ async function runDaemon(): Promise<void> {
 
     let input: ReconcileInput;
     if (config.tmux.mirror === "windows") {
-      const windowsWithTabs = await Promise.all(windows.map(async (w) => ({ id: w.id, tabs: await cmuxActuator.listTabs(w.id) })));
+      const windowsWithTabs = await Promise.all(
+        windows.map(async (w) => ({ id: w.id, index: w.index, tabs: await cmuxActuator.listTabs(w.id) })),
+      );
       input = { mode: "windows", sessions, hostMap, windows: windowsWithTabs, state: tmuxReconcileState, config: reconcileConfig };
+    } else if (config.tmux.mirror === "partition") {
+      const [windowsWithTabs, focusedWindowId] = await Promise.all([
+        Promise.all(windows.map(async (w) => ({ id: w.id, index: w.index, tabs: await cmuxActuator.listTabs(w.id) }))),
+        cmuxActuator.getFocusedWindowId(),
+      ]);
+      input = {
+        mode: "partition",
+        sessions,
+        hostMap,
+        windows: windowsWithTabs,
+        focusedWindowId,
+        state: tmuxReconcileState,
+        config: reconcileConfig,
+      };
     } else {
       const allTabs = (await Promise.all(windows.map((w) => cmuxActuator.listTabs(w.id)))).flat();
       input = { mode: "global", sessions, hostMap, allTabs, state: tmuxReconcileState, config: reconcileConfig };

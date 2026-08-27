@@ -30,7 +30,21 @@ export interface ServerStats {
 
 type PushedEvent =
   | { type: "event"; seq: number; name: ActuatorEvent["name"]; workspace: ActuatorWorkspace }
-  | { type: "event"; seq: number; name: "open_url"; workspace: ActuatorWorkspace; url: string }
+  | {
+      type: "event";
+      seq: number;
+      name: "open_url";
+      workspace: ActuatorWorkspace;
+      url: string;
+      /** Window pairing (docs/protocol.md, "Chrome window pairing"): the
+       * Chrome window group creation should target, resolved at the exact
+       * moment of open_url -- "Group creation (on-open) happens in the
+       * home window, creating the paired Chrome window on demand
+       * (focused:false) if absent." null when unresolvable (no cmux
+       * window known yet, or the pair hasn't been created/reported) --
+       * the extension falls back to its own current window in that case. */
+      homeChromeWindowId: string | null;
+    }
   | { type: "event"; seq: number; name: "focus_window" };
 
 export interface ActuatorServerOptions {
@@ -58,6 +72,25 @@ export interface ActuatorServerOptions {
    * Chrome group by hand). Clearing attachedAt (registry + lazyGroups) and
    * persisting live in main.ts -- this is just the wire. */
   onUserClosedGroup?: (id: string) => void;
+  /** Placement ownership (docs/protocol.md, "Placement ownership"): called
+   * when an authed client sends `{"type":"groupPlacement","id":"...",
+   * "chromeWindowId":"..."|null}` -- the user moved (or the group returned
+   * home, chromeWindowId: null) an identity's group to a Chrome window
+   * other than its home. Resolving the wire id to a real ref and calling
+   * Registry.setPlacementOverride lives in main.ts -- this is just the
+   * wire. */
+  onGroupPlacement?: (id: string, chromeWindowId: string | null) => void;
+  /** Chrome window pairing (docs/protocol.md, "Chrome window pairing"):
+   * called when an authed client sends `{"type":"windowPairing",
+   * "cmuxWindowId":"...","chromeWindowId":"..."}` -- the extension
+   * resolved (or created) the paired Chrome window for a cmux window via
+   * its per-window marker tab. Not itself part of the written contract
+   * (docs/protocol.md only specifies the persisted map and how it's
+   * resolved "by marker tab") -- this is the reporting frame the marker-
+   * tab flow needs to actually populate that map; named to mirror
+   * `groupPlacement`'s shape. Registry.setWindowPairing + persisting live
+   * in main.ts. */
+  onWindowPairing?: (cmuxWindowId: string, chromeWindowId: string) => void;
   /** Registry compaction (POST /prune, `metamux prune`): called after
    * `registry.pruneArchived(null)` actually removed something, so main.ts
    * can persist registry.json -- ActuatorServer owns no file I/O itself. */
@@ -79,6 +112,8 @@ export class ActuatorServer {
   private portsTracker?: PortsTracker;
   private onUserActivatedGroup?: (id: string) => void;
   private onUserClosedGroup?: (id: string) => void;
+  private onGroupPlacement?: (id: string, chromeWindowId: string | null) => void;
+  private onWindowPairing?: (cmuxWindowId: string, chromeWindowId: string) => void;
   private onPrune?: () => void | Promise<void>;
   private port: number;
   private secret: string;
@@ -95,6 +130,8 @@ export class ActuatorServer {
     this.portsTracker = options.portsTracker;
     this.onUserActivatedGroup = options.onUserActivatedGroup;
     this.onUserClosedGroup = options.onUserClosedGroup;
+    this.onGroupPlacement = options.onGroupPlacement;
+    this.onWindowPairing = options.onWindowPairing;
     this.onPrune = options.onPrune;
     this.log = options.log ?? ((line: string) => console.log(line));
   }
@@ -145,6 +182,37 @@ export class ActuatorServer {
       for (const p of this.portsTracker.portsFor(member.sourceId)) ports.add(p);
     }
     return [...ports].sort((a, b) => a - b);
+  }
+
+  /** The paired Chrome window for a projected identity's HOME cmux window
+   * (docs/protocol.md, "Chrome window pairing") -- same shape as
+   * portsForIdentity: that member's own cmuxWindowId in groupBy:
+   * "workspace"; in groupBy: "title", the first LIVE member carrying one
+   * (partition mode guarantees at most one live tmux-sourced member per
+   * title in steady state, so this is unambiguous there; legacy windows/
+   * global modes never stamp cmuxWindowId at all, so this resolves to null
+   * for them, same as an unpaired window). Not baked into ActuatorWorkspace
+   * itself -- spread onto the wire object at serialization time, exactly
+   * like `ports`. */
+  private homeChromeWindowIdForIdentity(identity: ActuatorWorkspace, snapshot: GroupProjectionSnapshot): string | null {
+    if (this.config.groupBy === "workspace") {
+      const ref = snapshot.workspaces.find((w) => w.id === identity.id);
+      return ref ? this.registry.homeChromeWindowId(ref.cmuxWindowId) : null;
+    }
+    const member = snapshot.workspaces.find((w) => w.title === identity.title && !w.archived && w.cmuxWindowId !== null);
+    return member ? this.registry.homeChromeWindowId(member.cmuxWindowId) : null;
+  }
+
+  /** Placement ownership (docs/protocol.md, "Placement ownership") for a
+   * projected identity -- same representative-member shape as
+   * homeChromeWindowIdForIdentity. */
+  private placementOverrideForIdentity(identity: ActuatorWorkspace, snapshot: GroupProjectionSnapshot): string | null {
+    if (this.config.groupBy === "workspace") {
+      const ref = snapshot.workspaces.find((w) => w.id === identity.id);
+      return ref ? ref.placementOverride : null;
+    }
+    const member = snapshot.workspaces.find((w) => w.title === identity.title && !w.archived && w.placementOverride !== null);
+    return member ? member.placementOverride : null;
   }
 
   private handleFetch(req: Request, server: Server<WsData>): Response | Promise<Response> | undefined {
@@ -286,9 +354,10 @@ export class ActuatorServer {
     const snapshot = this.currentSnapshot();
     const identity = this.groupProjection.identityFor(target, snapshot);
     this.lazyGroups.markAttached(identity.id); // in-memory wire-identity cache for this session
+    const homeChromeWindowId = this.homeChromeWindowIdForIdentity(identity, snapshot);
     this.seq++;
-    this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr });
-    this.log(`[open_url] ${identity.title} (${identity.id}) -> ${urlStr}`);
+    this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr, homeChromeWindowId });
+    this.log(`[open_url] ${identity.title} (${identity.id}) -> ${urlStr}${homeChromeWindowId ? ` [win ${homeChromeWindowId}]` : ""}`);
     return identity;
   }
 
@@ -339,6 +408,20 @@ export class ActuatorServer {
     if (obj.type === "userClosedGroup") {
       const id = typeof obj.id === "string" ? obj.id : null;
       if (id) this.onUserClosedGroup?.(id);
+      return;
+    }
+
+    if (obj.type === "groupPlacement") {
+      const id = typeof obj.id === "string" ? obj.id : null;
+      const chromeWindowId = typeof obj.chromeWindowId === "string" ? obj.chromeWindowId : null;
+      if (id) this.onGroupPlacement?.(id, chromeWindowId);
+      return;
+    }
+
+    if (obj.type === "windowPairing") {
+      const cmuxWindowId = typeof obj.cmuxWindowId === "string" ? obj.cmuxWindowId : null;
+      const chromeWindowId = typeof obj.chromeWindowId === "string" ? obj.chromeWindowId : null;
+      if (cmuxWindowId && chromeWindowId) this.onWindowPairing?.(cmuxWindowId, chromeWindowId);
     }
   }
 
@@ -372,6 +455,8 @@ export class ActuatorServer {
         workspaces: workspaces.map((w) => ({
           ...w,
           ...(this.portsTracker ? { ports: this.portsForIdentity(w, snapshot) } : {}),
+          homeChromeWindowId: this.homeChromeWindowIdForIdentity(w, snapshot),
+          placementOverride: this.placementOverrideForIdentity(w, snapshot),
         })),
       },
     };
@@ -445,6 +530,8 @@ export class ActuatorServer {
         workspaces: projectedWorkspaces.map((w) => ({
           ...w,
           ...(this.portsTracker ? { ports: this.portsForIdentity(w, snapshot) } : {}),
+          homeChromeWindowId: this.homeChromeWindowIdForIdentity(w, snapshot),
+          placementOverride: this.placementOverrideForIdentity(w, snapshot),
         })),
       },
     };

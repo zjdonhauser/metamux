@@ -86,9 +86,9 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
     case "tmux.alphabetize":
       return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };
     case "tmux.mirror":
-      return value === "windows" || value === "global"
+      return value === "windows" || value === "global" || value === "partition"
         ? { ok: true }
-        : { ok: false, error: `${key} must be "windows" or "global"` };
+        : { ok: false, error: `${key} must be "windows", "global", or "partition"` };
     case "tmux.reattachGraceMs":
       return typeof value === "number" ? { ok: true } : { ok: false, error: `${key} must be a number` };
     case "pruneArchivedAfterDays":

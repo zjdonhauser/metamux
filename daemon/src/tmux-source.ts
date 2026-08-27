@@ -117,13 +117,18 @@ export async function hostMap(): Promise<HostMap> {
   return parseHostMapOutput(clients.stdout, ps.stdout);
 }
 
-export type MirrorMode = "windows" | "global";
+/** "partition" added for the window-pairing model (docs/protocol.md,
+ * "Window pairing (partition model, replaces mirroring)") -- it has no
+ * TMUX_CMUX_MIRROR env equivalent, since that env var only ever existed
+ * for the legacy tmux-cmux-sync tool's windows/global modes. */
+export type MirrorMode = "windows" | "global" | "partition";
 
 /** TMUX_CMUX_MIRROR-equivalent resolution: a recognized env override wins,
  * else the given default, else "windows" (matching the existing tool's
  * default). `env` is injectable so this is directly unit-testable without
  * mutating process.env -- same "collaborators come in by injection" shape
- * as the rest of this codebase's pure functions. */
+ * as the rest of this codebase's pure functions. "partition" is never read
+ * from the env var (legacy tool never had it) but is a valid defaultMode. */
 export function resolveMirrorMode(
   defaultMode: MirrorMode = "windows",
   env: Record<string, string | undefined> = process.env,

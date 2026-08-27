@@ -246,13 +246,13 @@ describe("loadConfig", () => {
   });
 
   describe("tmux config block", () => {
-    test("defaults: disabled, windows mirror, alphabetize on, 8s reattach grace, ~/Documents/GitHub cwd", async () => {
+    test("defaults: disabled, partition mirror, alphabetize on, 8s reattach grace, ~/Documents/GitHub cwd", async () => {
       const originalEnv = process.env.TMUX_CMUX_MIRROR;
       delete process.env.TMUX_CMUX_MIRROR;
       const config = await loadConfig("/nonexistent/path/config.json");
       expect(config.tmux).toEqual({
         enabled: false,
-        mirror: "windows",
+        mirror: "partition",
         alphabetize: true,
         reattachGraceMs: 8000,
         spawnCwd: join(process.env.HOME ?? "", "Documents/GitHub"),
@@ -285,7 +285,7 @@ describe("loadConfig", () => {
       const originalEnv = process.env.TMUX_CMUX_MIRROR;
       delete process.env.TMUX_CMUX_MIRROR;
       const config = await loadConfig(path);
-      expect(config.tmux.mirror).toBe("windows");
+      expect(config.tmux.mirror).toBe("partition");
       if (originalEnv !== undefined) process.env.TMUX_CMUX_MIRROR = originalEnv;
       await rm(dir, { recursive: true, force: true });
     });

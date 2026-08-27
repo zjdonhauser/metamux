@@ -59,6 +59,22 @@ export interface WorkspaceRef {
    * and its release call sites. Persisted so a restart doesn't reshuffle
    * every still-attached identity's color. */
   paletteIndex: number | null;
+  /** Window pairing (docs/protocol.md, "Window pairing"): the id of the
+   * cmux window hosting this ref's tab, or null. Set ONLY by tmux-
+   * reconcile.ts's partition mode (source: "tmux" refs) via
+   * applyTmuxIntent -- cmux-sourced refs never carry this (their own
+   * activation/window-follow events don't report a window id; see
+   * cmux-actuator.ts's ActuatorWindow discussion). Combined with
+   * Registry.windowPairings, resolves to a group's HOME Chrome window. */
+  cmuxWindowId: string | null;
+  /** Placement ownership (docs/protocol.md, "Placement ownership"): a
+   * Chrome window id the user has explicitly moved this identity's group
+   * to, overriding its home window -- or null if it still lives at home.
+   * Set/cleared via the ext->daemon `groupPlacement` frame
+   * (Registry.setPlacementOverride); cleared automatically on detach
+   * (server.ts's userClosedGroup handling), matching the contract's
+   * "override clears with detach". */
+  placementOverride: string | null;
   updatedAt: string; // ISO
 }
 
@@ -206,11 +222,17 @@ export class Registry {
     return null;
   }
 
+  /** `cmuxWindowId`, when passed, is written on both create and update --
+   * only tmux-reconcile.ts's partition-mode intents pass it (see
+   * applyTmuxIntent). Omitted (undefined), it's left untouched on an
+   * existing ref (legacy windows/global modes and cmux-sourced upserts
+   * never pass it) and defaults to null on a fresh ref. */
   private upsert(
     source: WorkspaceSource,
     sourceId: string,
     title: string,
     cwd: string | null,
+    cmuxWindowId?: string,
   ): { ref: WorkspaceRef; changed: boolean } {
     const existing = this.findMatch(source, sourceId, title, cwd);
     if (existing) {
@@ -218,11 +240,13 @@ export class Registry {
         existing.title !== title ||
         existing.cwd !== cwd ||
         existing.sourceId !== sourceId ||
-        existing.archived; // unarchiving counts as a change worth an upsert event
+        existing.archived || // unarchiving counts as a change worth an upsert event
+        (cmuxWindowId !== undefined && existing.cmuxWindowId !== cmuxWindowId);
       existing.title = title;
       existing.cwd = cwd;
       existing.sourceId = sourceId;
       existing.archived = false;
+      if (cmuxWindowId !== undefined) existing.cmuxWindowId = cmuxWindowId;
       existing.updatedAt = new Date().toISOString();
       return { ref: existing, changed };
     }
@@ -237,6 +261,8 @@ export class Registry {
       attachedAt: null,
       paintedColor: null,
       paletteIndex: null,
+      cmuxWindowId: cmuxWindowId ?? null,
+      placementOverride: null,
       updatedAt: new Date().toISOString(),
     };
     this.workspaces.set(ref.id, ref);
@@ -279,13 +305,47 @@ export class Registry {
    * createGroups' lazy filter stops including it until it's reopened, and
    * releases its palette color claim (palette-allocator.ts) -- a
    * re-attach later claims fresh and may land on a different color, by
-   * design (Zac: "frees back up"). No-op for an unknown id or one already
-   * unattached. */
+   * design (Zac: "frees back up"). Also clears placementOverride (docs/
+   * protocol.md, "Placement ownership": "override clears with detach") --
+   * a re-opened group starts back at its home window. No-op for an
+   * unknown id or one already unattached. */
   clearAttached(id: string): void {
     const ref = this.workspaces.get(id);
     if (!ref) return;
     ref.attachedAt = null;
     ref.paletteIndex = null;
+    ref.placementOverride = null;
+  }
+
+  /** ext->daemon `groupPlacement` frame: records (or clears, with
+   * `chromeWindowId: null`) a user-driven move of this identity's group to
+   * a Chrome window other than its home -- see WorkspaceRef.placementOverride.
+   * No-op for an unknown id or an unchanged value. */
+  setPlacementOverride(id: string, chromeWindowId: string | null): ActuatorEvent[] {
+    const ref = this.workspaces.get(id);
+    if (!ref || ref.placementOverride === chromeWindowId) return [];
+    ref.placementOverride = chromeWindowId;
+    ref.updatedAt = new Date().toISOString();
+    return [{ name: "workspace.upserted", workspace: this.toActuator(ref) }];
+  }
+
+  /** Chrome window pairing (docs/protocol.md, "Chrome window pairing"):
+   * cmux window id -> paired Chrome window id, persisted alongside the
+   * workspace map. Set by the extension-reported window-pairing frame
+   * (main.ts), resolved by marker tab per the contract. */
+  windowPairings: Map<string, string> = new Map();
+
+  /** Records (or overwrites) one cmux-window -> Chrome-window pairing. */
+  setWindowPairing(cmuxWindowId: string, chromeWindowId: string): void {
+    this.windowPairings.set(cmuxWindowId, chromeWindowId);
+  }
+
+  /** The paired Chrome window for a cmux window id, or null if unpaired
+   * (or the ref carries no cmux window at all -- legacy windows/global
+   * modes, or a cmux-sourced ref). */
+  homeChromeWindowId(cmuxWindowId: string | null): string | null {
+    if (cmuxWindowId === null) return null;
+    return this.windowPairings.get(cmuxWindowId) ?? null;
   }
 
   /** Color backflow's only writer of `paintedColor` (color-backflow.ts is
@@ -366,7 +426,7 @@ export class Registry {
       existing.updatedAt = new Date().toISOString();
       return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
     }
-    const { ref, changed } = this.upsert("tmux", intent.sessionId, intent.sessionName, null);
+    const { ref, changed } = this.upsert("tmux", intent.sessionId, intent.sessionName, null, intent.cmuxWindowId);
     return changed ? [{ name: "workspace.upserted", workspace: this.toActuator(ref) }] : [];
   }
 

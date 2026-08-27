@@ -189,6 +189,9 @@ export function clearTabColor(workspaceRef: string, windowId?: string): Promise<
 
 export interface ActuatorWindow {
   id: string;
+  /** Window ordering, for partition mode's "lowest-index window" fallback
+   * (docs/protocol.md, "Window pairing"). */
+  index: number;
 }
 
 /** Prefers the already-proven `cmux rpc window.list` (via cmux-rpc.ts's
@@ -202,10 +205,26 @@ export async function listWindows(): Promise<ActuatorWindow[]> {
   if (!Array.isArray(windows)) return [];
   const out: ActuatorWindow[] = [];
   for (const w of windows) {
-    const id = (w as Record<string, unknown> | null)?.id;
-    if (typeof id === "string") out.push({ id });
+    const obj = w as Record<string, unknown> | null;
+    if (!obj || typeof obj.id !== "string") continue;
+    out.push({ id: obj.id, index: typeof obj.index === "number" ? obj.index : 0 });
   }
   return out;
+}
+
+/** `cmux current-window` -- the cmux window with OS keyboard focus (macOS
+ * "key window" terminology), used for partition mode's spawn placement
+ * (docs/protocol.md, "Window pairing": "a session with NO cmux tab spawns
+ * ONE tab, in the FOCUSED cmux window"). A plain CLI subcommand, not
+ * `cmux rpc` -- prints the bare window UUID, nothing to JSON-parse. null
+ * if the call fails for any reason (no cmux shell, no windows, etc.) --
+ * callers fall back to the lowest-index window, same as the contract's
+ * own fallback rule. */
+export async function getFocusedWindowId(): Promise<string | null> {
+  const result = await runCmuxCli(["current-window"]);
+  if (!result.ok) return null;
+  const id = result.stdout.trim();
+  return id.length > 0 ? id : null;
 }
 
 export interface ActuatorTab {
@@ -213,13 +232,19 @@ export interface ActuatorTab {
   title: string;
   pinned: boolean;
   index: number;
+  /** Whether this is the currently-active tab within ITS window (a
+   * per-window property -- multiple windows can each have their own
+   * `selected: true` tab simultaneously). Partition mode's multi-window
+   * legacy convergence uses this to prefer the tab the user is actually
+   * looking at when picking which duplicate survives. */
+  selected: boolean;
 }
 
 /** `cmux workspace list --window <id> --json` -- kept as the direct CLI
  * call (not `cmux rpc workspace.list`) because it's the one already
- * verified live to carry `pinned`/`index`/`title` together (plan
- * Appendix); `workspace.list`'s RPC shape wasn't independently confirmed
- * to include all three. */
+ * verified live to carry `pinned`/`index`/`title`/`selected` together
+ * (plan Appendix); `workspace.list`'s RPC shape wasn't independently
+ * confirmed to include all four. */
 export async function listTabs(windowId: string): Promise<ActuatorTab[]> {
   const result = await runCmuxCli(["workspace", "list", "--window", windowId, "--json"]);
   if (!result.ok) return [];
@@ -240,6 +265,7 @@ export async function listTabs(windowId: string): Promise<ActuatorTab[]> {
       title: typeof obj.title === "string" ? obj.title : "",
       pinned: obj.pinned === true,
       index: typeof obj.index === "number" ? obj.index : 0,
+      selected: obj.selected === true,
     });
   }
   return out;

@@ -301,6 +301,33 @@ async function main() {
       `identity=${openedIdentityId}, group=${JSON.stringify(activeGroupAfterOpen)}`,
     );
 
+    // Palette allocation (colorMode: "palette", the isolated config's
+    // default -- not set explicitly above): a fresh isolated registry's
+    // FIRST attachment claims palette index 0, whose chromeColor is
+    // "blue" (palette.ts's ordering -- Blue is entry 1). Real cmux state
+    // may have already colored this workspace by hand, which would
+    // legitimately override the allocation (resolveColor's precedence) --
+    // this assertion is conditional on that not being the case, same
+    // "skipped, see above" pattern as the janitor/pruning assertions.
+    if (activeGroupAfterOpen) {
+      const rawAtOpen = stateAtBoot.workspaces.find((w: any) => w.id === stateAtBoot.activeId);
+      if (rawAtOpen?.cmuxColor == null) {
+        record(
+          "fresh registry, no user color: the first-attached identity gets palette index 0 (blue)",
+          activeGroupAfterOpen.color === "blue",
+          `chrome tabGroups color=${activeGroupAfterOpen.color}`,
+        );
+      } else {
+        record(
+          "palette allocation assertion (skipped -- the opened workspace already has a real cmux color)",
+          true,
+          `cmuxColor=${rawAtOpen.cmuxColor}`,
+        );
+      }
+    } else {
+      record("palette allocation assertion (skipped -- no group was created to check)", false, "see POST /open assertions above");
+    }
+
     let activeTabInGroup = false;
     let openedGroupTitle: string | null = null;
     if (activeGroupAfterOpen) {
