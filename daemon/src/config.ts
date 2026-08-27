@@ -63,6 +63,11 @@ export interface MetamuxConfig {
    * title-hash fallback (never overwrites a user-set cmux color). Default
    * true. */
   colorBackflow: boolean;
+  /** Registry compaction (auto, on startup): archived refs with
+   * updatedAt older than this many days are dropped -- see
+   * Registry.pruneArchived. 0 disables auto-compaction entirely. Only
+   * takes effect at daemon startup, not hot-reloadable. Default 7. */
+  pruneArchivedAfterDays: number;
 }
 
 export const DEFAULT_CONFIG: MetamuxConfig = {
@@ -78,6 +83,7 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   tmux: { enabled: false, mirror: "windows", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
   janitor: true,
   colorBackflow: true,
+  pruneArchivedAfterDays: 7,
 };
 
 export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxConfig> {
@@ -137,6 +143,8 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
     tmux,
     janitor: typeof obj.janitor === "boolean" ? obj.janitor : DEFAULT_CONFIG.janitor,
     colorBackflow: typeof obj.colorBackflow === "boolean" ? obj.colorBackflow : DEFAULT_CONFIG.colorBackflow,
+    pruneArchivedAfterDays:
+      typeof obj.pruneArchivedAfterDays === "number" ? obj.pruneArchivedAfterDays : DEFAULT_CONFIG.pruneArchivedAfterDays,
   };
 
   config.eventsPath = expandHome(config.eventsPath);

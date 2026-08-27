@@ -151,6 +151,31 @@ describe("loadConfig", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  describe("pruneArchivedAfterDays", () => {
+    test("defaults to 7 when absent", async () => {
+      const config = await loadConfig("/nonexistent/path/config.json");
+      expect(config.pruneArchivedAfterDays).toBe(7);
+    });
+
+    test("reads an explicit value from the config file", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "metamux-config-"));
+      const path = join(dir, "config.json");
+      await writeFile(path, JSON.stringify({ pruneArchivedAfterDays: 14 }));
+      const config = await loadConfig(path);
+      expect(config.pruneArchivedAfterDays).toBe(14);
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    test("0 (auto-compaction off) is read as-is, not treated as absent", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "metamux-config-"));
+      const path = join(dir, "config.json");
+      await writeFile(path, JSON.stringify({ pruneArchivedAfterDays: 0 }));
+      const config = await loadConfig(path);
+      expect(config.pruneArchivedAfterDays).toBe(0);
+      await rm(dir, { recursive: true, force: true });
+    });
+  });
+
   describe("createGroups", () => {
     test("defaults to on-open when absent", async () => {
       const config = await loadConfig("/nonexistent/path/config.json");

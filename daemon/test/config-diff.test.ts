@@ -71,6 +71,11 @@ describe("diffConfig", () => {
     ]);
   });
 
+  test("pruneArchivedAfterDays change is detected but NOT hot-applicable (auto-compaction only runs at startup)", () => {
+    const changes = diffConfig(cfg({ pruneArchivedAfterDays: 7 }), cfg({ pruneArchivedAfterDays: 14 }));
+    expect(changes).toEqual([{ key: "pruneArchivedAfterDays", oldValue: 7, newValue: 14, hotApplicable: false }]);
+  });
+
   test("multiple simultaneous changes are all reported independently", () => {
     const oldConfig = cfg({ port: 8377, reverseSync: false, debounceMs: 200 });
     const newConfig = cfg({ port: 9999, reverseSync: true, debounceMs: 200 });

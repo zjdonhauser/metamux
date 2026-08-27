@@ -22,7 +22,8 @@ export type ConfigChangeKey =
   | "tmux.reattachGraceMs"
   | "tmux.spawnCwd"
   | "janitor"
-  | "colorBackflow";
+  | "colorBackflow"
+  | "pruneArchivedAfterDays";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -31,9 +32,10 @@ export interface ConfigChange {
   hotApplicable: boolean;
 }
 
-/** Applied live without a daemon restart. port and eventsPath are the only
- * config keys NOT in this set (port needs a rebind, eventsPath needs a
- * fresh tail from a new file). */
+/** Applied live without a daemon restart. port and eventsPath need a
+ * restart (rebind / fresh tail from a new file); pruneArchivedAfterDays
+ * needs one too -- auto-compaction only ever runs once, at startup, so
+ * there's no live behavior a hot-apply could trigger. */
 export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set([
   "closeBehavior",
   "collapseOthers",
@@ -84,6 +86,7 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "tmux.spawnCwd", oldValue: oldConfig.tmux.spawnCwd, newValue: newConfig.tmux.spawnCwd },
     { key: "janitor", oldValue: oldConfig.janitor, newValue: newConfig.janitor },
     { key: "colorBackflow", oldValue: oldConfig.colorBackflow, newValue: newConfig.colorBackflow },
+    { key: "pruneArchivedAfterDays", oldValue: oldConfig.pruneArchivedAfterDays, newValue: newConfig.pruneArchivedAfterDays },
   ];
 
   return candidates

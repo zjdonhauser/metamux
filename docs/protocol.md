@@ -26,7 +26,8 @@ All components conform to this file. Change this file first, code second.
       "reattachGraceMs": 8000,
       "spawnCwd": "~/Documents/GitHub"
     },
-    "colorBackflow": true              // see "Color backflow" below
+    "colorBackflow": true,             // see "Color backflow" below
+    "pruneArchivedAfterDays": 7        // 0 = off -- see "Registry compaction" below
   }
   ```
   All fields optional; defaults above. `~` expansion required. `ports.*`, `reverseSync`, and
@@ -35,7 +36,10 @@ All components conform to this file. Change this file first, code second.
   `TMUX_CMUX_MIRROR` env var (tmux-cmux-sync compatibility) only when `tmux.mirror` is absent
   from the file; an explicit file value always wins. A config file written before the
   `createGroups` rename below and still saying `"lazy"` is read as `"on-activate"`, its exact
-  behavioral successor.
+  behavioral successor. `METAMUX_PORT` / `METAMUX_STATE_DIR` / `METAMUX_CONFIG_PATH` env vars
+  override the port and the two paths above respectively (tolerant, absent -> unchanged
+  defaults) -- isolation for `scripts/e2e-chromium.ts` and other throwaway daemon runs; never
+  set for the real daemon.
 
 ## cmux source (input)
 
@@ -81,6 +85,29 @@ would wrongly re-bind to the same ref.
 A `colored` event resolves its raw color (hex or named cmux.json slot, via a `namedSlots` table injected into the Registry at construction, read once from `~/.config/cmux/cmux.json`) and sets `cmuxColor` on the matching ref (found by sourceId only -- a color change carries no title/cwd to re-bind against); no-op if the workspace is unknown. Either way, `workspace.upserted` fires so the extension re-applies the group color (it already updates color on `ensureGroup`).
 Startup backfill: `set_color`/`clear_color` only appear in the JSONL log from whenever the daemon started tailing, so a color set earlier never shows up as an event. When socket features are on, right after seeding the daemon asks cmux directly (`cmux rpc window.list` + `workspace.list` per window) for every workspace's current `custom_color` and applies it once via the same path.
 
+## Registry compaction (2026-08-27)
+
+The registry never deletes on its own -- `applyEvent`'s `closed` branch only ever sets
+`archived: true` -- so it grows forever across a long-lived daemon's life. `Registry.pruneArchived`
+removes archived refs; it NEVER touches a live (unarchived) ref regardless of how it's called.
+Two paths:
+
+- **Manual, hot, no restart**: `POST /prune` (`metamux prune`) removes EVERY archived ref, no age
+  cutoff -- see Wire protocol above. Persists registry.json and pushes a fresh `sync` frame only
+  when something was actually removed.
+- **Auto, on startup only**: config `"pruneArchivedAfterDays"` (default `7`, `0` disables it)
+  removes archived refs with `updatedAt` strictly older than that many days. Runs once, right
+  after the registry is hydrated from disk and BEFORE the seed replay or lazy-tracker seeding --
+  not hot-reloadable (`config-diff.ts`'s `HOT_APPLICABLE_CONFIG_KEYS`), since auto-compaction has
+  no live behavior a hot-apply could trigger.
+
+Neither path is destructive in any lasting sense: a pruned ref's cmux workspace, if ever seen
+again, simply creates a fresh ref via the normal upsert-with-no-match path (a new `mw_` id, a new
+Chrome group) -- exactly as if metamux had never seen it before. `groupBy: "title"` aliasing needs
+no separate cleanup: an alias is computed fresh from `Registry.workspaces` on every projection, so
+a title with zero remaining members simply stops appearing on its own, with no persisted
+"bucket" state of its own to clean up.
+
 ## Wire protocol (one port, default 8377, 127.0.0.1 only)
 
 Auth token = contents of the `secret` file. Reject bad token: WS close code 4001 / HTTP 401.
@@ -125,6 +152,11 @@ When `cmuxColor` is unset (or unresolvable), fall back to a deterministic hash o
   Resolve target: by sourceId if given, else current activeId. 200 `{"ok":true,"workspace":"mw_..."}`; 404 if no target.
 - `GET /status?token=...` → `{"ok":true,"clients":1,"lastSeq":127,"activeId":"mw_...","workspaces":9,"cursor":{...},"skippedLines":0}`
 - `GET /state?token=...` → full registry JSON.
+- `POST /prune` body `{"token":"..."}` → registry compaction, hot, no restart. Deletes ALL
+  archived refs (no age cutoff -- see "Registry compaction" below for the age-cutoff auto path).
+  200 `{"ok":true,"removed":[{"id":"mw_...","title":"..."}]}` (empty array if nothing archived).
+  Persists registry.json and pushes a fresh `sync` frame to every client only when something was
+  actually removed. `metamux prune` (CLI) calls this.
 
 ## Grouping: groupBy + createGroups (2026-08-27, afternoon; createGroups reworked 2026-08-27 evening)
 
@@ -251,6 +283,17 @@ dissolved like any other leftover -- nothing is ever resurrected.
 - **The metamux window** is identified by a marker tab pointing at the extension's own `panel.html`. On startup: find a tab with that URL → that window is THE window; else create a new window with `panel.html` as its only tab. Never manage groups in other windows.
 - Mapping in `chrome.storage.local`: `{ byId: { [metamuxId]: { title, color, groupId|null, lastActiveTabId|null } }, lastSeq }`.
   `groupId` is a cache, never trusted across restarts: re-resolve by `tabGroups.query({title, windowId})` on startup, and handle `tabGroups.onCreated` remaps (cross-window moves change groupId).
+- **Sync is authoritative for byId** (2026-08-27): every `sync` frame PRUNES any `byId` entry whose
+  id is absent from that frame's `state.workspaces` -- a plain identity that reduceSync only ever
+  upserted before now also deletes. Nothing is lost: a pruned entry reappears with fresh defaults
+  the moment the daemon includes its id in a later sync (registry compaction above, or the id's
+  own attachment simply lapsing, are the two ways that happens). This is what keeps the panel
+  showing the daemon's actual live view instead of accumulating every identity the extension has
+  EVER seen across its lifetime (Zac's panel once showed ~75 identities against 8 live tmux
+  sessions). Ordering matters: the tab-group janitor classification below runs against the
+  PRE-prune `byId` (so it still recognizes a title about to be pruned and merges/blank-closes its
+  leftover group one last time), and pruning happens immediately after, before this reduce call
+  returns.
 - `workspace.upserted`: ensure a group exists (create one background `chrome://newtab` tab, `tabs.group` it, set title+color, collapse). Rename = `tabGroups.update({title})` and mapping key update.
 - `workspace.activated`: expand the group, activate `lastActiveTabId` (fallback: first tab in group) via `tabs.update(tabId, {active:true})`. If `collapseOthers`, collapse every other managed group. **NEVER call `chrome.windows.update({focused:true})`** (F3, hard rule).
 - `workspace.archived`: `closeBehavior === "archive"` → collapse + `tabGroups.move({index:-1})`; `"close"` → remove the group's tabs.

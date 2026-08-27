@@ -1,6 +1,6 @@
 // Bun.serve on 127.0.0.1:<port>: WS /actuator + HTTP POST /open, GET /status,
-// GET /state, POST /focus. One port, per docs/protocol.md "Wire protocol"
-// and "Phase 2 additions".
+// GET /state, POST /focus, POST /prune. One port, per docs/protocol.md
+// "Wire protocol" and "Phase 2 additions".
 //
 // Wire-projection layer: raw per-workspace registry state/events are
 // projected through GroupProjection (groupBy: title-aliasing) and
@@ -58,6 +58,10 @@ export interface ActuatorServerOptions {
    * Chrome group by hand). Clearing attachedAt (registry + lazyGroups) and
    * persisting live in main.ts -- this is just the wire. */
   onUserClosedGroup?: (id: string) => void;
+  /** Registry compaction (POST /prune, `metamux prune`): called after
+   * `registry.pruneArchived(null)` actually removed something, so main.ts
+   * can persist registry.json -- ActuatorServer owns no file I/O itself. */
+  onPrune?: () => void | Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -75,6 +79,7 @@ export class ActuatorServer {
   private portsTracker?: PortsTracker;
   private onUserActivatedGroup?: (id: string) => void;
   private onUserClosedGroup?: (id: string) => void;
+  private onPrune?: () => void | Promise<void>;
   private port: number;
   private secret: string;
 
@@ -90,6 +95,7 @@ export class ActuatorServer {
     this.portsTracker = options.portsTracker;
     this.onUserActivatedGroup = options.onUserActivatedGroup;
     this.onUserClosedGroup = options.onUserClosedGroup;
+    this.onPrune = options.onPrune;
     this.log = options.log ?? ((line: string) => console.log(line));
   }
 
@@ -156,6 +162,10 @@ export class ActuatorServer {
 
     if (url.pathname === "/focus" && req.method === "POST") {
       return this.handleFocus(req);
+    }
+
+    if (url.pathname === "/prune" && req.method === "POST") {
+      return this.handlePrune(req);
     }
 
     if (url.pathname === "/status" && req.method === "GET") {
@@ -230,6 +240,36 @@ export class ActuatorServer {
     this.broadcastRaw({ type: "event", seq: this.seq, name: "focus_window" });
     this.log(`[focus_window]`);
     return Response.json({ ok: true });
+  }
+
+  /** Registry compaction, hot: deletes ALL archived refs (no age cutoff --
+   * that's the auto-compact startup path in main.ts, which calls
+   * `registry.pruneArchived` directly). Persists via onPrune and pushes a
+   * fresh sync to every client so the extension's own byId prunes in
+   * lockstep (sync-authoritative byId, reducer.js's reduceSync) instead of
+   * carrying stale entries for refs the registry no longer has at all. */
+  private async handlePrune(req: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(JSON.stringify({ ok: false, error: "invalid body" }), { status: 400 });
+    }
+    const obj = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+    const token = typeof obj.token === "string" ? obj.token : null;
+    if (!this.checkToken(token)) {
+      return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), { status: 401 });
+    }
+
+    const removed = this.registry.pruneArchived(null);
+    if (removed.length > 0) {
+      await this.onPrune?.();
+      this.pushSyncToAll();
+    }
+    this.log(
+      `[prune] removed ${removed.length} archived workspace(s)${removed.length > 0 ? ": " + removed.map((r) => r.title).join(", ") : ""}`,
+    );
+    return Response.json({ ok: true, removed: removed.map((r) => ({ id: r.id, title: r.title })) });
   }
 
   /** Push an open_url event for a resolved workspace ref -- projected to

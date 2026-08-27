@@ -353,6 +353,53 @@ async function main() {
       record("janitor merge assertion (skipped -- no group was created to duplicate)", false, "see POST /open assertions above");
     }
 
+    // --- Sync-authoritative byId: close the group by hand (detach-on-close),
+    // then a fresh sync should both clear the daemon's attachedAt AND prune
+    // the extension's own byId entry for it. ---
+    if (activeGroupAfterOpen && openedIdentityId && openedGroupTitle) {
+      console.log("--- pruning: closing the group by hand, then a fresh sync should prune its byId entry ---");
+      const beforeByIdCheck = await sw.evaluate(
+        (id) => chrome.storage.local.get("metamuxState").then((s) => Boolean(s.metamuxState?.byId?.[id])),
+        openedIdentityId,
+      );
+      record("byId has an entry for the opened identity before closing it", beforeByIdCheck);
+
+      const groupIdToClose: number | null = await sw.evaluate(
+        (title) => chrome.tabGroups.query({ title }).then((gs) => gs[0]?.id ?? null),
+        openedGroupTitle,
+      );
+      if (groupIdToClose != null) {
+        await sw.evaluate(async (groupId) => {
+          const tabs = await chrome.tabs.query({ groupId });
+          await chrome.tabs.remove(tabs.map((t) => t.id as number));
+        }, groupIdToClose);
+      }
+      await sleep(1500);
+
+      const stateAfterDetach = await getState();
+      const detachedRaw = stateAfterDetach.workspaces.find((w: any) => w.title === openedGroupTitle);
+      record(
+        "daemon cleared attachedAt after the user-close (detach-on-close)",
+        detachedRaw?.attachedAt === null,
+        JSON.stringify(detachedRaw),
+      );
+
+      console.log("--- triggering one more sync (isolated config hot-reload) to prune byId ---");
+      await writeFile(
+        configPath,
+        JSON.stringify({ createGroups: "on-open", groupBy: "title", janitor: true, collapseOthers: false, closeBehavior: "archive" }),
+      );
+      await sleep(2000);
+
+      const afterByIdCheck = await sw.evaluate(
+        (id) => chrome.storage.local.get("metamuxState").then((s) => Boolean(s.metamuxState?.byId?.[id])),
+        openedIdentityId,
+      );
+      record("byId entry for the closed/detached identity is pruned after the next sync omits it", !afterByIdCheck);
+    } else {
+      record("pruning assertion (skipped -- no group was created to close)", false, "see POST /open assertions above");
+    }
+
     console.log("--- cmux rpc workspace.previous (restoring real cmux focus) ---");
     Bun.spawnSync(["cmux", "rpc", "workspace.previous", "{}"], { cwd: REPO_ROOT });
     await sleep(500);

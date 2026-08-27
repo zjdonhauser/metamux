@@ -566,6 +566,88 @@ describe("Registry.reclassifyAsTmux", () => {
   });
 });
 
+describe("Registry.pruneArchived", () => {
+  test("cutoffIso: null removes ALL archived refs, regardless of age", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "old-session", "/a"));
+    reg.applyEvent(ev("closed", "W1", "old-session", "/a"));
+    const removed = reg.pruneArchived(null);
+    expect(removed.length).toBe(1);
+    expect(removed[0]!.title).toBe("old-session");
+    expect(reg.workspaces.size).toBe(0);
+  });
+
+  test("live (unarchived) refs are NEVER pruned, even with cutoffIso: null", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/a"));
+    const removed = reg.pruneArchived(null);
+    expect(removed).toEqual([]);
+    expect(reg.workspaces.size).toBe(1);
+  });
+
+  test("with a cutoffIso, only archived refs updatedAt strictly OLDER than it are removed", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "old-session", "/a"));
+    reg.applyEvent(ev("closed", "W1", "old-session", "/a"));
+    const ref = [...reg.workspaces.values()][0]!;
+    ref.updatedAt = "2020-01-01T00:00:00.000Z"; // simulate an old archive
+
+    const removed = reg.pruneArchived("2025-01-01T00:00:00.000Z");
+    expect(removed.length).toBe(1);
+    expect(reg.workspaces.size).toBe(0);
+  });
+
+  test("an archived ref NEWER than the cutoff is kept", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "recent-session", "/a"));
+    reg.applyEvent(ev("closed", "W1", "recent-session", "/a"));
+    const ref = [...reg.workspaces.values()][0]!;
+    ref.updatedAt = "2026-08-01T00:00:00.000Z"; // recent
+
+    const removed = reg.pruneArchived("2020-01-01T00:00:00.000Z"); // cutoff far in the past
+    expect(removed).toEqual([]);
+    expect(reg.workspaces.size).toBe(1);
+  });
+
+  test("a mix of old-archived, recent-archived, and live refs: only old-archived is pruned", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "live", "/a"));
+    reg.applyEvent(ev("created", "W2", "old-archived", "/b"));
+    reg.applyEvent(ev("closed", "W2", "old-archived", "/b"));
+    reg.applyEvent(ev("created", "W3", "recent-archived", "/c"));
+    reg.applyEvent(ev("closed", "W3", "recent-archived", "/c"));
+
+    const refs = [...reg.workspaces.values()];
+    refs.find((r) => r.title === "old-archived")!.updatedAt = "2020-01-01T00:00:00.000Z";
+    refs.find((r) => r.title === "recent-archived")!.updatedAt = "2026-08-01T00:00:00.000Z";
+
+    const removed = reg.pruneArchived("2025-01-01T00:00:00.000Z");
+    expect(removed.length).toBe(1);
+    expect(removed[0]!.title).toBe("old-archived");
+    expect(reg.workspaces.size).toBe(2);
+    const remainingTitles = [...reg.workspaces.values()].map((r) => r.title).sort();
+    expect(remainingTitles).toEqual(["live", "recent-archived"]);
+  });
+
+  test("an empty registry prunes nothing, no throw", () => {
+    const reg = new Registry();
+    expect(reg.pruneArchived(null)).toEqual([]);
+  });
+
+  test("a pruned ref's cmux workspace re-creates cleanly if seen again (a new id, not a resurrection)", () => {
+    const reg = new Registry();
+    const [firstUpsert] = reg.applyEvent(ev("created", "W1", "cmux", "/a"));
+    const originalId = firstUpsert!.workspace.id;
+    reg.applyEvent(ev("closed", "W1", "cmux", "/a"));
+    reg.pruneArchived(null);
+    expect(reg.workspaces.size).toBe(0);
+
+    const [reCreated] = reg.applyEvent(ev("created", "W1", "cmux", "/a"));
+    expect(reg.workspaces.size).toBe(1);
+    expect(reCreated!.workspace.id).not.toBe(originalId); // fresh id, not resurrected
+  });
+});
+
 describe("Registry.archiveBySourceId", () => {
   test("archives a matching ref of the given source and emits workspace.archived", () => {
     const reg = new Registry();

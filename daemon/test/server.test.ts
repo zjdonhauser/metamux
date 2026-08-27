@@ -218,6 +218,88 @@ describe("ActuatorServer.getState -- raw and projected views", () => {
   });
 });
 
+describe("ActuatorServer.handlePrune (POST /prune)", () => {
+  // handlePrune is private; constructing a real Request and invoking it
+  // via a bracket-notation cast is the minimal way to exercise the actual
+  // endpoint logic (auth, JSON parsing, the onPrune/pushSyncToAll
+  // conditionals) without starting a real server on a real port -- the
+  // file's own established convention (see the top comment).
+  function makeServerWithPrune(config: MetamuxConfig, registry: Registry, onPrune?: () => void) {
+    const logs: string[] = [];
+    const server = new ActuatorServer({
+      port: 0,
+      secret: "test-secret",
+      registry,
+      config,
+      cursor: { bootId: "B1", seq: 1 },
+      stats: { skippedLines: 0 },
+      groupProjection: new GroupProjection(config.groupBy),
+      lazyGroups: new LazyGroupTracker(),
+      onPrune,
+      log: (line) => logs.push(line),
+    });
+    return { server, logs };
+  }
+
+  function callPrune(server: ActuatorServer, token: string): Promise<Response> {
+    const req = new Request("http://127.0.0.1/prune", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    return (server as unknown as { handlePrune(req: Request): Promise<Response> }).handlePrune(req);
+  }
+
+  test("removes archived refs and reports them by id/title", async () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "gone", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    registry.applyEvent({ name: "closed", workspaceId: "SRC-A", title: "gone", cwd: "/a", bootId: "B1", seq: 2, occurredAtMs: 2 });
+    const { server } = makeServerWithPrune(cfg(), registry);
+
+    const res = await callPrune(server, "test-secret");
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.removed.length).toBe(1);
+    expect(body.removed[0].title).toBe("gone");
+    expect(registry.workspaces.size).toBe(0);
+  });
+
+  test("live refs are never removed", async () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "live", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const { server } = makeServerWithPrune(cfg(), registry);
+
+    const res = await callPrune(server, "test-secret");
+    const body = await res.json();
+    expect(body.removed).toEqual([]);
+    expect(registry.workspaces.size).toBe(1);
+  });
+
+  test("rejects a missing/wrong token with 401", async () => {
+    const registry = new Registry();
+    const { server } = makeServerWithPrune(cfg(), registry);
+    const res = await callPrune(server, "wrong-token");
+    expect(res.status).toBe(401);
+  });
+
+  test("calls onPrune (persist) only when something was actually removed", async () => {
+    let pruneCalls = 0;
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "live", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const { server } = makeServerWithPrune(cfg(), registry, () => {
+      pruneCalls++;
+    });
+
+    await callPrune(server, "test-secret");
+    expect(pruneCalls).toBe(0); // nothing archived -- nothing to persist
+
+    registry.applyEvent({ name: "created", workspaceId: "SRC-B", title: "gone", cwd: "/b", bootId: "B1", seq: 2, occurredAtMs: 2 });
+    registry.applyEvent({ name: "closed", workspaceId: "SRC-B", title: "gone", cwd: "/b", bootId: "B1", seq: 3, occurredAtMs: 3 });
+    await callPrune(server, "test-secret");
+    expect(pruneCalls).toBe(1);
+  });
+});
+
 describe("ActuatorServer.pushOpenUrl -- groupBy: title routes to the alias", () => {
   test("open_url targeting one member logs the shared alias id", () => {
     const registry = new Registry();

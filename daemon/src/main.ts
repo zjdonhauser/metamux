@@ -127,6 +127,23 @@ async function runDaemon(): Promise<void> {
     void appendFile(logPath(), stamped + "\n").catch(() => {});
   };
 
+  // Registry compaction (auto, startup-only): archived refs older than
+  // config.pruneArchivedAfterDays are dropped before anything else touches
+  // the registry (seed replay, lazy-tracker seeding). 0 disables this
+  // entirely. A pruned ref's cmux workspace re-creates harmlessly if ever
+  // seen again (registry.ts's pruneArchived) -- this only trims refs the
+  // user is very unlikely to ever revisit, keeping sync/panel/janitor
+  // scope from growing without bound across the daemon's lifetime.
+  if (config.pruneArchivedAfterDays > 0) {
+    const cutoff = new Date(Date.now() - config.pruneArchivedAfterDays * 24 * 60 * 60 * 1000).toISOString();
+    const autoRemoved = registry.pruneArchived(cutoff);
+    if (autoRemoved.length > 0) {
+      log(
+        `[prune] auto-compacted ${autoRemoved.length} archived workspace(s) older than ${config.pruneArchivedAfterDays}d: ${autoRemoved.map((r) => r.title).join(", ")}`,
+      );
+    }
+  }
+
   // Socket-gated features (Phase 2): ports watcher, reverse sync, window
   // follow all need a cmux-spawned shell's env. Probed at startup, then
   // kept live: metamuxd is long-lived (zshrc-ensured), so a later cmux
@@ -196,6 +213,7 @@ async function runDaemon(): Promise<void> {
     onUserClosedGroup: (id) => {
       handleUserClosedGroup(id);
     },
+    onPrune: () => persist(),
     log,
   });
   server.start();

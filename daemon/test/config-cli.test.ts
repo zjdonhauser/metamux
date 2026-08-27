@@ -138,6 +138,13 @@ describe("validateConfigValue", () => {
     expect(validateConfigValue("colorBackflow", "true").ok).toBe(false);
   });
 
+  test("pruneArchivedAfterDays requires a number >= 0, and accepts 0 (off)", () => {
+    expect(validateConfigValue("pruneArchivedAfterDays", 7).ok).toBe(true);
+    expect(validateConfigValue("pruneArchivedAfterDays", 0).ok).toBe(true);
+    expect(validateConfigValue("pruneArchivedAfterDays", -1).ok).toBe(false);
+    expect(validateConfigValue("pruneArchivedAfterDays", "7").ok).toBe(false);
+  });
+
   test("failed validations include a human-readable error", () => {
     const result = validateConfigValue("port", "not-a-number");
     expect(result.ok).toBe(false);

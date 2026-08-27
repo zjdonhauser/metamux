@@ -21,6 +21,7 @@ export const CONFIG_ALLOWED_KEYS = [
   "tmux.spawnCwd",
   "janitor",
   "colorBackflow",
+  "pruneArchivedAfterDays",
 ] as const;
 
 export type ConfigKey = (typeof CONFIG_ALLOWED_KEYS)[number];
@@ -87,6 +88,10 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
         : { ok: false, error: `${key} must be "windows" or "global"` };
     case "tmux.reattachGraceMs":
       return typeof value === "number" ? { ok: true } : { ok: false, error: `${key} must be a number` };
+    case "pruneArchivedAfterDays":
+      return typeof value === "number" && value >= 0
+        ? { ok: true }
+        : { ok: false, error: `${key} must be a number >= 0 (0 disables auto-compaction)` };
     case "tmux.spawnCwd":
       return typeof value === "string" && value.length > 0
         ? { ok: true }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// metamux CLI: open/status/state/secret/doctor/focus/mcp. Reads port from
+// metamux CLI: open/status/state/secret/doctor/focus/prune/mcp. Reads port from
 // config, token from the secret file (or METAMUX_PORT/METAMUX_TOKEN env
 // overrides -- used for tests and for pointing at a non-default daemon).
 // Friendly errors when the daemon isn't running.
@@ -154,6 +154,33 @@ async function cmdFocus(): Promise<void> {
   console.log("focused the metamux window");
 }
 
+async function cmdPrune(): Promise<void> {
+  const port = await resolvePort();
+  const token = await requireToken();
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}/prune`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+  } catch {
+    notRunningError(port);
+  }
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error(`metamux prune failed: ${res.status} ${JSON.stringify(body)}`);
+    process.exit(1);
+  }
+  const removed: Array<{ id: string; title: string }> = body.removed ?? [];
+  if (removed.length === 0) {
+    console.log("nothing to prune (no archived workspaces)");
+    return;
+  }
+  console.log(`pruned ${removed.length} archived workspace(s):`);
+  for (const r of removed) console.log(`  ${r.title} (${r.id})`);
+}
+
 async function cmdDoctor(): Promise<void> {
   const child = spawn("bun", [DAEMON_MAIN, "doctor"], { stdio: "inherit" });
   await new Promise<void>((resolve) => child.on("exit", () => resolve()));
@@ -256,6 +283,9 @@ async function main() {
     case "focus":
       await cmdFocus();
       break;
+    case "prune":
+      await cmdPrune();
+      break;
     case "doctor":
       await cmdDoctor();
       break;
@@ -266,7 +296,7 @@ async function main() {
       await cmdConfig(rest);
       break;
     default:
-      console.error("usage: metamux <open <url>|current|status|state|secret|focus|doctor|mcp|config [--json | <key> <value>]>");
+      console.error("usage: metamux <open <url>|current|status|state|secret|focus|prune|doctor|mcp|config [--json | <key> <value>]>");
       process.exit(1);
   }
 }

@@ -300,4 +300,28 @@ export class Registry {
     existing.updatedAt = new Date().toISOString();
     return [{ name: "workspace.archived", workspace: toActuator(existing) }];
   }
+
+  /** Registry compaction: removes archived refs from the registry -- ALL
+   * of them when `cutoffIso` is null (manual /prune, `metamux prune`), or
+   * only those with `updatedAt` strictly older than `cutoffIso`
+   * (auto-compact on startup, config.pruneArchivedAfterDays). Live
+   * (unarchived) refs are NEVER touched regardless. Returns the removed
+   * refs for logging/CLI output. Not destructive in any lasting sense: a
+   * pruned ref's cmux workspace, if ever seen again, simply creates a
+   * fresh ref via the normal upsert-with-no-match path (a new `mw_` id,
+   * a new Chrome group) -- exactly as if metamux had never seen it
+   * before. Alias-level grouping (groupBy: "title") needs no separate
+   * cleanup here: it's computed fresh from `this.workspaces` on every
+   * projection, so a title with zero remaining members simply stops
+   * appearing, automatically. */
+  pruneArchived(cutoffIso: string | null): WorkspaceRef[] {
+    const removed: WorkspaceRef[] = [];
+    for (const [id, ref] of this.workspaces) {
+      if (!ref.archived) continue;
+      if (cutoffIso !== null && ref.updatedAt >= cutoffIso) continue;
+      removed.push(ref);
+      this.workspaces.delete(id);
+    }
+    return removed;
+  }
 }

@@ -182,6 +182,24 @@ function reduceSync(state, msg) {
     ops.unshift(...classifyJanitor(byId, msg.janitorGroups));
   }
 
+  // Sync is authoritative for byId: prune every entry whose id is absent
+  // from this sync frame's workspaces list. Runs AFTER the janitor
+  // classification above (which needs the full, pre-prune byId to still
+  // recognize a stale identity's title and merge/close its leftover
+  // group one last time), not before -- pruning first would make that
+  // title invisible to classifyJanitor's idByTitle map, turning a
+  // recognized DUPLICATE/CANONICAL into an unrecognized BLANK
+  // ORPHAN/FOREIGN on its very last sync. A pruned identity isn't lost:
+  // it reappears with fresh defaults the moment the daemon includes it
+  // again (createGroups' attachment model already handles that). This is
+  // what keeps the panel/janitor scope tracking the daemon's actual live
+  // view instead of accumulating every identity ever seen in this
+  // extension instance's lifetime.
+  const syncIds = new Set(msg.state.workspaces.map((ws) => ws.id));
+  for (const id of Object.keys(byId)) {
+    if (!syncIds.has(id)) delete byId[id];
+  }
+
   if (msg.state.activeId) {
     ops.push({ op: "activate", id: msg.state.activeId });
     ops.push({ op: "markServerActivation", id: msg.state.activeId });

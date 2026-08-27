@@ -129,6 +129,104 @@ describe("sync reconciliation", () => {
   });
 });
 
+describe("sync-authoritative byId (pruning)", () => {
+  test("an id absent from the sync's workspaces list is pruned from byId", () => {
+    const state = makeState({
+      byId: {
+        mw_a: { title: "alpha", color: "blue", archived: false, groupId: 1, lastActiveTabId: null },
+        mw_stale: { title: "gone-tmux-session", color: "grey", archived: false, groupId: 99, lastActiveTabId: null },
+      },
+    });
+    const { state: next } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+    });
+    expect(next.byId.mw_a).toBeDefined();
+    expect(next.byId.mw_stale).toBeUndefined();
+  });
+
+  test("every id present in the sync survives, none pruned", () => {
+    const state = makeState({
+      byId: {
+        mw_a: { title: "alpha", color: "blue", archived: false, groupId: 1, lastActiveTabId: null },
+        mw_b: { title: "beta", color: "red", archived: true, groupId: null, lastActiveTabId: null },
+      },
+    });
+    const { state: next } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: {
+        activeId: null,
+        workspaces: [
+          { id: "mw_a", title: "alpha", color: "blue", archived: false },
+          { id: "mw_b", title: "beta", color: "red", archived: true },
+        ],
+      },
+    });
+    expect(Object.keys(next.byId).sort()).toEqual(["mw_a", "mw_b"]);
+  });
+
+  test("an empty sync workspaces list prunes everything", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 1, lastActiveTabId: null } },
+    });
+    const { state: next } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+    });
+    expect(next.byId).toEqual({});
+  });
+
+  test("ordering: the janitor still recognizes a stale identity's title on its LAST sync, before it's pruned", () => {
+    // mw_stale is about to be pruned (absent from this sync's workspaces),
+    // but its title still has two real chrome groups -- the janitor must
+    // see it as a managed title (canonical + duplicate) THIS ONE LAST TIME
+    // and merge them, not treat the duplicate as an unrecognized orphan.
+    const state = makeState({
+      byId: { mw_stale: { title: "old-session", color: "grey", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { state: next, ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+      janitorGroups: [
+        { groupId: 10, title: "old-session", tabs: [] },
+        { groupId: 11, title: "old-session", tabs: [] },
+      ],
+    });
+    expect(ops).toContainEqual({ op: "mergeGroup", fromGroupId: 11, intoId: 10 });
+    expect(next.byId.mw_stale).toBeUndefined(); // still pruned in the same reduce call
+  });
+
+  test("re-appearance: an id pruned on one sync comes back with fresh defaults if a later sync includes it again", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 1, lastActiveTabId: null } },
+    });
+    const pruned = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [] },
+    });
+    expect(pruned.state.byId.mw_a).toBeUndefined();
+
+    const reappeared = reduce(pruned.state, {
+      type: "sync",
+      seq: 2,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+    });
+    expect(reappeared.state.byId.mw_a).toBeDefined();
+    expect(reappeared.ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+  });
+});
+
 describe("workspace.activated", () => {
   test("emits activate and collapseOthers when config.collapseOthers is true", () => {
     const state = makeState({ config: { collapseOthers: true, closeBehavior: "archive" } });
