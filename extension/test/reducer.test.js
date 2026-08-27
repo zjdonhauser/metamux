@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { initialState, reduce } from "../reducer.js";
+import { initialState, reduce, resolveGroupCache, chooseAdoptionWindow } from "../reducer.js";
 
 /** @param {Partial<import("../reducer.js").State>} [overrides] */
 function makeState(overrides = {}) {
@@ -845,5 +845,331 @@ describe("tab group janitor", () => {
       janitorGroups: [{ groupId: 31, title: "activated-not-opened", tabs: [{ tabId: 2, url: "chrome://newtab/" }] }],
     });
     expect(ops.find((o) => o.op === "closeGroup" || o.op === "mergeGroup")).toBeUndefined();
+  });
+});
+
+describe("tab group janitor -- cross-window recovery", () => {
+  test("a managed-title group in another window recovers into the in-window canonical", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      foreignJanitorGroups: [{ groupId: 99, windowId: 999, title: "alpha" }],
+    });
+    expect(ops).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 99, fromWindowId: 999, intoId: 10 });
+  });
+
+  test("a foreign (unmanaged-title) group in another window is never touched", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      foreignJanitorGroups: [{ groupId: 99, windowId: 999, title: "personal banking" }],
+    });
+    expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+  });
+
+  test("a managed title with no in-window canonical yet is left for a later sync (self-healing, not a special case)", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [], // no in-window group for "alpha" yet
+      foreignJanitorGroups: [{ groupId: 99, windowId: 999, title: "alpha" }],
+    });
+    expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+  });
+
+  test("config.janitorCrossWindow: false disables recovery even with a clear match", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive", janitorCrossWindow: false },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      foreignJanitorGroups: [{ groupId: 99, windowId: 999, title: "alpha" }],
+    });
+    expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+  });
+
+  test("janitorCrossWindow defaults to enabled when absent from config", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" }, // no janitorCrossWindow key
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      foreignJanitorGroups: [{ groupId: 99, windowId: 999, title: "alpha" }],
+    });
+    expect(ops).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 99, fromWindowId: 999, intoId: 10 });
+  });
+
+  test("no foreignJanitorGroups on the sync message is a no-op, not a throw", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      // foreignJanitorGroups absent entirely
+    });
+    expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+  });
+
+  test("multiple foreign-window duplicates of the same title all recover into the one in-window canonical", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }],
+      foreignJanitorGroups: [
+        { groupId: 98, windowId: 998, title: "alpha" },
+        { groupId: 99, windowId: 999, title: "alpha" },
+      ],
+    });
+    const recoveries = ops.filter((o) => o.op === "recoverCrossWindow");
+    expect(recoveries).toEqual([
+      { op: "recoverCrossWindow", fromGroupId: 98, fromWindowId: 998, intoId: 10 },
+      { op: "recoverCrossWindow", fromGroupId: 99, fromWindowId: 999, intoId: 10 },
+    ]);
+  });
+});
+
+describe("resolveGroupCache -- cache invalidation on window resolution", () => {
+  test("a cached groupId that still belongs to the target window is left alone (no correction)", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 10, windowId: 1, title: "alpha" }];
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([]);
+  });
+
+  test("a cached groupId that now belongs to a DIFFERENT window is corrected via title re-resolution in-window", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
+    // groupId 10 is really in window 2 (stale, cross-window); window 1 (the
+    // target) has its own group titled "alpha" under a different id.
+    const allGroups = [
+      { groupId: 10, windowId: 2, title: "alpha" },
+      { groupId: 20, windowId: 1, title: "alpha" },
+    ];
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+  });
+
+  test("a cached groupId in the wrong window with NO matching title in-window falls back to null", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 10, windowId: 2, title: "alpha" }]; // nothing at all in window 1
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: null }]);
+  });
+
+  test("a cached groupId that no longer exists anywhere falls back to title re-resolution, same as a cross-window mismatch", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 20, windowId: 1, title: "alpha" }]; // groupId 10 doesn't appear at all
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+  });
+
+  test("a never-attached entry (groupId: null) with a real match in-window still resolves it", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 20, windowId: 1, title: "alpha" }];
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+  });
+
+  test("archived entries are never touched, even with a stale cross-window groupId", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: true, groupId: 10, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 10, windowId: 2, title: "alpha" }];
+    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([]);
+  });
+
+  test("this is exactly the fix for the live incident: a stale groupId from the OLD window never survives window resolution", () => {
+    // The exact shape of the reported bug: byId still has the old window's
+    // groupIds cached; the new window (freshly created/adopted) has none of
+    // them, but DOES already carry freshly-created groups for some titles.
+    const byId = {
+      mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null },
+      mw_b: { title: "beta", color: "red", archived: false, groupId: 11, lastActiveTabId: null },
+    };
+    const allGroups = [
+      { groupId: 10, windowId: 777, title: "alpha" }, // stale: really in the OLD window
+      { groupId: 11, windowId: 777, title: "beta" }, // stale: really in the OLD window
+    ];
+    const facts = resolveGroupCache(byId, 555, allGroups); // 555 = the newly-resolved window, empty
+    expect(facts).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: null },
+      { type: "local", name: "groupCreated", id: "mw_b", groupId: null },
+    ]);
+  });
+});
+
+describe("chooseAdoptionWindow -- window adoption / marker consolidation", () => {
+  test("a single marker tab is kept as-is, no candidates to close", () => {
+    const markers = [{ tabId: 1, windowId: 100 }];
+    const byId = {};
+    expect(chooseAdoptionWindow(markers, byId, [])).toEqual({ action: "keep", windowId: 100, closeTabIds: [] });
+  });
+
+  test("multiple marker tabs: the group-richest window's marker wins, the rest queue to close", () => {
+    const markers = [
+      { tabId: 1, windowId: 100 }, // 0 managed groups
+      { tabId: 2, windowId: 200 }, // 2 managed groups
+      { tabId: 3, windowId: 300 }, // 1 managed group
+    ];
+    const byId = {
+      mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null },
+      mw_b: { title: "beta", color: "red", archived: false, groupId: null, lastActiveTabId: null },
+    };
+    const allGroups = [
+      { groupId: 10, windowId: 200, title: "alpha" },
+      { groupId: 11, windowId: 200, title: "beta" },
+      { groupId: 12, windowId: 300, title: "alpha" },
+    ];
+    const decision = chooseAdoptionWindow(markers, byId, allGroups);
+    expect(decision.action).toBe("keep");
+    expect(decision.windowId).toBe(200);
+    expect(decision.closeTabIds.sort()).toEqual([1, 3]);
+  });
+
+  test("zero marker tabs: adopts the window with the most managed-title groups", () => {
+    const byId = {
+      mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null },
+      mw_b: { title: "beta", color: "red", archived: false, groupId: null, lastActiveTabId: null },
+    };
+    const allGroups = [
+      { groupId: 10, windowId: 200, title: "alpha" },
+      { groupId: 11, windowId: 200, title: "beta" },
+      { groupId: 12, windowId: 300, title: "alpha" },
+    ];
+    expect(chooseAdoptionWindow([], byId, allGroups)).toEqual({ action: "adopt", windowId: 200, closeTabIds: [] });
+  });
+
+  test("zero marker tabs, zero candidate windows: creates a brand-new window (the original last-resort behavior)", () => {
+    expect(chooseAdoptionWindow([], {}, [])).toEqual({ action: "createNew", windowId: null, closeTabIds: [] });
+  });
+
+  test("zero marker tabs, groups exist but none match any managed title: still creates a brand-new window", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 10, windowId: 200, title: "someone else's tabs" }];
+    expect(chooseAdoptionWindow([], byId, allGroups)).toEqual({ action: "createNew", windowId: null, closeTabIds: [] });
+  });
+});
+
+describe("isolated e2e: window-split incident end to end", () => {
+  test("boot after a marker-tab loss recovers a full duplicate set without ever activating the old window's groups", () => {
+    // Simulates exactly the reported incident: byId still holds groupIds
+    // for the OLD window (777); the extension has just resolved a NEW
+    // window (555, adopted or created) with none of those groups yet.
+    const staleState = makeState({
+      windowId: 777,
+      activeId: "mw_a",
+      byId: {
+        mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: 101 },
+        mw_b: { title: "beta", color: "red", archived: false, groupId: 11, lastActiveTabId: 111 },
+      },
+    });
+
+    // Step 1: window resolution runs cache invalidation (fix 1). The new
+    // window (555) has no groups of its own yet -- everything nulls out.
+    const allGroupsAtOldWindow = [
+      { groupId: 10, windowId: 777, title: "alpha" },
+      { groupId: 11, windowId: 777, title: "beta" },
+    ];
+    const corrections = resolveGroupCache(staleState.byId, 555, allGroupsAtOldWindow);
+    expect(corrections).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: null },
+      { type: "local", name: "groupCreated", id: "mw_b", groupId: null },
+    ]);
+
+    let state = staleState;
+    for (const fact of corrections) {
+      state = reduce(state, fact).state;
+    }
+    // Nothing in byId still points at the old window's groups.
+    expect(state.byId.mw_a.groupId).toBeNull();
+    expect(state.byId.mw_b.groupId).toBeNull();
+
+    // Step 2: the next sync arrives. ensureGroup will (in the real
+    // extension) create fresh groups in window 555 for alpha/beta; the
+    // janitor's foreign-group scan reports the OLD window's groups as
+    // recoverable, but only once a canonical exists there -- so THIS
+    // sync's janitorGroups (window 555's own groups) is still empty at
+    // classification time (ensureGroup hasn't run yet this pass).
+    const { ops: firstSyncOps } = reduce(state, {
+      type: "sync",
+      seq: 2,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: {
+        activeId: "mw_a",
+        workspaces: [
+          { id: "mw_a", title: "alpha", color: "blue", archived: false },
+          { id: "mw_b", title: "beta", color: "red", archived: false },
+        ],
+      },
+      janitorGroups: [], // window 555 is still empty at classification time
+      foreignJanitorGroups: [
+        { groupId: 10, windowId: 777, title: "alpha" },
+        { groupId: 11, windowId: 777, title: "beta" },
+      ],
+    });
+    // No recovery yet (no in-window canonical to recover into) -- and,
+    // critically, activation targets groupId: null (invalidated above),
+    // never the old window's real groupIds 10/11.
+    expect(firstSyncOps.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+    expect(firstSyncOps).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+    expect(firstSyncOps).toContainEqual({ op: "activate", id: "mw_a" });
+
+    // Step 3: ensureGroup ran (simulated: byId now has fresh in-window
+    // groupIds), and the NEXT sync arrives with the old window's groups
+    // still sitting there -- this is when cross-window recovery fires.
+    const afterEnsure = reduce(state, { type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }).state;
+    const afterEnsure2 = reduce(afterEnsure, { type: "local", name: "groupCreated", id: "mw_b", groupId: 21 }).state;
+
+    const { ops: secondSyncOps } = reduce(afterEnsure2, {
+      type: "sync",
+      seq: 3,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: {
+        activeId: "mw_a",
+        workspaces: [
+          { id: "mw_a", title: "alpha", color: "blue", archived: false },
+          { id: "mw_b", title: "beta", color: "red", archived: false },
+        ],
+      },
+      janitorGroups: [
+        { groupId: 20, title: "alpha", tabs: [] },
+        { groupId: 21, title: "beta", tabs: [] },
+      ],
+      foreignJanitorGroups: [
+        { groupId: 10, windowId: 777, title: "alpha" },
+        { groupId: 11, windowId: 777, title: "beta" },
+      ],
+    });
+    expect(secondSyncOps).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 10, fromWindowId: 777, intoId: 20 });
+    expect(secondSyncOps).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 11, fromWindowId: 777, intoId: 21 });
+    // Still never a report -- these are recognized, managed titles, not
+    // unrecognized foreign groups.
+    expect(secondSyncOps.find((o) => o.op === "reportForeignGroups")).toBeUndefined();
   });
 });

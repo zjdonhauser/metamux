@@ -260,6 +260,48 @@ browser tab the cmux tab relates to" -- Zac), fully implemented, tested, and LIV
       against the live production daemon's full registry (which would have painted every real
       tab with a fallback color, out of scope for "one throwaway workspace").
 
+## Window-split fix (2026-08-27) -- diagnose-by-design, TDD
+
+Live bug on Zac's machine: after an extension reload, two full group sets existed side by side,
+cmux switching kept driving the original set, and the janitor reported nothing. Diagnosed root
+cause (supervisor): `resolveMetamuxWindow` picked a different window post-reload (the original
+marker tab was closed during manual cleanup); stale cached groupIds kept working cross-window
+(chrome APIs accept a groupId regardless of window) while `ensureGroup` rebuilt a second set in
+the new window and the janitor, scoped to that new window only, never saw the old one.
+
+- [x] **Cache invalidation on window resolution**: `reducer.js`'s new `resolveGroupCache` checks
+      every cached groupId against a snapshot of ALL windows' groups, not just the managed one --
+      a groupId that belongs to the wrong window (or doesn't exist at all) is corrected by title
+      re-resolution within the target window, else nulled. This is the actual fix for the
+      reported symptom (a stale cross-window groupId silently working for activation).
+- [x] **Window adoption**: `reducer.js`'s new `chooseAdoptionWindow` -- zero marker tabs no
+      longer always means "create a brand-new window"; it now adopts the window with the most
+      managed-title groups if one exists, only falling back to create-new as a true last resort.
+      Multiple marker tabs (a prior-boot leftover): keeps the group-richest window's, closes the
+      rest.
+- [x] **Cross-window recovery merge**: `classifyJanitor` extended with a `foreignGroups` param --
+      managed-title groups in OTHER windows get `recoverCrossWindow`'d (tabs.move then
+      tabs.group) into the in-window canonical, once one exists; unmanaged titles in other
+      windows are never touched, same as the in-window janitor's own FOREIGN classification.
+      Config `janitorCrossWindow: true` default, daemon config plumbing done (allowlist/
+      validate/hot-reload/sync-frame/protocol.md).
+- [x] All three are PURE decision functions in `reducer.js`, fed snapshots gathered by thin
+      `chrome-ops.js`/`sw.js` glue -- same "reducer stays pure" pattern as the base janitor.
+      `extension/test/reducer.test.js`: 20 new tests (54 -> 74) covering the full matrix for all
+      three plus an "isolated e2e" scenario test that walks the exact incident end to end
+      (stale-window boot -> cache invalidation -> first sync with no in-window canonical yet ->
+      second sync recovers cross-window -> activation never once targets the old window's real
+      groupIds).
+- [x] "Isolated e2e" interpreted as a self-contained, CI-safe reducer-level scenario test (no
+      real Chrome/daemon), not an extension of `scripts/e2e-chromium.ts` (the real-Chromium
+      harness, already flagged there as "manual pre-flight, not CI-safe") -- flagging this
+      interpretation explicitly in case a real-browser second-window scenario is still wanted as
+      a separate follow-up.
+- [x] `bun test`: 558 pass, 0 fail (up from 540 at the start of this fix). `bunx tsc --noEmit`:
+      clean.
+- Not yet activated live: per the task, the supervisor activates this (Zac reloads the extension
+  once) -- not performed here, same category of live-environment action as the tmux cutover.
+
 ## Blockers
 
 - tmux absorption live cutover (kill the real tmux-cmux-sync process, edit real `.zshrc`,

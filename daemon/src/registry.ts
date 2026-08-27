@@ -6,8 +6,12 @@
 
 import { randomBytes } from "node:crypto";
 import { nearestChromeGroupColor, resolveCmuxColor, TAB_GROUP_COLORS, type ChromeGroupColor } from "./colors.ts";
+import { claimPaletteIndex, type PaletteHolder } from "./palette-allocator.ts";
+import type { PaletteEntry } from "./palette.ts";
 import type { CmuxWorkspaceEvent } from "./parser.ts";
 import type { RegistryIntent } from "./tmux-reconcile.ts";
+
+export type ColorMode = "palette" | "hash";
 
 export { TAB_GROUP_COLORS };
 
@@ -47,6 +51,14 @@ export interface WorkspaceRef {
    * type-restricted to "cmux" since a ref can be reclassified between
    * sources (tmux-migration.ts). */
   paintedColor: string | null;
+  /** colorMode: "palette" allocation (palette-allocator.ts): the index
+   * into the loaded palette.ts entries this ref currently holds, or null
+   * if it's never attached, was released (detach/archive), or colorMode
+   * is "hash". Cleared (not just left stale) on every archive/detach so a
+   * later re-attach always claims fresh -- see Registry.claimPaletteColor
+   * and its release call sites. Persisted so a restart doesn't reshuffle
+   * every still-attached identity's color. */
+  paletteIndex: number | null;
   updatedAt: string; // ISO
 }
 
@@ -63,7 +75,9 @@ export type ActuatorEvent =
   | { name: "workspace.archived"; workspace: ActuatorWorkspace };
 
 /** The workspace's mapped cmuxColor when set and resolvable, else a
- * deterministic hash of the title: sum of UTF-16 char codes mod 9. */
+ * deterministic hash of the title: sum of UTF-16 char codes mod 9. This is
+ * ONLY the title-hash fallback -- resolveColor below is the actual
+ * colorMode-aware precedence used everywhere on the wire. */
 export function colorFor(title: string, cmuxColor?: string | null): ChromeGroupColor {
   if (cmuxColor) {
     const mapped = nearestChromeGroupColor(cmuxColor);
@@ -76,8 +90,39 @@ export function colorFor(title: string, cmuxColor?: string | null): ChromeGroupC
   return TAB_GROUP_COLORS[sum % TAB_GROUP_COLORS.length]!;
 }
 
-function toActuator(ref: WorkspaceRef): ActuatorWorkspace {
-  return { id: ref.id, title: ref.title, color: colorFor(ref.title, ref.cmuxColor), archived: ref.archived };
+export interface ColorInputs {
+  title: string;
+  cmuxColor: string | null;
+  paintedColor: string | null;
+  paletteIndex: number | null;
+}
+
+/** Full color-resolution precedence, colorMode-aware:
+ * 1. A genuinely USER-set cmuxColor -- cmuxColor !== paintedColor, the
+ *    same ownership signature color-backflow.ts already uses to tell "the
+ *    user set this" apart from "this is our own paint echoing back
+ *    through the colored event" -- hue-mapped to the nearest Chrome color.
+ * 2. In colorMode: "palette", the ref's allocated palette entry
+ *    (palette.ts): an EXPLICIT per-entry choice, never hue-mapped.
+ *    Excluding step 1's own paint from hue-mapping matters here: a
+ *    backflow-painted brand hex whose palette entry says e.g. "grey"
+ *    could otherwise hue-map to a DIFFERENT Chrome color (Navy #152744
+ *    hue-maps to "blue" per colors.ts), flipping the group's color one
+ *    backflow cycle after allocation -- the paintedColor check in step 1
+ *    is what prevents that.
+ * 3. The title hash (colorFor) -- the ultimate fallback, and the entire
+ *    behavior in colorMode: "hash". */
+export function resolveColor(input: ColorInputs, colorMode: ColorMode, palette: PaletteEntry[]): ChromeGroupColor {
+  const userSet = input.cmuxColor !== null && input.cmuxColor !== input.paintedColor;
+  if (userSet) {
+    const mapped = nearestChromeGroupColor(input.cmuxColor!);
+    if (mapped) return mapped;
+  }
+  if (colorMode === "palette" && input.paletteIndex !== null) {
+    const entry = palette[input.paletteIndex];
+    if (entry) return entry.chromeColor;
+  }
+  return colorFor(input.title);
 }
 
 function newId(): string {
@@ -95,8 +140,48 @@ export class Registry {
    * hot-reloadable -- main.ts sets this immediately after construction,
    * before the seed replay, and again on a live config change. */
   attachOnActivate = true;
+  /** groupBy (title-aliasing vs one identity per real workspace): mirrors
+   * GroupProjection's own mode. Kept here too because palette allocation
+   * happens at the moment of attachment (markAttached) and needs to know
+   * the allocation UNIT -- a title alias's members share one claim, a
+   * real workspace's don't. Mutable for the same hot-reload reason as
+   * attachOnActivate; main.ts keeps both in lockstep with config.groupBy. */
+  groupBy: "title" | "workspace" = "title";
+  /** colorMode: "palette" (default) allocates a distinguishable palette
+   * entry per identity at attachment time (see markAttached);
+   * "hash" disables allocation and every identity without a user-set
+   * color falls back to colorFor's title hash. Mutable, hot-reloadable. */
+  colorMode: ColorMode = "palette";
 
-  constructor(private namedSlots: Record<string, string> | null = null) {}
+  constructor(
+    private namedSlots: Record<string, string> | null = null,
+    private palette: PaletteEntry[] = [],
+  ) {}
+
+  private toActuator(ref: WorkspaceRef): ActuatorWorkspace {
+    return { id: ref.id, title: ref.title, color: resolveColor(ref, this.colorMode, this.palette), archived: ref.archived };
+  }
+
+  /** Claims this ref's palette index (colorMode: "palette" only -- see
+   * markAttached, the sole caller): the lowest index not held by any
+   * OTHER live, attached identity sharing its groupBy unit. Idempotent
+   * and stable for an identity that already holds a live index -- see
+   * palette-allocator.ts's claimPaletteIndex for the full contract.
+   * No-op when the palette is empty (colorMode: "hash", or an unreadable
+   * cmux.json with no fallback loaded -- shouldn't happen in practice,
+   * palette.ts always returns a non-empty list, but stays defensive). */
+  private claimPaletteColor(id: string): void {
+    if (this.palette.length === 0) return;
+    const ref = this.workspaces.get(id);
+    if (!ref) return;
+    const identityKey = this.groupBy === "title" ? ref.title : ref.id;
+    const holders: PaletteHolder[] = [...this.workspaces.values()].map((other) => ({
+      identityKey: this.groupBy === "title" ? other.title : other.id,
+      live: !other.archived && other.attachedAt !== null,
+      paletteIndex: other.paletteIndex,
+    }));
+    ref.paletteIndex = claimPaletteIndex(identityKey, holders, this.palette.length);
+  }
 
   private findBySourceId(source: WorkspaceSource, sourceId: string): WorkspaceRef | null {
     for (const ref of this.workspaces.values()) {
@@ -151,6 +236,7 @@ export class Registry {
       cmuxColor: null,
       attachedAt: null,
       paintedColor: null,
+      paletteIndex: null,
       updatedAt: new Date().toISOString(),
     };
     this.workspaces.set(ref.id, ref);
@@ -170,25 +256,36 @@ export class Registry {
     if (existing.cmuxColor === resolved) return [];
     existing.cmuxColor = resolved;
     existing.updatedAt = new Date().toISOString();
-    return [{ name: "workspace.upserted", workspace: toActuator(existing) }];
+    return [{ name: "workspace.upserted", workspace: this.toActuator(existing) }];
   }
 
   /** Marks a workspace attached (idempotent -- the first call for a given
    * id records the timestamp; later calls are no-ops). Called on
    * activation (selected, window follow) when attachOnActivate is true,
    * and always when open_url targets a workspace directly (server.ts).
-   * No-op for an unknown id. */
+   * Attachment is also palette allocation's trigger point (docs/
+   * protocol.md's "Palette allocation" section): a fresh attachment
+   * claims a palette color in colorMode: "palette", the same instant a
+   * group is actually created. No-op for an unknown id or one already
+   * attached. */
   markAttached(id: string, atIso: string = new Date().toISOString()): void {
     const ref = this.workspaces.get(id);
-    if (ref && ref.attachedAt === null) ref.attachedAt = atIso;
+    if (!ref || ref.attachedAt !== null) return;
+    ref.attachedAt = atIso;
+    if (this.colorMode === "palette") this.claimPaletteColor(id);
   }
 
   /** Detach-on-close (userClosedGroup): clears a workspace's attachedAt so
-   * createGroups' lazy filter stops including it until it's reopened.
-   * No-op for an unknown id or one already unattached. */
+   * createGroups' lazy filter stops including it until it's reopened, and
+   * releases its palette color claim (palette-allocator.ts) -- a
+   * re-attach later claims fresh and may land on a different color, by
+   * design (Zac: "frees back up"). No-op for an unknown id or one already
+   * unattached. */
   clearAttached(id: string): void {
     const ref = this.workspaces.get(id);
-    if (ref) ref.attachedAt = null;
+    if (!ref) return;
+    ref.attachedAt = null;
+    ref.paletteIndex = null;
   }
 
   /** Color backflow's only writer of `paintedColor` (color-backflow.ts is
@@ -214,8 +311,14 @@ export class Registry {
       const existing = this.findMatch("cmux", event.workspaceId, event.title, event.cwd);
       if (!existing) return [];
       existing.archived = true;
+      // Release the palette claim on archive, not just at detach: attachedAt
+      // survives archive (a still-attached-but-archived ref can unarchive
+      // later via upsert without going through markAttached again), so
+      // leaving paletteIndex stamped here would let it silently come back
+      // live holding a slot someone else may have claimed meanwhile.
+      existing.paletteIndex = null;
       existing.updatedAt = new Date().toISOString();
-      return [{ name: "workspace.archived", workspace: toActuator(existing) }];
+      return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
     }
 
     if (event.name === "colored") {
@@ -225,12 +328,12 @@ export class Registry {
     // created, renamed, selected all upsert first.
     const { ref, changed } = this.upsert("cmux", event.workspaceId, event.title, event.cwd);
     const out: ActuatorEvent[] = [];
-    if (changed) out.push({ name: "workspace.upserted", workspace: toActuator(ref) });
+    if (changed) out.push({ name: "workspace.upserted", workspace: this.toActuator(ref) });
 
     if (event.name === "selected") {
       this.activeId = ref.id;
       if (this.attachOnActivate) this.markAttached(ref.id);
-      out.push({ name: "workspace.activated", workspace: toActuator(ref) });
+      out.push({ name: "workspace.activated", workspace: this.toActuator(ref) });
     }
 
     return out;
@@ -245,7 +348,7 @@ export class Registry {
     if (!target || this.activeId === target.id) return [];
     this.activeId = target.id;
     if (this.attachOnActivate) this.markAttached(target.id);
-    return [{ name: "workspace.activated", workspace: toActuator(target) }];
+    return [{ name: "workspace.activated", workspace: this.toActuator(target) }];
   }
 
   /** Applies one tmux-source RegistryIntent (tmux-reconcile.ts's pure
@@ -259,11 +362,12 @@ export class Registry {
       const existing = this.findBySourceId("tmux", intent.sessionId);
       if (!existing || existing.archived) return [];
       existing.archived = true;
+      existing.paletteIndex = null; // release the palette claim, same as applyEvent's closed branch
       existing.updatedAt = new Date().toISOString();
-      return [{ name: "workspace.archived", workspace: toActuator(existing) }];
+      return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
     }
     const { ref, changed } = this.upsert("tmux", intent.sessionId, intent.sessionName, null);
-    return changed ? [{ name: "workspace.upserted", workspace: toActuator(ref) }] : [];
+    return changed ? [{ name: "workspace.upserted", workspace: this.toActuator(ref) }] : [];
   }
 
   /** One-time migration only (docs/tmux-port-plan.md §3.1(b)/§5 Phase 5):
@@ -284,7 +388,7 @@ export class Registry {
     existing.title = sessionName;
     existing.cwd = null;
     existing.updatedAt = new Date().toISOString();
-    return [{ name: "workspace.upserted", workspace: toActuator(existing) }];
+    return [{ name: "workspace.upserted", workspace: this.toActuator(existing) }];
   }
 
   /** Migration-only sibling of reclassifyAsTmux: for every OTHER cmux ref
@@ -297,8 +401,9 @@ export class Registry {
     const existing = this.findBySourceId(source, sourceId);
     if (!existing || existing.archived) return [];
     existing.archived = true;
+    existing.paletteIndex = null; // release the palette claim, same as applyEvent's closed branch
     existing.updatedAt = new Date().toISOString();
-    return [{ name: "workspace.archived", workspace: toActuator(existing) }];
+    return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
   }
 
   /** Registry compaction: removes archived refs from the registry -- ALL

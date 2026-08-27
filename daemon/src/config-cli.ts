@@ -20,8 +20,10 @@ export const CONFIG_ALLOWED_KEYS = [
   "tmux.reattachGraceMs",
   "tmux.spawnCwd",
   "janitor",
+  "janitorCrossWindow",
   "colorBackflow",
   "pruneArchivedAfterDays",
+  "colorMode",
 ] as const;
 
 export type ConfigKey = (typeof CONFIG_ALLOWED_KEYS)[number];
@@ -54,6 +56,7 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
     case "reverseSync":
     case "collapseOthers":
     case "janitor":
+    case "janitorCrossWindow":
     case "colorBackflow":
       return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };
     case "closeBehavior":
@@ -96,6 +99,10 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
       return typeof value === "string" && value.length > 0
         ? { ok: true }
         : { ok: false, error: `${key} must be a non-empty string` };
+    case "colorMode":
+      return value === "palette" || value === "hash"
+        ? { ok: true }
+        : { ok: false, error: `${key} must be "palette" or "hash"` };
   }
 }
 

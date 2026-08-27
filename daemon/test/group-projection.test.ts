@@ -13,6 +13,7 @@ function ref(overrides: Partial<WorkspaceRef> = {}): WorkspaceRef {
     cmuxColor: overrides.cmuxColor ?? null,
     attachedAt: overrides.attachedAt ?? null,
     paintedColor: overrides.paintedColor ?? null,
+    paletteIndex: overrides.paletteIndex ?? null,
     updatedAt: overrides.updatedAt ?? new Date().toISOString(),
   };
 }
@@ -154,6 +155,50 @@ describe("GroupProjection -- title mode: dedupe and aggregation", () => {
     // falls back to title hash since the only colored member is archived
     const expectedFallback = state.workspaces[0]!.color;
     expect(expectedFallback).not.toBe("blue"); // would be "blue" if b's color leaked through
+  });
+
+  const TEST_PALETTE = [
+    { name: "Navy", hex: "#152744", chromeColor: "grey" as const },
+    { name: "Blue", hex: "#2779FB", chromeColor: "blue" as const },
+  ];
+
+  test("colorMode: palette -- the alias picks up the first LIVE member's palette allocation", () => {
+    const gp = new GroupProjection("title", "palette", TEST_PALETTE);
+    const a = ref({ id: "mw_a", title: "cmux", paletteIndex: null });
+    const b = ref({ id: "mw_b", title: "cmux", paletteIndex: 0 });
+    const state = gp.projectState(snapshot([a, b]));
+    expect(state.workspaces[0]!.color).toBe("grey"); // TEST_PALETTE[0]'s chromeColor, not hue-mapped
+  });
+
+  test("colorMode: palette -- an archived member's allocation is NOT used", () => {
+    const gp = new GroupProjection("title", "palette", TEST_PALETTE);
+    const a = ref({ id: "mw_a", title: "cmux", paletteIndex: null, archived: false });
+    const b = ref({ id: "mw_b", title: "cmux", paletteIndex: 0, archived: true });
+    const state = gp.projectState(snapshot([a, b]));
+    expect(state.workspaces[0]!.color).not.toBe("grey");
+  });
+
+  test("colorMode: palette -- a genuinely user-set color on any live member still wins over the allocation", () => {
+    const gp = new GroupProjection("title", "palette", TEST_PALETTE);
+    const a = ref({ id: "mw_a", title: "cmux", paletteIndex: 0, cmuxColor: null });
+    const b = ref({ id: "mw_b", title: "cmux", paletteIndex: null, cmuxColor: "#2779FB", paintedColor: null });
+    const state = gp.projectState(snapshot([a, b]));
+    expect(state.workspaces[0]!.color).toBe("blue"); // hue-mapped user color, not TEST_PALETTE[0]'s grey
+  });
+
+  test("groupBy: workspace -- resolveColor is applied per-ref directly, using its own paletteIndex", () => {
+    const gp = new GroupProjection("workspace", "palette", TEST_PALETTE);
+    const a = ref({ id: "mw_a", title: "cmux", paletteIndex: 0 });
+    const state = gp.projectState(snapshot([a]));
+    expect(state.workspaces[0]!.color).toBe("grey");
+  });
+
+  test("setColorMode switches live, mirroring setGroupBy", () => {
+    const gp = new GroupProjection("title", "hash", TEST_PALETTE);
+    const a = ref({ id: "mw_a", title: "cmux", paletteIndex: 0 });
+    expect(gp.projectState(snapshot([a])).workspaces[0]!.color).not.toBe("grey"); // hash mode ignores the allocation
+    gp.setColorMode("palette");
+    expect(gp.projectState(snapshot([a])).workspaces[0]!.color).toBe("grey");
   });
 
   test("no live members with a color falls back to title hash", () => {

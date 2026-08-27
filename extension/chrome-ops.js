@@ -11,9 +11,12 @@
  * must honor, especially: never chrome.windows.update({focused:true}) (F3).
  */
 
+import { resolveGroupCache, chooseAdoptionWindow } from "./reducer.js";
+
 /** @typedef {import("./reducer.js").Op} Op */
 /** @typedef {import("./reducer.js").State} State */
 /** @typedef {import("./reducer.js").Msg} Msg */
+/** @typedef {import("./reducer.js").WorkspaceEntry} WorkspaceEntry */
 
 const TAB_GROUP_ID_NONE = -1;
 
@@ -88,6 +91,8 @@ function executeOp(op, state, ctx) {
       return mergeGroup(op);
     case "closeGroup":
       return closeGroup(op);
+    case "recoverCrossWindow":
+      return recoverCrossWindow(op, ctx);
     case "reportForeignGroups":
       return reportForeignGroups(op, ctx);
     default:
@@ -280,6 +285,31 @@ async function closeGroup(op) {
 }
 
 /**
+ * Cross-window recovery merge (window-split fix, 2026-08-27): a managed-
+ * title group living in a DIFFERENT window (found by the janitor's
+ * foreign-group scan) gets its tabs moved into the canonical in-window
+ * group. tabs.move first -- a tab must already be in the target window
+ * before tabs.group can add it to a group there -- then tabs.group.
+ * markServerRemoval on the source group so watchGroupRemoved's detach
+ * echo-suppression doesn't mistake this recovery for the user closing the
+ * group by hand (the source group dissolves once its last tab moves out,
+ * same as mergeGroup's in-window case).
+ * @param {Op} op
+ * @param {{windowId: number}} ctx
+ * @returns {Promise<null>}
+ */
+async function recoverCrossWindow(op, ctx) {
+  markServerRemoval(/** @type {number} */ (op.fromGroupId));
+  const tabs = await chrome.tabs.query({ groupId: /** @type {number} */ (op.fromGroupId) });
+  if (tabs.length > 0) {
+    const tabIds = /** @type {number[]} */ (tabs.map((t) => t.id));
+    await chrome.tabs.move(tabIds, { windowId: ctx.windowId, index: -1 });
+    await chrome.tabs.group({ tabIds, groupId: /** @type {number} */ (op.intoId) });
+  }
+  return null;
+}
+
+/**
  * Janitor: reports unrecognized, non-blank groups back to the daemon via
  * the existing client->server "state" frame (docs/protocol.md, Wire
  * protocol) so it can log them for the human to review. The janitor never
@@ -294,41 +324,73 @@ async function reportForeignGroups(op, ctx) {
 }
 
 /**
- * Finds the marker tab (panel.html) to identify THE metamux window, or
- * creates a fresh window with panel.html as its only tab.
+ * Every tab group chrome currently knows about, across ALL windows (unlike
+ * scanTabGroups, which is metamux-window-only and carries per-tab detail
+ * for the blank-orphan check). Feeds resolveGroupCache's cache-
+ * invalidation check, chooseAdoptionWindow's window-adoption decision, and
+ * the cross-window janitor recovery scan -- all three need to reason about
+ * groups OUTSIDE the (not yet fully known, at boot) managed window.
+ * @returns {Promise<import("./reducer.js").GroupSnapshot[]>}
+ */
+export async function allGroupsSnapshot() {
+  const groups = await chrome.tabGroups.query({});
+  return groups.map((g) => ({ groupId: g.id, windowId: g.windowId, title: g.title ?? "" }));
+}
+
+/**
+ * Finds THE metamux window via chooseAdoptionWindow's pure decision
+ * (window-split fix, 2026-08-27): every real tab whose URL is panel.html
+ * is a marker sighting; every real tab group is scanned for managed-title
+ * membership. One marker -> keep it. Multiple markers -> keep the
+ * group-richest window's, close the rest (a leftover from a prior boot
+ * that never got cleaned up). Zero markers -> adopt the group-richest
+ * window if one has any managed-title groups (create a marker tab there),
+ * else create a brand-new window (the original, now last-resort, behavior).
+ * @param {Object<string, WorkspaceEntry>} [byId]
  * @returns {Promise<number>} windowId
  */
-export async function resolveMetamuxWindow() {
+export async function resolveMetamuxWindow(byId = {}) {
   const panelUrl = chrome.runtime.getURL("panel.html");
   const tabs = await chrome.tabs.query({});
-  const marker = tabs.find((t) => t.url && t.url.startsWith(panelUrl));
-  if (marker && marker.windowId != null) return marker.windowId;
+  /** @type {import("./reducer.js").MarkerTabSighting[]} */
+  const markers = [];
+  for (const t of tabs) {
+    if (t.url && t.url.startsWith(panelUrl) && t.id != null && t.windowId != null) {
+      markers.push({ tabId: t.id, windowId: t.windowId });
+    }
+  }
+
+  const allGroups = await allGroupsSnapshot();
+  const decision = chooseAdoptionWindow(markers, byId, allGroups);
+
+  for (const tabId of decision.closeTabIds) {
+    await chrome.tabs.remove(tabId).catch(() => {}); // best-effort -- already-closed tab is not an error here
+  }
+
+  if (decision.action === "keep") return /** @type {number} */ (decision.windowId);
+
+  if (decision.action === "adopt") {
+    await chrome.tabs.create({ windowId: /** @type {number} */ (decision.windowId), url: panelUrl, active: false });
+    return /** @type {number} */ (decision.windowId);
+  }
+
   const win = await chrome.windows.create({ url: panelUrl, focused: false });
   return /** @type {number} */ (win.id);
 }
 
 /**
- * groupId is never trusted across restarts. Re-resolve every tracked,
- * unarchived entry's group by title within the metamux window and emit
- * correction facts for anything that changed (including entries that lost
- * their group and must fall back to null, to be recreated by the next
- * ensureGroup op).
+ * groupId is never trusted across restarts OR across a window-resolution
+ * change (window-split fix, 2026-08-27: the cached groupId itself is
+ * checked for membership in `windowId` before anything is trusted -- see
+ * resolveGroupCache for why "chrome APIs accept a groupId cross-window"
+ * made the old title-only re-resolution insufficient on its own).
  * @param {State} state
  * @param {number} windowId
  * @returns {Promise<Msg[]>}
  */
 export async function reresolveGroupIds(state, windowId) {
-  /** @type {Msg[]} */
-  const facts = [];
-  for (const [id, entry] of Object.entries(state.byId)) {
-    if (entry.archived) continue;
-    const found = await chrome.tabGroups.query({ title: entry.title, windowId });
-    const groupId = found[0]?.id ?? null;
-    if (groupId !== entry.groupId) {
-      facts.push({ type: "local", name: "groupCreated", id, groupId });
-    }
-  }
-  return facts;
+  const allGroups = await allGroupsSnapshot();
+  return resolveGroupCache(state.byId, windowId, allGroups);
 }
 
 /**

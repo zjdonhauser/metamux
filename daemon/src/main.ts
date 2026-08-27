@@ -13,6 +13,7 @@ import { loadConfig } from "./config.ts";
 import { Gate, type GateEmission } from "./gate.ts";
 import { GroupProjection } from "./group-projection.ts";
 import { LazyGroupTracker } from "./lazy-groups.ts";
+import { loadPalette, type PaletteEntry } from "./palette.ts";
 import { parseLine, parseWindowFocusedLine, type CmuxWorkspaceEvent } from "./parser.ts";
 import { atomicWriteJson, CONFIG_PATH, cursorPath, ensureSecret, ensureStateDir, logPath, registryPath } from "./paths.ts";
 import { PortsTracker } from "./ports.ts";
@@ -77,16 +78,19 @@ function extractRawIdentity(line: string): { bootId: string | null; seq: number 
 export function hydrateRegistry(
   saved: { workspaces: WorkspaceRef[]; activeId: string | null } | null,
   namedSlots: Record<string, string> | null,
+  palette: PaletteEntry[] = [],
 ): Registry {
-  const registry = new Registry(namedSlots);
+  const registry = new Registry(namedSlots, palette);
   if (!saved) return registry;
   for (const ref of saved.workspaces ?? []) {
-    // registry.json written before these features has no cmuxColor/attachedAt/paintedColor field.
+    // registry.json written before these features has no
+    // cmuxColor/attachedAt/paintedColor/paletteIndex field.
     registry.workspaces.set(ref.id, {
       ...ref,
       cmuxColor: ref.cmuxColor ?? null,
       attachedAt: ref.attachedAt ?? null,
       paintedColor: ref.paintedColor ?? null,
+      paletteIndex: ref.paletteIndex ?? null,
     });
   }
   registry.activeId = saved.activeId ?? null;
@@ -111,13 +115,19 @@ async function runDaemon(): Promise<void> {
   // resolving set_color events that used a slot name instead of raw hex.
   // Plain local file read -- doesn't need socket features.
   const namedColorSlots = await loadCmuxNamedColorSlots();
-  const registry = hydrateRegistry(savedRegistry, namedColorSlots);
+  // Ordered brand palette (colorMode: "palette", palette.ts) -- same
+  // read-once-at-startup lifecycle as namedColorSlots; a cmux.json edit
+  // to workspaceColors.colors takes effect on the next restart.
+  const palette = await loadPalette();
+  const registry = hydrateRegistry(savedRegistry, namedColorSlots, palette);
   // Must be set before ANY applyEvent call, including the seed replay
   // below: replay pushes historical `selected` events through the
   // registry too, and attachOnActivate gates whether those re-stamp
   // attachedAt. Left at its default (true) this far, on-open would
   // silently degenerate back to attach-everything on every restart.
   registry.attachOnActivate = config.createGroups !== "on-open";
+  registry.groupBy = config.groupBy;
+  registry.colorMode = config.colorMode;
 
   const stats = { skippedLines: 0 };
 
@@ -183,7 +193,7 @@ async function runDaemon(): Promise<void> {
   // lazy inclusion) both live here so main.ts's reverse-sync resolution
   // and server.ts's broadcast/buildSync/getState share the exact same
   // projection state.
-  const groupProjection = new GroupProjection(config.groupBy);
+  const groupProjection = new GroupProjection(config.groupBy, config.colorMode, palette);
   const lazyGroups = new LazyGroupTracker();
 
   // Seed lazy-inclusion attachment from registry.json's persisted
@@ -316,7 +326,9 @@ async function runDaemon(): Promise<void> {
         change.key === "closeBehavior" ||
         change.key === "groupBy" ||
         change.key === "createGroups" ||
-        change.key === "janitor"
+        change.key === "janitor" ||
+        change.key === "janitorCrossWindow" ||
+        change.key === "colorMode"
       ) {
         extensionAffected = true;
       }
@@ -332,6 +344,7 @@ async function runDaemon(): Promise<void> {
     if (changes.some((c) => c.hotApplicable && c.key === "groupBy")) {
       config.groupBy = newConfig.groupBy;
       groupProjection.setGroupBy(newConfig.groupBy);
+      registry.groupBy = newConfig.groupBy;
     }
     if (changes.some((c) => c.hotApplicable && c.key === "createGroups")) {
       config.createGroups = newConfig.createGroups;
@@ -354,6 +367,12 @@ async function runDaemon(): Promise<void> {
     }
     if (changes.some((c) => c.hotApplicable && c.key === "colorBackflow")) config.colorBackflow = newConfig.colorBackflow;
     if (changes.some((c) => c.hotApplicable && c.key === "janitor")) config.janitor = newConfig.janitor;
+    if (changes.some((c) => c.hotApplicable && c.key === "janitorCrossWindow")) config.janitorCrossWindow = newConfig.janitorCrossWindow;
+    if (changes.some((c) => c.hotApplicable && c.key === "colorMode")) {
+      config.colorMode = newConfig.colorMode;
+      registry.colorMode = newConfig.colorMode;
+      groupProjection.setColorMode(newConfig.colorMode);
+    }
 
     if (extensionAffected) server.pushSyncToAll();
   };
@@ -541,9 +560,10 @@ async function runDaemon(): Promise<void> {
       title: ref.title,
       cmuxColor: ref.cmuxColor,
       paintedColor: ref.paintedColor,
+      paletteIndex: ref.paletteIndex,
       archived: ref.archived,
     }));
-    const candidates = computeBackflowCandidates(refs, config.groupBy);
+    const candidates = computeBackflowCandidates(refs, config.groupBy, config.colorMode, palette);
     const actions = planBackflow(candidates);
     if (actions.length === 0) return;
 
@@ -723,7 +743,10 @@ async function runDoctor(): Promise<void> {
   console.log("(no side effects -- registry.json/cursor.json are not touched)");
 
   const namedColorSlots = await loadCmuxNamedColorSlots();
-  const registry = new Registry(namedColorSlots);
+  const palette = await loadPalette();
+  const registry = new Registry(namedColorSlots, palette);
+  registry.groupBy = config.groupBy;
+  registry.colorMode = config.colorMode;
   const gate = new Gate(config.debounceMs, 500);
   let skipped = 0;
   let suppressedCount = 0;

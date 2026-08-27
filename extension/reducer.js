@@ -21,6 +21,7 @@
  * @property {boolean} collapseOthers
  * @property {"archive"|"close"} closeBehavior
  * @property {boolean} [janitor]  default true when absent -- see the janitor section below
+ * @property {boolean} [janitorCrossWindow]  default true when absent -- see "cross-window recovery" below
  */
 
 /**
@@ -55,6 +56,30 @@
  */
 
 /**
+ * @typedef {Object} GroupSnapshot  one real chrome tab group, ANY window (lighter than
+ *   JanitorGroupSnapshot -- no per-tab detail, since the window-resolution/adoption/
+ *   cross-window-recovery decisions below only ever need groupId+windowId+title)
+ * @property {number} groupId
+ * @property {number} windowId
+ * @property {string} title
+ */
+
+/**
+ * @typedef {Object} JanitorForeignGroup  a managed-title group found OUTSIDE the metamux
+ *   window -- input to the cross-window recovery pass (see classifyJanitor below)
+ * @property {number} groupId
+ * @property {number} windowId
+ * @property {string} title
+ */
+
+/**
+ * @typedef {Object} MarkerTabSighting  a real tab whose URL is the extension's own
+ *   panel.html -- input to chooseAdoptionWindow
+ * @property {number} tabId
+ * @property {number} windowId
+ */
+
+/**
  * @typedef {Object} SyncMsg
  * @property {"sync"} type
  * @property {number} seq
@@ -63,6 +88,8 @@
  * @property {JanitorGroupSnapshot[]} [janitorGroups]  live tab-group enumeration, attached
  *   locally by sw.js before dispatch -- see the janitor section below. Absent (e.g. in older
  *   test fixtures) means "skip the janitor pass this reconciliation".
+ * @property {JanitorForeignGroup[]} [foreignJanitorGroups]  managed-title groups in OTHER
+ *   windows, attached alongside janitorGroups -- see "cross-window recovery" below.
  */
 
 /**
@@ -106,8 +133,10 @@
  * @property {string} [exceptId]
  * @property {"archive"|"close"} [behavior]
  * @property {string} [url]
- * @property {number} [fromGroupId]  mergeGroup: the duplicate group to dissolve
- * @property {number} [intoId]      mergeGroup: the canonical group to merge into
+ * @property {number} [fromGroupId]  mergeGroup: the duplicate group to dissolve;
+ *                                    recoverCrossWindow: the foreign-window group to recover
+ * @property {number} [fromWindowId] recoverCrossWindow: the window the group is being recovered FROM
+ * @property {number} [intoId]      mergeGroup/recoverCrossWindow: the canonical group to merge into
  * @property {number} [groupId]     closeGroup: the blank-orphan group to remove
  * @property {{title: string, tabCount: number}[]} [groups]  reportForeignGroups
  */
@@ -179,7 +208,8 @@ function reduceSync(state, msg) {
   // time only one group per managed title remains, so that query can't
   // pick a stale duplicate. See docs/protocol.md ("Extension behavior").
   if (msg.config.janitor !== false && Array.isArray(msg.janitorGroups)) {
-    ops.unshift(...classifyJanitor(byId, msg.janitorGroups));
+    const crossWindowEnabled = msg.config.janitorCrossWindow !== false;
+    ops.unshift(...classifyJanitor(byId, msg.janitorGroups, msg.foreignJanitorGroups ?? [], crossWindowEnabled));
   }
 
   // Sync is authoritative for byId: prune every entry whose id is absent
@@ -243,12 +273,29 @@ function isBlankTabUrl(url) {
  *    new-tab/blank placeholder -> closes.
  *  - FOREIGN: title matches no managed identity and it has real tabs ->
  *    left untouched, reported.
- * Pure: the enumeration snapshot is passed in as data, not gathered here.
+ *
+ * Cross-window recovery (2026-08-27, window-split fix): `foreignGroups` is
+ * every managed-title group found OUTSIDE the metamux window (a leftover
+ * from a window-resolution mixup -- see resolveGroupCache/
+ * chooseAdoptionWindow, and docs/protocol.md's "Window-split recovery").
+ * When `crossWindowEnabled`, each one that matches a managed title AND has
+ * a canonical group already established IN the metamux window this same
+ * pass -> recoverCrossWindow (moves its tabs in). A managed title with no
+ * canonical group yet (this is the very first sync since the window
+ * switched, ensureGroup hasn't created it yet) is left for a LATER sync to
+ * recover, once a canonical exists to recover it into -- self-healing, not
+ * a special case to handle here. A foreign-window group whose title isn't
+ * managed at all is never even considered, per "Foreign titles in other
+ * windows: never touched."
+ *
+ * Pure: every enumeration snapshot is passed in as data, not gathered here.
  * @param {Object<string, WorkspaceEntry>} byId
  * @param {JanitorGroupSnapshot[]} groups
+ * @param {JanitorForeignGroup[]} foreignGroups
+ * @param {boolean} crossWindowEnabled
  * @returns {Op[]}
  */
-function classifyJanitor(byId, groups) {
+function classifyJanitor(byId, groups, foreignGroups, crossWindowEnabled) {
   /** @type {Object<string, string>} */
   const idByTitle = {};
   for (const [id, entry] of Object.entries(byId)) {
@@ -293,6 +340,17 @@ function classifyJanitor(byId, groups) {
   if (foreign.length > 0) {
     ops.push({ op: "reportForeignGroups", groups: foreign });
   }
+
+  if (crossWindowEnabled) {
+    for (const group of foreignGroups) {
+      const id = idByTitle[group.title];
+      if (id === undefined) continue; // not a managed title -- never touched
+      const canonicalGroupId = canonicalGroupIdByTitle[group.title];
+      if (canonicalGroupId === undefined) continue; // no in-window canonical yet -- next sync recovers it
+      ops.push({ op: "recoverCrossWindow", fromGroupId: group.groupId, fromWindowId: group.windowId, intoId: canonicalGroupId });
+    }
+  }
+
   return ops;
 }
 
@@ -507,4 +565,128 @@ function reduceGroupCreated(state, msg) {
   if (!existing) return { state, ops: [] };
   const byId = { ...state.byId, [id]: { ...existing, groupId: /** @type {number} */ (msg.groupId) } };
   return { state: { ...state, byId }, ops: [{ op: "saveState" }] };
+}
+
+// --- Window-split recovery (2026-08-27) ---------------------------------
+//
+// Root cause of the live incident this section fixes: resolveMetamuxWindow
+// picked a DIFFERENT window than the one holding Zac's real tab groups
+// (the original marker tab was closed during manual cleanup). Chrome's
+// tabGroups/tabs APIs accept a groupId regardless of which window it
+// actually lives in, so the cached groupIds from the old window kept
+// silently working for activation -- violating the F3-adjacent hard rule
+// that activation must never touch a group outside the managed window --
+// while ensureGroup's windowId-scoped query rebuilt a second full set in
+// the new window, and the janitor (scoped to the new window only) never
+// saw the old window's groups to report or merge them. Both functions
+// below are pure: chrome-ops.js gathers the snapshot, these decide.
+
+/**
+ * Cache invalidation on window resolution: verifies every cached groupId
+ * for an unarchived entry actually belongs to `windowId`. A mismatch (or a
+ * groupId that no longer exists in `allGroups` at all) re-resolves by
+ * title WITHIN windowId; no match there either -> null, to be recreated
+ * by the next ensureGroup. This is the check that closes the gap above --
+ * a stale cross-window groupId is caught here instead of silently working.
+ * @param {Object<string, WorkspaceEntry>} byId
+ * @param {number} windowId
+ * @param {GroupSnapshot[]} allGroups  every tab group chrome knows about, ANY window
+ * @returns {LocalMsg[]}
+ */
+export function resolveGroupCache(byId, windowId, allGroups) {
+  const groupsById = new Map(allGroups.map((g) => [g.groupId, g]));
+  /** @type {Map<string, number>} */
+  const inWindowByTitle = new Map();
+  for (const g of allGroups) {
+    if (g.windowId === windowId && !inWindowByTitle.has(g.title)) inWindowByTitle.set(g.title, g.groupId);
+  }
+
+  /** @type {LocalMsg[]} */
+  const facts = [];
+  for (const [id, entry] of Object.entries(byId)) {
+    if (entry.archived) continue;
+
+    let groupId = null;
+    if (entry.groupId != null) {
+      const cached = groupsById.get(entry.groupId);
+      if (cached && cached.windowId === windowId) groupId = entry.groupId;
+    }
+    if (groupId == null) {
+      groupId = inWindowByTitle.get(entry.title) ?? null;
+    }
+    if (groupId !== entry.groupId) {
+      facts.push({ type: "local", name: "groupCreated", id, groupId });
+    }
+  }
+  return facts;
+}
+
+/**
+ * @param {Object<string, WorkspaceEntry>} byId
+ * @param {GroupSnapshot[]} allGroups
+ * @returns {Map<number, number>} windowId -> count of managed-title groups in it
+ */
+function countManagedGroupsByWindow(byId, allGroups) {
+  const managedTitles = new Set(Object.values(byId).map((e) => e.title));
+  /** @type {Map<number, number>} */
+  const counts = new Map();
+  for (const g of allGroups) {
+    if (!managedTitles.has(g.title)) continue;
+    counts.set(g.windowId, (counts.get(g.windowId) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * @typedef {Object} AdoptionDecision
+ * @property {"keep"|"adopt"|"createNew"} action
+ * @property {number|null} windowId  the window to use for "keep"/"adopt"; null for "createNew"
+ * @property {number[]} closeTabIds  extra marker tabs to close (only for "keep" with duplicates)
+ */
+
+/**
+ * Window adoption / marker consolidation decision, replacing "first marker
+ * tab found wins, otherwise always create a brand-new window":
+ *  - One or more marker tabs exist: "keep" the one in the group-richest
+ *    window (most managed-title groups, per byId's live titles); every
+ *    OTHER marker tab is queued to close. A single marker with no
+ *    competitors trivially wins its own window, same as before.
+ *  - Zero marker tabs: adopt the window with the most managed-title
+ *    groups, if any window has at least one ("adopt" -- caller creates a
+ *    fresh marker tab there, unfocused). Otherwise "createNew" -- the
+ *    original create-fresh-window behavior, only now as a true last
+ *    resort rather than the default.
+ * Pure: `allGroups` and `markers` are gathered by chrome-ops.js.
+ * @param {MarkerTabSighting[]} markers
+ * @param {Object<string, WorkspaceEntry>} byId
+ * @param {GroupSnapshot[]} allGroups
+ * @returns {AdoptionDecision}
+ */
+export function chooseAdoptionWindow(markers, byId, allGroups) {
+  const countByWindow = countManagedGroupsByWindow(byId, allGroups);
+
+  if (markers.length > 0) {
+    let best = markers[0];
+    let bestCount = countByWindow.get(best.windowId) ?? 0;
+    for (const m of markers.slice(1)) {
+      const count = countByWindow.get(m.windowId) ?? 0;
+      if (count > bestCount) {
+        best = m;
+        bestCount = count;
+      }
+    }
+    const closeTabIds = markers.filter((m) => m.tabId !== best.tabId).map((m) => m.tabId);
+    return { action: "keep", windowId: best.windowId, closeTabIds };
+  }
+
+  let bestWindowId = null;
+  let bestCount = 0;
+  for (const [windowId, count] of countByWindow) {
+    if (count > bestCount) {
+      bestWindowId = windowId;
+      bestCount = count;
+    }
+  }
+  if (bestWindowId != null) return { action: "adopt", windowId: bestWindowId, closeTabIds: [] };
+  return { action: "createNew", windowId: null, closeTabIds: [] };
 }

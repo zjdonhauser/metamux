@@ -11,7 +11,8 @@
 // events when an aggregate's title/color/archived hasn't actually
 // changed).
 
-import { colorFor, type ActuatorEvent, type ActuatorWorkspace, type WorkspaceRef } from "./registry.ts";
+import type { PaletteEntry } from "./palette.ts";
+import { resolveColor, type ActuatorEvent, type ActuatorWorkspace, type ColorMode, type WorkspaceRef } from "./registry.ts";
 
 export type GroupByMode = "title" | "workspace";
 
@@ -35,18 +36,40 @@ export function titleAliasId(title: string): string {
   return "t_" + fnv1a32(title).toString(16).padStart(8, "0");
 }
 
-function computeBucketIdentity(title: string, snapshot: GroupProjectionSnapshot): ActuatorWorkspace | null {
+/** The representative color inputs for a title alias: a genuinely
+ * user-set cmuxColor from the first LIVE member that has one (cmuxColor
+ * !== paintedColor -- see registry.ts's resolveColor for why that
+ * distinction matters), and separately, a palette allocation from the
+ * first live member holding one -- mirroring cmuxColor's own "first
+ * non-null among live members" aggregation rule (Round 9/10), just
+ * applied to two independent fields instead of one. */
+function representativeColorInputs(title: string, liveMembers: WorkspaceRef[]) {
+  const userColored = liveMembers.find((w) => w.cmuxColor !== null && w.cmuxColor !== w.paintedColor);
+  const palettePicked = liveMembers.find((w) => w.paletteIndex !== null);
+  return {
+    title,
+    cmuxColor: userColored?.cmuxColor ?? null,
+    paintedColor: userColored?.paintedColor ?? null,
+    paletteIndex: palettePicked?.paletteIndex ?? null,
+  };
+}
+
+function computeBucketIdentity(
+  title: string,
+  snapshot: GroupProjectionSnapshot,
+  colorMode: ColorMode,
+  palette: PaletteEntry[],
+): ActuatorWorkspace | null {
   const members = snapshot.workspaces.filter((w) => w.title === title);
   if (members.length === 0) return null;
 
   const liveMembers = members.filter((w) => !w.archived);
   const allArchived = liveMembers.length === 0;
-  const representativeColor = liveMembers.find((w) => w.cmuxColor !== null)?.cmuxColor ?? null;
 
   return {
     id: titleAliasId(title),
     title,
-    color: colorFor(title, representativeColor),
+    color: resolveColor(representativeColorInputs(title, liveMembers), colorMode, palette),
     archived: allArchived,
   };
 }
@@ -55,19 +78,27 @@ export class GroupProjection {
   private lastKnownTitle = new Map<string, string>(); // real workspace id -> title, to detect renames
   private lastEmitted = new Map<string, ActuatorWorkspace>(); // alias id -> last reported aggregate (title mode dedupe)
 
-  constructor(private groupBy: GroupByMode) {}
+  constructor(
+    private groupBy: GroupByMode,
+    private colorMode: ColorMode = "palette",
+    private palette: PaletteEntry[] = [],
+  ) {}
 
   setGroupBy(mode: GroupByMode): void {
     this.groupBy = mode;
+  }
+
+  setColorMode(mode: ColorMode): void {
+    this.colorMode = mode;
   }
 
   /** The wire identity for a workspace ref: itself in workspace mode, its
    * title's alias aggregate in title mode. */
   identityFor(ref: WorkspaceRef, snapshot: GroupProjectionSnapshot): ActuatorWorkspace {
     if (this.groupBy === "workspace") {
-      return { id: ref.id, title: ref.title, color: colorFor(ref.title, ref.cmuxColor), archived: ref.archived };
+      return { id: ref.id, title: ref.title, color: resolveColor(ref, this.colorMode, this.palette), archived: ref.archived };
     }
-    return computeBucketIdentity(ref.title, snapshot)!; // ref is itself a member, never null
+    return computeBucketIdentity(ref.title, snapshot, this.colorMode, this.palette)!; // ref is itself a member, never null
   }
 
   /** Maps a wire identity id back to a real workspace id to act on
@@ -142,7 +173,7 @@ export class GroupProjection {
 
   private emitBucketUpdate(title: string, snapshot: GroupProjectionSnapshot, wasActivated: boolean): ActuatorEvent[] {
     const aliasId = titleAliasId(title);
-    const identity = computeBucketIdentity(title, snapshot);
+    const identity = computeBucketIdentity(title, snapshot, this.colorMode, this.palette);
 
     if (!identity) {
       // Zero members left under this title (a rename moved the last one
@@ -180,7 +211,7 @@ export class GroupProjection {
         workspaces: snapshot.workspaces.map((ref) => ({
           id: ref.id,
           title: ref.title,
-          color: colorFor(ref.title, ref.cmuxColor),
+          color: resolveColor(ref, this.colorMode, this.palette),
           archived: ref.archived,
         })),
       };
@@ -191,7 +222,7 @@ export class GroupProjection {
     for (const ref of snapshot.workspaces) {
       if (seenTitles.has(ref.title)) continue;
       seenTitles.add(ref.title);
-      identities.push(computeBucketIdentity(ref.title, snapshot)!);
+      identities.push(computeBucketIdentity(ref.title, snapshot, this.colorMode, this.palette)!);
     }
     return { activeId: this.currentActiveIdentity(snapshot), workspaces: identities };
   }

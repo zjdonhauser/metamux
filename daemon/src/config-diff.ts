@@ -22,8 +22,10 @@ export type ConfigChangeKey =
   | "tmux.reattachGraceMs"
   | "tmux.spawnCwd"
   | "janitor"
+  | "janitorCrossWindow"
   | "colorBackflow"
-  | "pruneArchivedAfterDays";
+  | "pruneArchivedAfterDays"
+  | "colorMode";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -52,7 +54,9 @@ export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set(
   "tmux.reattachGraceMs",
   "tmux.spawnCwd",
   "janitor",
+  "janitorCrossWindow",
   "colorBackflow",
+  "colorMode",
 ]);
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -85,8 +89,10 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "tmux.reattachGraceMs", oldValue: oldConfig.tmux.reattachGraceMs, newValue: newConfig.tmux.reattachGraceMs },
     { key: "tmux.spawnCwd", oldValue: oldConfig.tmux.spawnCwd, newValue: newConfig.tmux.spawnCwd },
     { key: "janitor", oldValue: oldConfig.janitor, newValue: newConfig.janitor },
+    { key: "janitorCrossWindow", oldValue: oldConfig.janitorCrossWindow, newValue: newConfig.janitorCrossWindow },
     { key: "colorBackflow", oldValue: oldConfig.colorBackflow, newValue: newConfig.colorBackflow },
     { key: "pruneArchivedAfterDays", oldValue: oldConfig.pruneArchivedAfterDays, newValue: newConfig.pruneArchivedAfterDays },
+    { key: "colorMode", oldValue: oldConfig.colorMode, newValue: newConfig.colorMode },
   ];
 
   return candidates

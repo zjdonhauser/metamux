@@ -3,15 +3,21 @@ import { hydrateRegistry, serializeRegistry } from "../src/main.ts";
 import { GroupProjection } from "../src/group-projection.ts";
 import { LazyGroupTracker } from "../src/lazy-groups.ts";
 import { Registry } from "../src/registry.ts";
+import type { PaletteEntry } from "../src/palette.ts";
 
 /** Simulates a real disk round-trip: serialize -> JSON.stringify ->
  * JSON.parse -> hydrate, exactly what atomicWriteJson + readJsonOrDefault
  * do around a real daemon restart. */
-function roundTrip(registry: Registry, namedSlots: Record<string, string> | null = null): Registry {
+function roundTrip(registry: Registry, namedSlots: Record<string, string> | null = null, palette: PaletteEntry[] = []): Registry {
   const serialized = serializeRegistry(registry);
   const onDisk = JSON.parse(JSON.stringify(serialized));
-  return hydrateRegistry(onDisk, namedSlots);
+  return hydrateRegistry(onDisk, namedSlots, palette);
 }
+
+const TEST_PALETTE: PaletteEntry[] = [
+  { name: "Navy", hex: "#152744", chromeColor: "grey" },
+  { name: "Blue", hex: "#2779FB", chromeColor: "blue" },
+];
 
 describe("registry persistence round-trip -- attachedAt", () => {
   test("a workspace activated before 'restart' still shows attachedAt after re-hydration", () => {
@@ -124,5 +130,69 @@ describe("registry persistence round-trip -- paintedColor (color backflow)", () 
     const registry = hydrateRegistry(legacySaved as any, null);
     const ref = [...registry.workspaces.values()][0]!;
     expect(ref.paintedColor).toBeNull();
+  });
+});
+
+describe("registry persistence round-trip -- paletteIndex (palette allocation)", () => {
+  test("an attached, colorMode: palette ref still shows its claimed index after re-hydration", () => {
+    const registry = new Registry(null, TEST_PALETTE);
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const id = [...registry.workspaces.values()][0]!.id;
+    registry.markAttached(id);
+    expect(registry.workspaces.get(id)!.paletteIndex).toBe(0);
+
+    const restored = roundTrip(registry, null, TEST_PALETTE);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.paletteIndex).toBe(0);
+  });
+
+  test("a restart does NOT reshuffle a still-attached identity's color -- restoring the same daemon state re-claims the same index", () => {
+    const registry = new Registry(null, TEST_PALETTE);
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "aaa", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    registry.applyEvent({ name: "created", workspaceId: "SRC-B", title: "bbb", cwd: "/b", bootId: "B1", seq: 2, occurredAtMs: 2 });
+    const [idA, idB] = [...registry.workspaces.values()].map((r) => r.id);
+    registry.markAttached(idA!);
+    registry.markAttached(idB!);
+    expect(registry.workspaces.get(idA!)!.paletteIndex).toBe(0);
+    expect(registry.workspaces.get(idB!)!.paletteIndex).toBe(1);
+
+    // hydrateRegistry restores the persisted stamps directly (no re-claim
+    // pass) -- this is the restart-stability guarantee.
+    const restored = roundTrip(registry, null, TEST_PALETTE);
+    expect(restored.workspaces.get(idA!)!.paletteIndex).toBe(0);
+    expect(restored.workspaces.get(idB!)!.paletteIndex).toBe(1);
+  });
+
+  test("a never-attached workspace still shows paletteIndex: null after re-hydration", () => {
+    const registry = new Registry(null, TEST_PALETTE);
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/repo", bootId: "B1", seq: 1, occurredAtMs: 1 });
+
+    const restored = roundTrip(registry, null, TEST_PALETTE);
+    const after = [...restored.workspaces.values()][0]!;
+    expect(after.paletteIndex).toBeNull();
+  });
+
+  test("a registry.json written before this feature (no paletteIndex key at all) hydrates to null, not a crash", () => {
+    const legacySaved = {
+      workspaces: [
+        {
+          id: "mw_legacy",
+          title: "old-workspace",
+          cwd: "/old",
+          source: "cmux" as const,
+          sourceId: "SRC-LEGACY",
+          archived: false,
+          cmuxColor: null,
+          attachedAt: "2026-01-01T00:00:00.000Z",
+          paintedColor: null,
+          updatedAt: new Date().toISOString(),
+          // no paletteIndex field at all -- simulates a pre-feature file
+        },
+      ],
+      activeId: null,
+    };
+    const registry = hydrateRegistry(legacySaved as any, null, TEST_PALETTE);
+    const ref = [...registry.workspaces.values()][0]!;
+    expect(ref.paletteIndex).toBeNull();
   });
 });

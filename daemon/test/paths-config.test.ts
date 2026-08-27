@@ -229,6 +229,22 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("janitorCrossWindow", () => {
+    test("defaults to true when absent", async () => {
+      const config = await loadConfig("/nonexistent/path/config.json");
+      expect(config.janitorCrossWindow).toBe(true);
+    });
+
+    test("reads false from the config file", async () => {
+      const dir = await mkdtemp(join(tmpdir(), "metamux-config-"));
+      const path = join(dir, "config.json");
+      await writeFile(path, JSON.stringify({ janitorCrossWindow: false }));
+      const config = await loadConfig(path);
+      expect(config.janitorCrossWindow).toBe(false);
+      await rm(dir, { recursive: true, force: true });
+    });
+  });
+
   describe("tmux config block", () => {
     test("defaults: disabled, windows mirror, alphabetize on, 8s reattach grace, ~/Documents/GitHub cwd", async () => {
       const originalEnv = process.env.TMUX_CMUX_MIRROR;

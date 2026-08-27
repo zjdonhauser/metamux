@@ -276,11 +276,15 @@ export class ActuatorServer {
    * its alias in groupBy: "title". Shared by POST /open and the ports
    * watcher (main.ts). Returns the identity it was pushed to. Also marks
    * the identity attached -- the ONLY attachment path in createGroups:
-   * "on-open"; also true in "on-activate", where activation attaches too. */
+   * "on-open"; also true in "on-activate", where activation attaches too.
+   * markAttached runs BEFORE identityFor deliberately: in colorMode:
+   * "palette" it's also where the palette color gets claimed (registry.ts),
+   * and the very first open_url for a freshly-created group must already
+   * carry that allocated color, not a stale pre-claim one. */
   pushOpenUrl(target: WorkspaceRef, urlStr: string): ActuatorWorkspace {
+    this.registry.markAttached(target.id); // persisted -- survives a restart
     const snapshot = this.currentSnapshot();
     const identity = this.groupProjection.identityFor(target, snapshot);
-    this.registry.markAttached(target.id); // persisted -- survives a restart
     this.lazyGroups.markAttached(identity.id); // in-memory wire-identity cache for this session
     this.seq++;
     this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr });
@@ -361,6 +365,7 @@ export class ActuatorServer {
         collapseOthers: this.config.collapseOthers,
         closeBehavior: this.config.closeBehavior,
         janitor: this.config.janitor,
+        janitorCrossWindow: this.config.janitorCrossWindow,
       },
       state: {
         activeId: projected.activeId,

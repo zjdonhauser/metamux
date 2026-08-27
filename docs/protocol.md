@@ -27,12 +27,14 @@ All components conform to this file. Change this file first, code second.
       "spawnCwd": "~/Documents/GitHub"
     },
     "colorBackflow": true,             // see "Color backflow" below
-    "pruneArchivedAfterDays": 7        // 0 = off -- see "Registry compaction" below
+    "pruneArchivedAfterDays": 7,       // 0 = off -- see "Registry compaction" below
+    "colorMode": "palette"             // "palette" | "hash" -- see "Palette allocation" below
   }
   ```
-  All fields optional; defaults above. `~` expansion required. `ports.*`, `reverseSync`, and
-  `janitor` (default `true` -- extension-side tab-group janitor, "Extension behavior" below)
-  are also valid top-level keys -- see their own sections below. `tmux.mirror` falls back to the
+  All fields optional; defaults above. `~` expansion required. `ports.*`, `reverseSync`,
+  `janitor` (default `true` -- extension-side tab-group janitor, "Extension behavior" below), and
+  `janitorCrossWindow` (default `true` -- see "Window-split recovery" below) are also valid
+  top-level keys -- see their own sections below. `tmux.mirror` falls back to the
   `TMUX_CMUX_MIRROR` env var (tmux-cmux-sync compatibility) only when `tmux.mirror` is absent
   from the file; an explicit file value always wins. A config file written before the
   `createGroups` rename below and still saying `"lazy"` is read as `"on-activate"`, its exact
@@ -73,6 +75,7 @@ interface WorkspaceRef {
   cmuxColor: string | null;  // resolved "#RRGGBB" hex, or null if never set/cleared (cmux-sourced refs only)
   attachedAt: string | null; // ISO, set on first attachment (open_url always; activation too in createGroups: "on-activate"), null again after a userClosedGroup detach -- see Grouping
   paintedColor: string | null; // hex backflow itself last painted, or null -- see "Color backflow"
+  paletteIndex: number | null; // colorMode: "palette" allocation, or null -- see "Palette allocation"
   updatedAt: string;     // ISO
 }
 ```
@@ -503,7 +506,78 @@ an independent registry identity, it becomes an actuator-tracked attachment). Id
 second run finds nothing to reclassify (the ref's `source` is already `"tmux"`), so no separate
 "already migrated" marker is needed -- this runs unconditionally every time the gate is true.
 
-## Color backflow (2026-08-27)
+## Palette allocation (2026-08-27, colorMode: palette)
+
+Replaces the title-hash fallback with a deliberately-ordered, distinguishable palette so colors
+stop landing too close together (Zac). Config: `"colorMode": "palette"` (default) | `"hash"`
+(the original title-hash-only behavior), hot-reloadable -- switching modes re-emits a `sync` to
+every client. `colorFor` (the title hash) still exists and is still the ultimate fallback in
+both modes; `registry.ts`'s `resolveColor` is the actual colorMode-aware precedence used
+everywhere on the wire (`toActuator`, `GroupProjection`'s alias aggregation and workspace-mode
+projection):
+
+1. A genuinely user-set `cmuxColor` (`cmuxColor !== paintedColor` -- the same ownership check
+   Color backflow, below, already uses) -- hue-mapped to the nearest Chrome color, exactly as
+   before this feature.
+2. In `colorMode: "palette"`, the identity's allocated palette entry (below) -- an EXPLICIT
+   per-entry choice, never hue-mapped.
+3. `colorFor`'s title hash -- the ultimate fallback, and the entire behavior in `colorMode:
+   "hash"`.
+
+### The palette (`daemon/src/palette.ts`)
+
+A static, ordered list of `{name, hex, chromeColor}`, built once at daemon startup from Zac's
+real `~/.config/cmux/cmux.json` `workspaceColors.colors` table (via `cmux-config.ts`'s existing
+`loadCmuxNamedColorSlots` reader), falling back to a hardcoded copy of that same table for any
+name the live file is missing. Ordered for maximal pairwise distinguishability going down: the
+first 9 entries use 9 DISTINCT Chrome `tabGroups` colors and 9 visually distinct hexes, so every
+identity gets a genuinely different color for as long as possible; entries 10+ reuse
+`chromeColor`s (Chrome only has 9) but stay hex-distinct, so Color backflow still paints a
+unique cmux tab color even once the visible Chrome group color repeats. Full ordering + rationale
+lives in `palette.ts`'s header comment.
+
+### Allocation (`daemon/src/palette-allocator.ts`, pure + `Registry.claimPaletteColor`)
+
+State is `WorkspaceRef.paletteIndex: number | null`, persisted (survives a restart -- a restart
+re-stamps from the persisted value directly, it never re-claims). The pure allocator
+(`claimPaletteIndex(identityKey, holders, paletteSize)`) resolves the index an identity should
+hold, given every other current holder: idempotent and stable for an identity that already holds
+a LIVE index (`!archived && attachedAt !== null`) -- never reshuffled by another identity's
+claim or release, even once a lower index frees up -- otherwise claims the LOWEST index not held
+by any OTHER live identity. `identityKey` is the allocation UNIT: a title in `groupBy: "title"`
+(a whole alias shares one claim -- the first attaching member claims it, later members of the
+same alias reuse it), a real workspace id in `groupBy: "workspace"`.
+
+**Claimed at attachment time**, inside `Registry.markAttached` itself (not a separate call site):
+the same instant a group is actually created, whether via `open_url` (`createGroups: "on-open"`)
+or activation (`createGroups: "on-activate"`) -- this is why `server.ts`'s `pushOpenUrl` calls
+`markAttached` BEFORE computing the wire identity/color, so the very first `open_url` for a
+freshly-created group already carries its allocated color.
+
+**Released** (paletteIndex set back to `null`) on:
+- **Detach** (`Registry.clearAttached`, `userClosedGroup`) -- a later re-attach claims fresh and
+  may land on a DIFFERENT color. This is by design (Zac: "frees back up"), not a bug.
+- **Archive** (`applyEvent`'s `closed` branch, `applyTmuxIntent`'s archive branch,
+  `archiveBySourceId`) -- released on the INDIVIDUAL ref's own archive, not gated on "every
+  alias member archived": since a title alias's displayed color is "the first live member
+  holding a non-null `paletteIndex`" (mirrors `cmuxColor`'s own aggregation rule), the alias's
+  color persists automatically for as long as ANY sibling is still live and holding one, and only
+  visibly releases once none are. Explicit per-ref release on archive (rather than relying solely
+  on the `live` filter) closes a real edge case: `attachedAt` SURVIVES archive, so an
+  unarchive-via-upsert (the same cmux workspace reopens with the same sourceId) would otherwise
+  silently regain a stale claim someone else may hold by then, without ever going through
+  `markAttached` again.
+- **Prune** (`Registry.pruneArchived`) -- the ref is deleted outright, nothing to release.
+
+### Wiring
+
+`toActuator`/`GroupProjection` carry the resolved color on every `workspace.upserted` /
+`.activated` / `.archived` event and the `sync` frame, exactly as `colorFor` always did -- no
+separate wire concept, `resolveColor` just changed what feeds it. `GroupProjection` and
+`Registry` each hold their own mutable `groupBy`/`colorMode`/palette state (mirrors the existing
+`attachOnActivate` precedent), kept in lockstep by `main.ts` at startup and on hot-reload.
+
+## Color backflow (2026-08-27, palette-aware 2026-08-27)
 
 Paints a cmux tab's own color to match its Chrome group's color, so the two visually agree at a
 glance ("a colored flag that matches the color of the browser tab the cmux tab relates to" --
@@ -511,12 +585,14 @@ Zac). Config: `"colorBackflow": true` (default), hot-reloadable. Socket-gated (n
 workspace-action set-color`); polls every 5s, same unconditional-timer-with-internal-gate shape
 as the tmux poller above.
 
-**Only acts on the title-hash fallback.** Backflow never invents a color for an identity the
-user already colored -- for every identity (in `groupBy: "title"`, every member sharing a
-title; in `"workspace"`, the ref itself), if ANY live member has a real `cmuxColor`, that
-identity is untouched by backflow entirely. Only when every live member's `cmuxColor` is null
-(the identity's Chrome-group color is purely the title hash) does backflow paint anything, and
-it paints EVERY member's cmux tab, not just one.
+**Only acts on a color that isn't the user's.** Backflow never invents a color for an identity
+the user already colored -- for every identity (in `groupBy: "title"`, every member sharing a
+title; in `"workspace"`, the ref itself), if ANY live member has a genuinely user-set `cmuxColor`
+(`cmuxColor !== paintedColor`), that identity is untouched by backflow entirely. Otherwise it
+paints EVERY member's cmux tab (not just one) to the identity's resolved color -- the target hex
+depends on `colorMode`: the allocated palette entry's own hex in `colorMode: "palette"` (once one
+has been claimed; before that, the same Chrome-representative hex as hash mode), or the
+Chrome-representative hex for the title-hash color in `colorMode: "hash"`.
 
 **Never overwrites a user-set color.** `WorkspaceRef.paintedColor` (Registry section, above)
 tracks the hex backflow itself last painted. A ref is eligible for backflow to act on unless it
@@ -536,13 +612,19 @@ does, whether it's reporting the user's action or backflow's own echo).
   event already does -- backflow doesn't change that pipeline at all, it only stops trying to
   paint that one tab.
 
-**Loop safety.** `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` (all 9 Chrome colors, including
-grey) is, by construction, a FIXED POINT of `nearestChromeGroupColor`: painting a ref with
-`CHROME_GROUP_REPRESENTATIVE_HEX[X]` produces a `colored` event that resolves back to the same
-`X` through the daemon's own color pipeline, so a backflow-painted color never triggers a
-different downstream color and can't chase itself in a repaint loop. Proven directly in
-`colors.test.ts`. Dedupe (`already-matches`, above) additionally means a converged identity
-issues zero `set-color` calls per poll, not just "eventually stops."
+**Loop safety.** In `colorMode: "hash"`, `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` (all 9
+Chrome colors, including grey) is, by construction, a FIXED POINT of `nearestChromeGroupColor`:
+painting a ref with `CHROME_GROUP_REPRESENTATIVE_HEX[X]` produces a `colored` event that resolves
+back to the same `X` through the daemon's own color pipeline. In `colorMode: "palette"`, an
+allocated brand hex is generally NOT such a fixed point (e.g. Navy's `#152744` hue-maps to
+`"blue"`, but its palette entry's `chromeColor` is `"grey"` by explicit design -- see palette.ts's
+ordering rationale) -- loop safety instead comes entirely from `resolveColor`'s ownership check:
+once a backflow-painted hex round-trips through the tailed `colored` event and `markPainted`
+records the same hex as `paintedColor`, `cmuxColor === paintedColor` holds, step 1 above is
+skipped, and the allocated `chromeColor` stays authoritative regardless of what hue-mapping would
+say. Proven directly in `color-backflow.test.ts`'s "ownership-echo trap" test. Dedupe
+(`already-matches`, above) additionally means a converged identity issues zero `set-color` calls
+per poll, not just "eventually stops."
 
 `WorkspaceRef.paintedColor` is persisted (survives a daemon restart) for the same reason
 `attachedAt` is -- without it, every restart would forget what backflow owns and misclassify
@@ -561,6 +643,49 @@ superseded by the tab-color version specifically because status pills weren't re
 Zac's sidebar config at the time -- worth re-verifying whether that's still true) or something
 else entirely. Crosswin stays deferred (plan/BUILD-STATUS) until a non-color channel is
 confirmed workable; it will never be built as a second writer of `custom_color`.
+
+## Window-split recovery (2026-08-27)
+
+Fixes a live incident: after an extension reload, TWO full group sets existed side by side --
+cmux switching kept driving the ORIGINAL set, the new set grew in parallel, and the janitor
+reported nothing. Root cause: `resolveMetamuxWindow` picked a DIFFERENT window than the one
+holding Zac's real groups (the original marker tab was closed during manual cleanup). Chrome's
+`tabGroups`/`tabs` APIs accept a groupId regardless of which window it actually lives in, so the
+stale cached groupIds from the old window kept silently working for activation -- violating the
+F3-adjacent hard rule that activation must never touch a group outside the managed window --
+while `ensureGroup`'s windowId-scoped query rebuilt a second full set in the new window, and the
+janitor (scoped to the new window only) never saw the old window's groups to merge or report.
+Three fixes, all pure decision logic in `reducer.js` with `chrome-ops.js`/`sw.js` as thin
+gathering glue (`extension/test/reducer.test.js` has the fixture coverage for all three):
+
+- **Cache invalidation on window resolution** (`resolveGroupCache`): once `windowId` is
+  resolved, every cached groupId for an unarchived entry is checked against a snapshot of every
+  tab group chrome knows about (`chrome-ops.js`'s `allGroupsSnapshot`, ALL windows, not just the
+  managed one). A groupId that doesn't belong to `windowId` -- or no longer exists at all -- is
+  corrected by re-resolving by title WITHIN `windowId`; no match there either falls back to null,
+  recreated by the next `ensureGroup`. This is the actual fix for the reported symptom: the old
+  window's groupIds are caught and nulled instead of silently continuing to work cross-window.
+- **Window adoption** (`chooseAdoptionWindow`): `resolveMetamuxWindow` no longer always creates a
+  brand-new window when no marker tab is found. Zero markers: adopt the window with the most
+  managed-title groups (by `byId`'s live titles), if any has at least one -- a marker tab is
+  created there, unfocused. Only when no window has any managed-title group does it fall back to
+  creating one, now a true last resort rather than the default. Multiple marker tabs (a leftover
+  from a prior boot that never got cleaned up): keep the one in the group-richest window, close
+  the rest.
+- **Cross-window recovery merge** (`classifyJanitor`'s `foreignGroups` parameter, config
+  `janitorCrossWindow`, default `true`, hot-reloadable, mirrored into the sync frame's `config`
+  alongside `janitor`): the janitor scan is extended with every managed-title group living in a
+  window OTHER than the metamux one (`sw.js` derives this from the same all-windows snapshot,
+  filtered to `windowId !== windowId`). A match with an already-established in-window canonical
+  group -> `recoverCrossWindow` (`tabs.move` into the metamux window, then `tabs.group` into the
+  canonical -- `tabs.move` first because a tab must already be in the target window before
+  `tabs.group` can add it to a group there; `markServerRemoval` on the source group so
+  detach-echo-suppression doesn't mistake the recovery for the user closing it by hand). A
+  managed title with no in-window canonical YET (the very first sync since a window switch,
+  before `ensureGroup` has run) is left for a later sync -- self-healing, not a special case.
+  **Foreign (unmanaged-title) groups in other windows are never touched**, matching the
+  in-window janitor's own FOREIGN classification -- cross-window recovery only ever acts on
+  titles the daemon actually manages.
 
 ## Testing conventions
 

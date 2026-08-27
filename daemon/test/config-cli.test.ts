@@ -138,6 +138,11 @@ describe("validateConfigValue", () => {
     expect(validateConfigValue("colorBackflow", "true").ok).toBe(false);
   });
 
+  test("janitorCrossWindow requires a boolean", () => {
+    expect(validateConfigValue("janitorCrossWindow", true).ok).toBe(true);
+    expect(validateConfigValue("janitorCrossWindow", "true").ok).toBe(false);
+  });
+
   test("pruneArchivedAfterDays requires a number >= 0, and accepts 0 (off)", () => {
     expect(validateConfigValue("pruneArchivedAfterDays", 7).ok).toBe(true);
     expect(validateConfigValue("pruneArchivedAfterDays", 0).ok).toBe(true);

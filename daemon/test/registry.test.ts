@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Registry, colorFor, TAB_GROUP_COLORS } from "../src/registry.ts";
+import { Registry, colorFor, resolveColor, TAB_GROUP_COLORS } from "../src/registry.ts";
 import type { CmuxWorkspaceEvent } from "../src/parser.ts";
 
 function ev(
@@ -148,6 +148,69 @@ describe("colorFor with cmuxColor", () => {
 
   test("falls back to the title hash when cmuxColor is an unparseable hex", () => {
     expect(colorFor("mh-accounts", "not-a-color")).toBe(colorFor("mh-accounts"));
+  });
+});
+
+const TEST_PALETTE = [
+  { name: "Navy", hex: "#152744", chromeColor: "grey" as const },
+  { name: "Blue", hex: "#2779FB", chromeColor: "blue" as const },
+  { name: "Crimson", hex: "#E11D48", chromeColor: "red" as const },
+  { name: "Green", hex: "#047857", chromeColor: "green" as const },
+];
+
+describe("resolveColor -- colorMode-aware precedence", () => {
+  test("colorMode: palette, no user color, no allocation -> title hash", () => {
+    const color = resolveColor(
+      { title: "mh-accounts", cmuxColor: null, paintedColor: null, paletteIndex: null },
+      "palette",
+      TEST_PALETTE,
+    );
+    expect(color).toBe(colorFor("mh-accounts"));
+  });
+
+  test("colorMode: palette, an allocated index -> that entry's chromeColor, NOT hue-mapped", () => {
+    const color = resolveColor(
+      { title: "zzz", cmuxColor: null, paintedColor: null, paletteIndex: 0 },
+      "palette",
+      TEST_PALETTE,
+    );
+    expect(color).toBe("grey"); // TEST_PALETTE[0] is Navy -> grey, even though Navy hue-maps to blue
+  });
+
+  test("a genuinely user-set cmuxColor (differs from paintedColor) wins over an allocation", () => {
+    const color = resolveColor(
+      { title: "zzz", cmuxColor: "#2779FB", paintedColor: null, paletteIndex: 0 },
+      "palette",
+      TEST_PALETTE,
+    );
+    expect(color).toBe("blue"); // hue-mapped user color, not TEST_PALETTE[0]'s grey
+  });
+
+  test("cmuxColor === paintedColor (our own paint echoing back) does NOT count as user-set -- allocation wins", () => {
+    const color = resolveColor(
+      { title: "zzz", cmuxColor: "#152744", paintedColor: "#152744", paletteIndex: 0 },
+      "palette",
+      TEST_PALETTE,
+    );
+    expect(color).toBe("grey"); // NOT hue-mapped to "blue" -- this is the ownership-echo trap
+  });
+
+  test("colorMode: hash ignores an allocation entirely, even if present", () => {
+    const color = resolveColor(
+      { title: "mh-accounts", cmuxColor: null, paintedColor: null, paletteIndex: 0 },
+      "hash",
+      TEST_PALETTE,
+    );
+    expect(color).toBe(colorFor("mh-accounts"));
+  });
+
+  test("an out-of-range paletteIndex falls back to the title hash rather than throwing", () => {
+    const color = resolveColor(
+      { title: "mh-accounts", cmuxColor: null, paintedColor: null, paletteIndex: 99 },
+      "palette",
+      TEST_PALETTE,
+    );
+    expect(color).toBe(colorFor("mh-accounts"));
   });
 });
 
@@ -669,5 +732,118 @@ describe("Registry.archiveBySourceId", () => {
   test("unknown sourceId is a no-op", () => {
     const reg = new Registry();
     expect(reg.archiveBySourceId("cmux", "unknown")).toEqual([]);
+  });
+});
+
+describe("Registry palette allocation (colorMode: palette, default)", () => {
+  test("markAttached claims palette index 0 for the first identity", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    const [created] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(created!.workspace.id);
+    expect(reg.workspaces.get(created!.workspace.id)!.paletteIndex).toBe(0);
+  });
+
+  test("a second, distinct identity claims the next free index", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    const [a] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    const [b] = reg.applyEvent(ev("created", "W2", "bbb", "/b"));
+    reg.markAttached(b!.workspace.id);
+    expect(reg.workspaces.get(b!.workspace.id)!.paletteIndex).toBe(1);
+  });
+
+  test("idempotent: a second markAttached call never reshuffles an existing claim", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    const [a] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    reg.markAttached(a!.workspace.id); // no-op, already attached
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(0);
+  });
+
+  test("colorMode: hash never claims a palette index", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    reg.colorMode = "hash";
+    const [a] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(null);
+  });
+
+  test("clearAttached (detach) releases the claim -- a later re-attach may land on a different index", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    const [a] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    const [b] = reg.applyEvent(ev("created", "W2", "bbb", "/b"));
+    reg.markAttached(b!.workspace.id); // takes index 1
+
+    reg.clearAttached(a!.workspace.id); // a releases index 0
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(null);
+
+    const [c] = reg.applyEvent(ev("created", "W3", "ccc", "/c"));
+    reg.markAttached(c!.workspace.id);
+    expect(reg.workspaces.get(c!.workspace.id)!.paletteIndex).toBe(0); // claimed a's freed slot
+
+    reg.markAttached(a!.workspace.id); // a re-attaches fresh -- no memory of its old index
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(2); // 0 and 1 are held, so 2
+  });
+
+  test("archiving a ref (applyEvent closed) releases its claim, not just detaching it", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    const [a] = reg.applyEvent(ev("created", "cmux-W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(0);
+
+    reg.applyEvent(ev("closed", "cmux-W1", "aaa", "/a"));
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(null);
+  });
+
+  test(
+    "the nasty edge case: attachedAt survives archive, so without releasing paletteIndex on archive, an " +
+      "unarchive-via-upsert would silently regain a stale claim someone else may hold by then",
+    () => {
+      const reg = new Registry(null, TEST_PALETTE);
+      const [a] = reg.applyEvent(ev("created", "cmux-W1", "aaa", "/a"));
+      reg.markAttached(a!.workspace.id); // claims 0, attachedAt set
+      reg.applyEvent(ev("closed", "cmux-W1", "aaa", "/a")); // archived; attachedAt survives, paletteIndex is released
+
+      const [b] = reg.applyEvent(ev("created", "W2", "bbb", "/b"));
+      reg.markAttached(b!.workspace.id);
+      expect(reg.workspaces.get(b!.workspace.id)!.paletteIndex).toBe(0); // b claims the freed slot
+
+      // "aaa" reopens with the SAME cmux workspace id -- upsert re-binds and
+      // unarchives it WITHOUT going through markAttached again (attachedAt
+      // was never cleared by archive). Its paletteIndex must stay released
+      // (null), not silently collide with b's now-live claim on 0.
+      reg.applyEvent(ev("created", "cmux-W1", "aaa", "/a"));
+      expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(null);
+    },
+  );
+
+  test("groupBy: title -- a second real ref sharing the same title alias reuses the alias's existing claim", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    reg.groupBy = "title";
+    const [a] = reg.applyEvent(ev("created", "W1", "compliance", "/a"));
+    reg.markAttached(a!.workspace.id); // claims 0
+
+    const [b] = reg.applyEvent(ev("created", "W2", "compliance", "/b")); // same title, different real ref
+    reg.markAttached(b!.workspace.id);
+    expect(reg.workspaces.get(b!.workspace.id)!.paletteIndex).toBe(0); // shares the alias's claim, doesn't take 1
+  });
+
+  test("groupBy: workspace -- two refs with the same title still claim independently", () => {
+    const reg = new Registry(null, TEST_PALETTE);
+    reg.groupBy = "workspace";
+    const [a] = reg.applyEvent(ev("created", "W1", "compliance", "/a"));
+    reg.markAttached(a!.workspace.id);
+    const [b] = reg.applyEvent(ev("created", "W2", "compliance", "/b"));
+    reg.markAttached(b!.workspace.id);
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(0);
+    expect(reg.workspaces.get(b!.workspace.id)!.paletteIndex).toBe(1);
+  });
+
+  test("an empty palette (unloaded) never claims anything, gracefully", () => {
+    const reg = new Registry(); // no palette passed -- defaults to []
+    const [a] = reg.applyEvent(ev("created", "W1", "aaa", "/a"));
+    reg.markAttached(a!.workspace.id);
+    expect(reg.workspaces.get(a!.workspace.id)!.paletteIndex).toBe(null);
   });
 });

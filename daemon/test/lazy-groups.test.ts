@@ -17,6 +17,7 @@ function ref(overrides: Partial<WorkspaceRef> = {}): WorkspaceRef {
     cmuxColor: overrides.cmuxColor ?? null,
     attachedAt: overrides.attachedAt ?? null,
     paintedColor: overrides.paintedColor ?? null,
+    paletteIndex: overrides.paletteIndex ?? null,
     updatedAt: overrides.updatedAt ?? new Date().toISOString(),
   };
 }

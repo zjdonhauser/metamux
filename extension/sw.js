@@ -48,7 +48,7 @@ async function boot() {
   const stored = await chrome.storage.local.get("metamuxState");
   if (stored.metamuxState) state = stored.metamuxState;
 
-  windowId = await chromeOps.resolveMetamuxWindow();
+  windowId = await chromeOps.resolveMetamuxWindow(state.byId);
   state = { ...state, windowId };
 
   const corrections = await chromeOps.reresolveGroupIds(state, windowId);
@@ -79,9 +79,17 @@ async function boot() {
       // part of every sync reconciliation (docs/protocol.md, "Extension
       // behavior"). Gathering the snapshot is chrome-ops's job -- the
       // reducer stays pure and only ever sees it as data on the message.
+      // foreignJanitorGroups (window-split fix, 2026-08-27): every
+      // managed-title group living in a window OTHER than this one, for
+      // the cross-window recovery pass -- derived from the same
+      // all-windows snapshot the boot-time cache invalidation uses.
       if (msg && msg.type === "sync" && windowId != null) {
-        const janitorGroups = await chromeOps.scanTabGroups(windowId);
-        msg = { ...msg, janitorGroups };
+        const [janitorGroups, allGroups] = await Promise.all([
+          chromeOps.scanTabGroups(windowId),
+          chromeOps.allGroupsSnapshot(),
+        ]);
+        const foreignJanitorGroups = allGroups.filter((g) => g.windowId !== windowId);
+        msg = { ...msg, janitorGroups, foreignJanitorGroups };
       }
       dispatch(msg);
     },

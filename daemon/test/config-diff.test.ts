@@ -104,7 +104,9 @@ describe("diffConfig", () => {
       "tmux.reattachGraceMs",
       "tmux.spawnCwd",
       "janitor",
+      "janitorCrossWindow",
       "colorBackflow",
+      "colorMode",
     ].sort();
     expect(actual).toEqual(expected);
   });

@@ -2,16 +2,28 @@
 // match its Chrome group, so the two visually agree at a glance ("a
 // colored flag that matches the color of the browser tab the cmux tab
 // relates to" -- Zac). Only ever acts when the Chrome group's color is
-// the TITLE-HASH FALLBACK (no live member has a user-set cmuxColor) --
-// backflow never invents a color for a group the user already colored,
-// it only extends an already-existing color outward onto the cmux side.
+// NOT a real, user-set one (no live member has a cmuxColor that differs
+// from what we last painted) -- backflow never invents a color for a
+// group the user already colored, it only extends an already-existing
+// color (the title-hash fallback in colorMode: "hash", or the allocated
+// palette entry in colorMode: "palette") outward onto the cmux side.
+//
+// In colorMode: "palette", the hex painted is the SPECIFIC allocated
+// palette.ts entry's hex, not a Chrome-representative hex -- distinct
+// identities land on visually distinct brand colors on the cmux side too,
+// not just on the 9-color Chrome side. registry.ts's resolveColor is what
+// keeps this from fighting with hue-mapping on the next tick: once this
+// hex round-trips through the tailed `colored` event and paintedColor
+// catches up to match it (registry.ts's markPainted), cmuxColor ===
+// paintedColor holds and hue-mapping is skipped for this ref from then on.
 //
 // No I/O -- daemon/src/main.ts's poll loop is the thin wrapper that reads
 // the registry, calls this, and executes the resulting actions via
 // cmux-actuator.ts.
 
-import { colorFor } from "./registry.ts";
+import { resolveColor, type ColorMode } from "./registry.ts";
 import { CHROME_GROUP_REPRESENTATIVE_HEX, type ChromeGroupColor } from "./colors.ts";
+import type { PaletteEntry } from "./palette.ts";
 
 export interface BackflowRef {
   id: string; // registry WorkspaceRef.id
@@ -23,17 +35,28 @@ export interface BackflowRef {
    * This is what distinguishes "the user set this color" from "this is
    * just our own paint echoing back" -- see decideBackflow. */
   paintedColor: string | null;
+  /** colorMode: "palette" allocation (palette-allocator.ts): the index
+   * into the loaded palette this ref currently holds, or null. */
+  paletteIndex: number | null;
   archived: boolean;
 }
 
 export interface BackflowCandidate {
   refId: string;
   cmuxWorkspaceId: string;
-  /** The Chrome group color this ref's identity currently resolves to. */
+  /** The Chrome group color this ref's identity currently resolves to
+   * (registry.ts's resolveColor -- same precedence the wire protocol
+   * uses). */
   identityColor: ChromeGroupColor;
-  /** Whether that identityColor came from a real, user-set cmuxColor
-   * (true) or the title-hash fallback (false) -- decideBackflow only
-   * acts when this is false. */
+  /** The hex backflow should paint if it decides to act at all: the
+   * allocated palette entry's hex when one is held in colorMode:
+   * "palette", else the Chrome-representative hex for identityColor (the
+   * entire behavior in colorMode: "hash", and palette mode's own
+   * fallback before an identity has attached/claimed one). */
+  targetHex: string;
+  /** Whether identityColor came from a real, user-set cmuxColor (true) --
+   * decideBackflow only acts when this is false, regardless of
+   * colorMode. */
   hasRealColor: boolean;
   cmuxColor: string | null;
   paintedColor: string | null;
@@ -41,14 +64,19 @@ export interface BackflowCandidate {
 
 /** Groups live cmux-sourced refs by their groupBy identity (title in
  * "title" mode, the ref itself in "workspace" mode) and resolves each
- * group's Chrome color exactly the way group-projection.ts's
- * computeBucketIdentity does (first live member's cmuxColor as the
- * representative, else the title-hash fallback) -- so backflow's notion
- * of "the Chrome group's color" always matches what the extension is
- * actually showing. Archived refs and tmux-sourced refs (nothing to
+ * group's color exactly the way group-projection.ts's computeBucketIdentity
+ * does (registry.ts's resolveColor, colorMode-aware) -- so backflow's
+ * notion of "the Chrome group's color" always matches what the extension
+ * is actually showing. Archived refs and tmux-sourced refs (nothing to
  * paint via `cmux workspace-action` for a tmux session id) are excluded.
- * Pure: same refs + groupBy, same candidates, every time. */
-export function computeBackflowCandidates(refs: BackflowRef[], groupBy: "title" | "workspace"): BackflowCandidate[] {
+ * Pure: same refs + groupBy + colorMode + palette, same candidates, every
+ * time. */
+export function computeBackflowCandidates(
+  refs: BackflowRef[],
+  groupBy: "title" | "workspace",
+  colorMode: ColorMode,
+  palette: PaletteEntry[],
+): BackflowCandidate[] {
   const live = refs.filter((r) => r.source === "cmux" && !r.archived);
   const groups = new Map<string, BackflowRef[]>();
   for (const ref of live) {
@@ -60,14 +88,29 @@ export function computeBackflowCandidates(refs: BackflowRef[], groupBy: "title" 
 
   const out: BackflowCandidate[] = [];
   for (const members of groups.values()) {
-    const representativeColor = members.find((m) => m.cmuxColor !== null)?.cmuxColor ?? null;
-    const hasRealColor = representativeColor !== null;
-    const identityColor = colorFor(members[0]!.title, representativeColor);
+    const userColored = members.find((m) => m.cmuxColor !== null && m.cmuxColor !== m.paintedColor);
+    const hasRealColor = userColored !== undefined;
+    const palettePicked = members.find((m) => m.paletteIndex !== null);
+
+    const identityColor = resolveColor(
+      {
+        title: members[0]!.title,
+        cmuxColor: userColored?.cmuxColor ?? null,
+        paintedColor: userColored?.paintedColor ?? null,
+        paletteIndex: palettePicked?.paletteIndex ?? null,
+      },
+      colorMode,
+      palette,
+    );
+    const allocatedHex = colorMode === "palette" && palettePicked ? palette[palettePicked.paletteIndex!]?.hex : undefined;
+    const targetHex = allocatedHex ?? CHROME_GROUP_REPRESENTATIVE_HEX[identityColor];
+
     for (const ref of members) {
       out.push({
         refId: ref.id,
         cmuxWorkspaceId: ref.sourceId,
         identityColor,
+        targetHex,
         hasRealColor,
         cmuxColor: ref.cmuxColor,
         paintedColor: ref.paintedColor,
@@ -82,8 +125,12 @@ export type BackflowDecision =
   | { action: "skip"; reason: "no-fallback-color" | "user-owned" | "already-matches" };
 
 export interface DecideBackflowInput {
-  identityColor: ChromeGroupColor;
   hasRealColor: boolean;
+  /** The hex to paint if this decides to act -- the Chrome-representative
+   * hex in colorMode: "hash", or the allocated palette entry's hex in
+   * colorMode: "palette" (BackflowCandidate.targetHex, already resolved
+   * by computeBackflowCandidates). */
+  targetHex: string;
   ref: { cmuxColor: string | null; paintedColor: string | null };
 }
 
@@ -103,16 +150,17 @@ export interface DecideBackflowInput {
  * last painted (cmuxColor !== paintedColor) -- that combination is the
  * only signature a user-set color can produce, since backflow itself
  * never writes cmuxColor directly (only the tailed `colored` event does,
- * whether it's reporting the user's action or our own echo). */
+ * whether it's reporting the user's action or our own echo). This matrix
+ * is unchanged by colorMode -- only where targetHex comes from differs
+ * (see computeBackflowCandidates). */
 export function decideBackflow(input: DecideBackflowInput): BackflowDecision {
   if (input.hasRealColor) return { action: "skip", reason: "no-fallback-color" };
 
   const userOwned = input.ref.cmuxColor !== null && input.ref.cmuxColor !== input.ref.paintedColor;
   if (userOwned) return { action: "skip", reason: "user-owned" };
 
-  const targetHex = CHROME_GROUP_REPRESENTATIVE_HEX[input.identityColor];
-  if (input.ref.cmuxColor === targetHex) return { action: "skip", reason: "already-matches" };
-  return { action: "paint", targetHex };
+  if (input.ref.cmuxColor === input.targetHex) return { action: "skip", reason: "already-matches" };
+  return { action: "paint", targetHex: input.targetHex };
 }
 
 export interface BackflowAction {
@@ -128,8 +176,8 @@ export function planBackflow(candidates: BackflowCandidate[]): BackflowAction[] 
   const actions: BackflowAction[] = [];
   for (const c of candidates) {
     const decision = decideBackflow({
-      identityColor: c.identityColor,
       hasRealColor: c.hasRealColor,
+      targetHex: c.targetHex,
       ref: { cmuxColor: c.cmuxColor, paintedColor: c.paintedColor },
     });
     if (decision.action === "paint") {

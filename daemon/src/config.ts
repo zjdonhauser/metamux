@@ -58,6 +58,13 @@ export interface MetamuxConfig {
    * closes blank orphans left over from the pre-dedupe/eager eras, on every
    * sync reconciliation. Default true. */
   janitor: boolean;
+  /** Window-split recovery (2026-08-27): extends the janitor scan to
+   * managed-title groups found in windows OTHER than the metamux window --
+   * their tabs get moved into the canonical in-window group instead of
+   * being left stranded (docs/protocol.md, "Window-split recovery").
+   * Foreign (unmanaged-title) groups in other windows are never touched
+   * regardless of this setting. Default true. */
+  janitorCrossWindow: boolean;
   /** Color backflow (daemon/src/color-backflow.ts): paints a cmux tab's
    * own color to match its Chrome group's color when that color is the
    * title-hash fallback (never overwrites a user-set cmux color). Default
@@ -68,6 +75,14 @@ export interface MetamuxConfig {
    * Registry.pruneArchived. 0 disables auto-compaction entirely. Only
    * takes effect at daemon startup, not hot-reloadable. Default 7. */
   pruneArchivedAfterDays: number;
+  /** "palette" (default): allocates a distinguishable entry from
+   * palette.ts's ordered brand colors per identity at attachment time
+   * (palette-allocator.ts) -- replaces the title-hash fallback for any
+   * identity without a user-set color, so colors land visually distinct
+   * instead of two identities landing on the same hash bucket. "hash":
+   * disables allocation entirely, restoring the original title-hash-only
+   * fallback behavior. */
+  colorMode: "palette" | "hash";
 }
 
 export const DEFAULT_CONFIG: MetamuxConfig = {
@@ -82,8 +97,10 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   createGroups: "on-open",
   tmux: { enabled: false, mirror: "windows", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
   janitor: true,
+  janitorCrossWindow: true,
   colorBackflow: true,
   pruneArchivedAfterDays: 7,
+  colorMode: "palette",
 };
 
 export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxConfig> {
@@ -142,9 +159,11 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
           : DEFAULT_CONFIG.createGroups,
     tmux,
     janitor: typeof obj.janitor === "boolean" ? obj.janitor : DEFAULT_CONFIG.janitor,
+    janitorCrossWindow: typeof obj.janitorCrossWindow === "boolean" ? obj.janitorCrossWindow : DEFAULT_CONFIG.janitorCrossWindow,
     colorBackflow: typeof obj.colorBackflow === "boolean" ? obj.colorBackflow : DEFAULT_CONFIG.colorBackflow,
     pruneArchivedAfterDays:
       typeof obj.pruneArchivedAfterDays === "number" ? obj.pruneArchivedAfterDays : DEFAULT_CONFIG.pruneArchivedAfterDays,
+    colorMode: obj.colorMode === "hash" ? "hash" : DEFAULT_CONFIG.colorMode,
   };
 
   config.eventsPath = expandHome(config.eventsPath);
