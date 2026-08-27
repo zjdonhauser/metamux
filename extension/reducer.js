@@ -14,6 +14,14 @@
  * @property {number|null} groupId          cached chrome tabGroups id, re-resolved on startup
  * @property {number|null} lastActiveTabId  last active tab within this group
  * @property {number[]} ports               listening ports reported by the daemon's ports watcher (F8)
+ * @property {string|null} cmuxWindowId          Window pairing (docs/protocol.md, "Window
+ *   pairing"): the cmux window id backing this identity's home, or null (cmux-sourced identity,
+ *   or a tmux session in legacy windows/global mirror mode -- see targetWindowFor).
+ * @property {string|null} homeChromeWindowId    the Chrome window paired to cmuxWindowId, as a
+ *   decimal string (wire convention -- chrome window ids are numbers; see targetWindowFor), or
+ *   null if cmuxWindowId is null or no pairing has been established yet.
+ * @property {string|null} placementOverride     a Chrome window (decimal string) the user moved
+ *   this identity's group to by hand, overriding homeChromeWindowId, or null.
  */
 
 /**
@@ -40,6 +48,9 @@
  * @property {string} color
  * @property {boolean} archived
  * @property {number[]} [ports]  optional; present when the daemon's ports watcher (F8) is on
+ * @property {string|null} [cmuxWindowId]  Window pairing; see WorkspaceEntry
+ * @property {string|null} [homeChromeWindowId]
+ * @property {string|null} [placementOverride]
  */
 
 /**
@@ -98,6 +109,12 @@
  * @property {string} title
  * @property {string} color
  * @property {number[]} [ports]  optional; present when the daemon's ports watcher (F8) is on
+ * @property {string|null} [cmuxWindowId]  never actually present -- server.ts's broadcast() never
+ *   spreads window-pairing fields onto `event.workspace` (only open_url's top-level fields, and
+ *   sync, do). Declared here only so resolveWindowFields' shared signature type-checks against
+ *   every event's `ws`; always resolves via the existing-entry carry-forward path in practice.
+ * @property {string|null} [homeChromeWindowId]  see cmuxWindowId above
+ * @property {string|null} [placementOverride]  see cmuxWindowId above
  */
 
 /**
@@ -107,6 +124,11 @@
  * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"} name
  * @property {EventWorkspace} [workspace]  absent for focus_window, which carries no workspace
  * @property {string} [url]  present only for open_url
+ * @property {string|null} [homeChromeWindowId]  present only for open_url -- see WorkspaceEntry.
+ *   Regular workspace.activated/upserted/archived events never carry window-pairing fields at
+ *   all (docs/protocol.md's Wire protocol section spreads them only onto sync/state and
+ *   open_url, same as `ports`); an existing entry's window fields survive those untouched.
+ * @property {string|null} [cmuxWindowId]  present only for open_url -- see WorkspaceEntry.
  */
 
 /**
@@ -139,6 +161,14 @@
  * @property {number} [intoId]      mergeGroup/recoverCrossWindow: the canonical group to merge into
  * @property {number} [groupId]     closeGroup: the blank-orphan group to remove
  * @property {{title: string, tabCount: number}[]} [groups]  reportForeignGroups
+ * @property {number|null} [windowId]  ensureGroup/openUrl/collapseOthers: the resolved target
+ *   Chrome window (see targetWindowFor) -- null means "not yet paired, but wants to be" (see
+ *   cmuxWindowId below), NOT "no window at all"; chrome-ops.js falls back to ctx.windowId (the
+ *   legacy single metamux window) only when BOTH windowId and cmuxWindowId are null/absent.
+ * @property {string|null} [cmuxWindowId]  ensureGroup/openUrl: the raw cmux window id this
+ *   identity's home is paired to, when windowId is null because no Chrome pairing exists YET --
+ *   chrome-ops.js creates one on demand and reports it. null/absent for a cmux-sourced identity,
+ *   or a tmux session in legacy windows/global mirror mode (see targetWindowFor).
  */
 
 /**
@@ -193,9 +223,18 @@ function reduceSync(state, msg) {
       groupId: existing ? existing.groupId : null,
       lastActiveTabId: existing ? existing.lastActiveTabId : null,
       ports: resolvePorts(ws, existing),
+      ...resolveWindowFields(ws, existing),
     };
     if (!ws.archived) {
-      ops.push({ op: "ensureGroup", id: ws.id, title: ws.title, color: ws.color });
+      const entry = byId[ws.id];
+      ops.push({
+        op: "ensureGroup",
+        id: ws.id,
+        title: ws.title,
+        color: ws.color,
+        windowId: targetWindowFor(entry, state),
+        cmuxWindowId: entry.cmuxWindowId,
+      });
     } else if (existing && existing.groupId != null) {
       ops.push({ op: "archiveGroup", id: ws.id, behavior: msg.config.closeBehavior });
     }
@@ -234,7 +273,12 @@ function reduceSync(state, msg) {
     ops.push({ op: "activate", id: msg.state.activeId });
     ops.push({ op: "markServerActivation", id: msg.state.activeId });
     if (msg.config.collapseOthers) {
-      ops.push({ op: "collapseOthers", exceptId: msg.state.activeId });
+      const activeEntry = byId[msg.state.activeId];
+      ops.push({
+        op: "collapseOthers",
+        exceptId: msg.state.activeId,
+        windowId: activeEntry ? targetWindowFor(activeEntry, state) : state.windowId,
+      });
     }
   }
 
@@ -399,6 +443,48 @@ function resolvePorts(ws, existing) {
 }
 
 /**
+ * Window pairing (docs/protocol.md, "Window pairing"): keep an incoming
+ * field when the message actually carries it (sync workspaces, open_url),
+ * else carry the existing entry's value forward, else null -- same
+ * "present > existing > default" shape as resolvePorts. Regular
+ * workspace.activated/upserted/archived events never carry these fields at
+ * all (see EventMsg's own doc comment), so an existing entry's window
+ * fields simply survive those untouched.
+ * @param {{cmuxWindowId?: string|null, homeChromeWindowId?: string|null, placementOverride?: string|null}} ws
+ * @param {WorkspaceEntry} [existing]
+ * @returns {{cmuxWindowId: string|null, homeChromeWindowId: string|null, placementOverride: string|null}}
+ */
+function resolveWindowFields(ws, existing) {
+  return {
+    cmuxWindowId: ws.cmuxWindowId !== undefined ? ws.cmuxWindowId : (existing?.cmuxWindowId ?? null),
+    homeChromeWindowId: ws.homeChromeWindowId !== undefined ? ws.homeChromeWindowId : (existing?.homeChromeWindowId ?? null),
+    placementOverride: ws.placementOverride !== undefined ? ws.placementOverride : (existing?.placementOverride ?? null),
+  };
+}
+
+/**
+ * The Chrome window an identity's group belongs in, right now: an
+ * explicit placementOverride wins (the user moved it by hand); else its
+ * resolved home window; else the legacy single metamux window
+ * (state.windowId). This last fallback is the load-bearing null-safety
+ * guarantee for this whole feature: a cmux-sourced identity, or a tmux
+ * session in legacy windows/global mirror mode, NEVER carries a
+ * cmuxWindowId or any pairing at all -- both entry.homeChromeWindowId and
+ * entry.placementOverride stay null forever for it -- so it always
+ * resolves to state.windowId, exactly the single-window behavior this
+ * whole codebase had before this feature existed. Wire ids are decimal
+ * strings (see WorkspaceEntry); chrome.* APIs want real numbers.
+ * @param {WorkspaceEntry} entry
+ * @param {State} state
+ * @returns {number|null}
+ */
+export function targetWindowFor(entry, state) {
+  if (entry.placementOverride != null) return Number(entry.placementOverride);
+  if (entry.homeChromeWindowId != null) return Number(entry.homeChromeWindowId);
+  return state.windowId;
+}
+
+/**
  * @param {State} state
  * @param {EventMsg} msg
  * @returns {{state: State, ops: Op[]}}
@@ -415,10 +501,12 @@ function reduceUpserted(state, msg) {
       groupId: existing ? existing.groupId : null,
       lastActiveTabId: existing ? existing.lastActiveTabId : null,
       ports: resolvePorts(ws, existing),
+      ...resolveWindowFields(ws, existing),
     },
   };
+  const entry = byId[ws.id];
   const ops = [
-    { op: "ensureGroup", id: ws.id, title: ws.title, color: ws.color },
+    { op: "ensureGroup", id: ws.id, title: ws.title, color: ws.color, windowId: targetWindowFor(entry, state), cmuxWindowId: entry.cmuxWindowId },
     { op: "saveState" },
   ];
   return { state: { ...state, byId }, ops };
@@ -452,13 +540,15 @@ function reduceActivated(state, msg) {
           groupId: null,
           lastActiveTabId: null,
           ports: resolvePorts(ws, existing),
+          ...resolveWindowFields(ws, existing),
         },
       };
+  const entry = byId[ws.id];
 
   /** @type {Op[]} */
   const ops = [{ op: "activate", id: ws.id }, { op: "markServerActivation", id: ws.id }];
   if (state.config.collapseOthers) {
-    ops.push({ op: "collapseOthers", exceptId: ws.id });
+    ops.push({ op: "collapseOthers", exceptId: ws.id, windowId: targetWindowFor(entry, state) });
   }
   ops.push({ op: "saveState" });
 
@@ -482,6 +572,7 @@ function reduceArchived(state, msg) {
       groupId: existing ? existing.groupId : null,
       lastActiveTabId: existing ? existing.lastActiveTabId : null,
       ports: resolvePorts(ws, existing),
+      ...resolveWindowFields(ws, existing),
     },
   };
   const ops = [
@@ -504,20 +595,38 @@ function reduceOpenUrl(state, msg) {
   // it first) -- establish the byId entry here, same shape as
   // reduceActivated's "new identity" branch, so chrome-ops's openUrl always
   // has an entry to create the group around instead of orphaning the tab.
-  const byId = existing
-    ? state.byId
-    : {
-        ...state.byId,
-        [ws.id]: {
-          title: ws.title,
-          color: ws.color,
-          archived: false,
-          groupId: null,
-          lastActiveTabId: null,
-          ports: resolvePorts(ws, existing),
-        },
-      };
-  const ops = [{ op: "openUrl", id: ws.id, url: /** @type {string} */ (msg.url) }];
+  // Window pairing fields, unlike title/color/groupId/ports above, are
+  // always refreshed here even for an EXISTING entry -- open_url is the
+  // one event that actually carries homeChromeWindowId/cmuxWindowId (see
+  // EventMsg's doc comment), so a later open_url on an already-known
+  // identity is how it ever learns/updates them.
+  const windowFields = {
+    cmuxWindowId: msg.cmuxWindowId !== undefined ? msg.cmuxWindowId : (existing?.cmuxWindowId ?? null),
+    homeChromeWindowId: msg.homeChromeWindowId !== undefined ? msg.homeChromeWindowId : (existing?.homeChromeWindowId ?? null),
+    placementOverride: existing?.placementOverride ?? null,
+  };
+  const byId = {
+    ...state.byId,
+    [ws.id]: {
+      title: existing ? existing.title : ws.title,
+      color: existing ? existing.color : ws.color,
+      archived: false,
+      groupId: existing ? existing.groupId : null,
+      lastActiveTabId: existing ? existing.lastActiveTabId : null,
+      ports: resolvePorts(ws, existing),
+      ...windowFields,
+    },
+  };
+  const entry = byId[ws.id];
+  const ops = [
+    {
+      op: "openUrl",
+      id: ws.id,
+      url: /** @type {string} */ (msg.url),
+      windowId: targetWindowFor(entry, state),
+      cmuxWindowId: windowFields.cmuxWindowId,
+    },
+  ];
   return { state: { ...state, byId }, ops };
 }
 

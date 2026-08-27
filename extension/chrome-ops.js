@@ -11,7 +11,7 @@
  * must honor, especially: never chrome.windows.update({focused:true}) (F3).
  */
 
-import { resolveGroupCache, chooseAdoptionWindow } from "./reducer.js";
+import { resolveGroupCache, chooseAdoptionWindow, targetWindowFor } from "./reducer.js";
 
 /** @typedef {import("./reducer.js").Op} Op */
 /** @typedef {import("./reducer.js").State} State */
@@ -101,22 +101,57 @@ function executeOp(op, state, ctx) {
 }
 
 /**
+ * Window pairing (docs/protocol.md, "Window pairing" / "Chrome window
+ * pairing"): resolves the ACTUAL Chrome window an ensureGroup/openUrl op
+ * should execute in.
+ *  - op.windowId already resolved (a real number, including the legacy
+ *    single metamux window via ctx.windowId as the reducer's own
+ *    fallback) -- use it directly, no chrome calls needed.
+ *  - op.windowId is null but op.cmuxWindowId isn't: this identity wants a
+ *    per-window home that has no Chrome pairing YET. Create one --
+ *    unfocused, per hard rule F3 -- with its own per-window marker tab at
+ *    `panel.html?win=<cmuxWindowId>` (the contract's own resolution
+ *    mechanism: "the marker becomes per-window, marker URL carries the
+ *    cmuxWindowId as a query param"), report the new pairing to the
+ *    daemon so `Registry.windowPairings` picks it up, and use the new
+ *    window from here on.
+ *  - neither -- ctx.windowId, the legacy single metamux window. This is
+ *    the null-safe path every cmux-sourced identity and every tmux
+ *    session in legacy windows/global mirror mode always takes.
+ * @param {Op} op
+ * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
+ * @returns {Promise<number>}
+ */
+async function resolveTargetWindow(op, ctx) {
+  if (op.windowId != null) return op.windowId;
+  if (op.cmuxWindowId != null) {
+    const markerUrl = chrome.runtime.getURL(`panel.html?win=${encodeURIComponent(op.cmuxWindowId)}`);
+    const win = await chrome.windows.create({ url: markerUrl, focused: false });
+    const chromeWindowId = /** @type {number} */ (win.id);
+    ctx.sendFrame?.({ type: "windowPairing", cmuxWindowId: op.cmuxWindowId, chromeWindowId: String(chromeWindowId) });
+    return chromeWindowId;
+  }
+  return ctx.windowId;
+}
+
+/**
  * Idempotent: re-resolves by title first so a duplicate sync/upsert never
  * creates a second group for the same workspace.
  * @param {Op} op
- * @param {{windowId: number}} ctx
+ * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
  * @returns {Promise<Msg>}
  */
 async function ensureGroup(op, ctx) {
   const title = /** @type {string} */ (op.title);
   const color = /** @type {string} */ (op.color);
-  const found = await chrome.tabGroups.query({ title, windowId: ctx.windowId });
+  const windowId = await resolveTargetWindow(op, ctx);
+  const found = await chrome.tabGroups.query({ title, windowId });
   let groupId;
   if (found.length > 0) {
     groupId = found[0].id;
     await chrome.tabGroups.update(groupId, { title, color: /** @type {chrome.tabGroups.ColorEnum} */ (color) });
   } else {
-    const tab = await chrome.tabs.create({ windowId: ctx.windowId, url: "chrome://newtab/", active: false });
+    const tab = await chrome.tabs.create({ windowId, url: "chrome://newtab/", active: false });
     groupId = await chrome.tabs.group({ tabIds: [/** @type {number} */ (tab.id)] });
     await chrome.tabGroups.update(groupId, {
       title,
@@ -149,6 +184,15 @@ async function activate(op, state) {
 }
 
 /**
+ * Per-window collapse scoping (docs/protocol.md, "Window pairing" ->
+ * "Chrome window pairing": "switching cmux tabs in window W
+ * activates/collapses groups ONLY within W's paired Chrome window. Other
+ * pairs are untouched"). Falls out of targetWindowFor -- the SAME pure
+ * resolution the reducer used for the activated identity's own op.windowId
+ * -- applied per OTHER entry: skip anything not sharing that window.
+ * Null-safe by construction: when no identity anywhere has a pairing,
+ * every entry resolves to the same state.windowId, so nothing is ever
+ * filtered out -- exactly today's behavior.
  * @param {Op} op
  * @param {State} state
  * @returns {Promise<null>}
@@ -156,6 +200,7 @@ async function activate(op, state) {
 async function collapseOthers(op, state) {
   for (const [id, entry] of Object.entries(state.byId)) {
     if (id === op.exceptId || entry.archived || entry.groupId == null) continue;
+    if (targetWindowFor(entry, state) !== op.windowId) continue;
     await chrome.tabGroups.update(entry.groupId, { collapsed: true });
   }
   return null;
@@ -191,16 +236,17 @@ async function archiveGroup(op, state) {
  * opened, never a separate chrome://newtab placeholder.
  * @param {Op} op
  * @param {State} state
- * @param {{windowId: number}} ctx
+ * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
  * @returns {Promise<Msg|null>}
  */
 async function openUrl(op, state, ctx) {
   const entry = state.byId[/** @type {string} */ (op.id)];
-  const tab = await chrome.tabs.create({ windowId: ctx.windowId, url: op.url, active: true });
+  const windowId = await resolveTargetWindow(op, ctx);
+  const tab = await chrome.tabs.create({ windowId, url: op.url, active: true });
 
   let groupId = entry.groupId;
   if (groupId == null) {
-    const found = await chrome.tabGroups.query({ title: entry.title, windowId: ctx.windowId });
+    const found = await chrome.tabGroups.query({ title: entry.title, windowId });
     if (found.length > 0) {
       groupId = found[0].id;
     } else {
@@ -355,9 +401,16 @@ export async function resolveMetamuxWindow(byId = {}) {
   /** @type {import("./reducer.js").MarkerTabSighting[]} */
   const markers = [];
   for (const t of tabs) {
-    if (t.url && t.url.startsWith(panelUrl) && t.id != null && t.windowId != null) {
-      markers.push({ tabId: t.id, windowId: t.windowId });
-    }
+    if (!t.url || !t.url.startsWith(panelUrl) || t.id == null || t.windowId == null) continue;
+    // Window pairing (docs/protocol.md, "Chrome window pairing"): a marker
+    // carrying `?win=<cmuxWindowId>` is a PER-WINDOW pairing marker, never
+    // a candidate for chooseAdoptionWindow's single-legacy-window
+    // consolidation -- resolveTargetWindow (chrome-ops.js) creates and
+    // owns these independently. Without this exclusion, the very first
+    // per-window marker this feature ever creates would get swept up here
+    // and closed as a "duplicate" of the legacy metamux marker.
+    if (t.url.includes("?win=")) continue;
+    markers.push({ tabId: t.id, windowId: t.windowId });
   }
 
   const allGroups = await allGroupsSnapshot();

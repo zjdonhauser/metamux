@@ -58,6 +58,26 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Bounded retry/poll for an assertion condition that can be transiently
+ * wrong (docs/protocol.md's "Testing conventions" note on this script):
+ * this daemon is isolated on port/state/config only -- it still tails
+ * Zac's REAL, live events.jsonl, so a real concurrent workspace event can
+ * legitimately land mid-step and make a check false for a moment before
+ * self-correcting on the extension's own next reconciliation. Re-checks
+ * `check()` every `intervalMs` until it returns a truthy value or
+ * `timeoutMs` elapses, returning whatever the LAST call returned either
+ * way -- callers still see the real final value for their `detail`
+ * string, this just gives a transient race a chance to settle first. */
+async function pollUntil<T>(check: () => Promise<T>, timeoutMs = 5000, intervalMs = 300): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let last = await check();
+  while (!last && Date.now() < deadline) {
+    await sleep(intervalMs);
+    last = await check();
+  }
+  return last;
+}
+
 function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();

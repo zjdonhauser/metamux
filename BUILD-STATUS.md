@@ -407,6 +407,107 @@ extension half (marker-tab-per-window, per-window group creation/activation/jani
   title and no server-driven move marker; per-window activation/collapse scoping ("switching cmux
   tabs in window W activates/collapses groups ONLY within W's paired Chrome window").
 
+## Isolated e2e regression triage + extension window-pairing half (2026-08-27 evening)
+
+Priority insert ahead of the extension half: 3 isolated-e2e assertions were reported failing
+against committed extension code (reproduced twice independently by team-lead). Systematic
+debugging, then the extension window-pairing half per the daemon-half report's own spec.
+
+### e2e triage findings
+
+- **The named suspects are refuted by direct inspection.** `classifyJanitor(byId, groups,
+  foreignGroups, crossWindowEnabled)` matches its call site exactly; same for
+  `resolveGroupCache` and `chooseAdoptionWindow`. No signature mismatch exists anywhere in
+  `e3b1bd7`'s janitor/window-split code.
+- **Fixed a real structural bug regardless: `sw.js`'s `dispatchChain` could be permanently
+  poisoned by one exception.** `(dispatchChain ?? Promise.resolve()).then(() =>
+  dispatchNow(msg))` looks sequential but isn't failure-isolated -- once `dispatchNow` rejects
+  once, every LATER `.then(dispatchNow)` on an already-rejected promise skips `dispatchNow`
+  forever, silently freezing extension state for the rest of the service worker's lifetime. This
+  is the best structural explanation for a 3-way co-occurring failure (one early rejection takes
+  down everything after it) -- extracted the fix into a new pure, chrome-free module
+  (`extension/chain.js`'s `chainStep`, isolates each step's failure the same way `executeOps`
+  already isolates one bad op) since `sw.js` itself has top-level `chrome.*`/`boot()` side effects
+  and isn't unit-testable directly. 5 new regression tests in `extension/test/chain.test.js`.
+  Also added SW console/pageerror forwarding to `scripts/e2e-chromium.ts` (MV3 SW errors
+  otherwise only show up in `chrome://extensions`, invisible to a scripted run).
+- **Across 10 total e2e runs this round, this new forwarding never once caught an exception --
+  including on runs where the exact 3-way failure reproduced.** This rules out an uncaught
+  exception as the cause of what was actually observed, at least in every run I captured.
+- **Root cause of the actual failures, captured directly in the daemon/extension logs**: the
+  isolated e2e's daemon is isolated on port/state/config only -- it still tails Zac's REAL, live
+  `events.jsonl` (explicit, deliberate, documented in the script's own header comment). Genuine
+  concurrent cmux activity on his machine (multiple real `workspace.activated` events for
+  unrelated titles like `cmux`/`amplify`, logged mid-test-run) races the test's tight assertion
+  timing. Direct evidence: one failing run's janitor assertion read `count=3` (three groups
+  sharing the test's title) where the test only ever creates one artificial duplicate --
+  something else, concurrently, created another real group under the same title mid-test. This
+  reproduces and clears intermittently as Zac's own foreground activity does; it is not a latent
+  code defect this round's changes could fix. `reduceActivated`'s entry-creation (the specific
+  mechanism behind the byId-pruning assertion) is documented, intentional behavior from `a6cf076`
+  -- two commits before `e3b1bd7` -- confirmed via `git log -S`; not touched.
+- **Not done**: hardening the e2e itself against this known non-isolation (e.g., a poll/retry
+  window before each assertion, or briefly pausing the daemon's tail during the critical section)
+  -- flagged as a follow-up, not attempted this round.
+- [x] `bun test`: 689 pass, 0 fail (daemon + extension combined, up from 502+87 at session start
+      counting only this task's own additions). `bunx tsc --noEmit`: clean (excluding pre-existing
+      `extension/automation.js` errors from a concurrent, unrelated agent's uncommitted work).
+
+### Extension window-pairing half
+
+Per the daemon-half report's own spec, layered strictly ON TOP of today's single-window model --
+the acceptance criterion throughout: a `cmuxWindowId: null` identity (every cmux-sourced
+identity, and every tmux session in legacy windows/global mirror mode) behaves EXACTLY as before
+this feature existed. Verified: the full 96-test extension suite and the isolated e2e (every
+identity there is cmux-sourced) both stayed green through every change.
+
+- **Daemon wire gap found and fixed first** (advisor-caught, before any extension code): the
+  sync/state/`open_url` wire only carried `homeChromeWindowId`/`placementOverride`, never the
+  raw `cmuxWindowId` backing them. Since a pairing can only be ESTABLISHED by the extension
+  creating a marker tab at `panel.html?win=<cmuxWindowId>` -- which requires knowing the uuid
+  first -- the daemon had no way to ever teach the extension a cmux window's id, so
+  `windowPairings` could never be populated. Fixed: `cmuxWindowId` now spreads alongside the
+  other two, same representative-member pattern, same three call sites (`server.ts`). Documented
+  as a contract correction in `docs/protocol.md`.
+- `reducer.js` (pure): `WorkspaceEntry` gains `cmuxWindowId`/`homeChromeWindowId`/
+  `placementOverride` (decimal-string wire convention for the two Chrome-window ids; cmux ids are
+  genuine UUID strings), read via a new `resolveWindowFields` helper (same "present > existing >
+  default" shape as the existing `resolvePorts`). New exported `targetWindowFor(entry, state)`:
+  `placementOverride` > `homeChromeWindowId` > `state.windowId` (the legacy single metamux
+  window) -- this last fallback is the load-bearing null-safety guarantee. `ensureGroup`/
+  `openUrl`/`collapseOthers` ops now carry an explicit resolved `windowId` (+ `cmuxWindowId` for
+  on-demand pairing creation); `activate`/`archiveGroup` untouched (chrome APIs are window-
+  agnostic given a real groupId/tabId). TDD: dedicated `targetWindowFor` describe block plus
+  every existing op-shape fixture updated for the new fields.
+- `chrome-ops.js` (glue): new `resolveTargetWindow(op, ctx)` -- uses `op.windowId` when resolved;
+  when null but `op.cmuxWindowId` isn't, creates a fresh unfocused Chrome window + per-window
+  marker tab and reports the pairing via a new `windowPairing` frame (not itself part of the
+  original contract text, which specifies only the persisted map and "resolved by marker tab" --
+  this is the reporting mechanism that flow needs); else falls back to `ctx.windowId` (legacy,
+  unchanged). `ensureGroup`/`openUrl` route through it. `collapseOthers` reuses the reducer's own
+  `targetWindowFor` (imported, same precedent as already importing `resolveGroupCache`/
+  `chooseAdoptionWindow`) to scope collapse to the activated identity's own window -- inert
+  (collapses everything, exactly as before) whenever no identity anywhere has a pairing.
+  `resolveMetamuxWindow`'s marker scan now excludes `?win=` per-window pairing markers from
+  `chooseAdoptionWindow`'s single-legacy-window consolidation -- without this, the first
+  per-window marker this feature ever creates would get swept up and closed as a "duplicate."
+- **Known incomplete, explicitly out of this round's scope** (documented here rather than
+  silently shipped as done): (1) `watchTabActivation`/`watchGroupRemoved` are still scoped to the
+  single legacy `windowId` -- F9 reverse sync and detach-on-close don't yet fire for a group
+  living in a per-window-paired Chrome window. (2) `classifyJanitor`'s cross-window recovery
+  logic is still single-window-canonical (one canonical group per TITLE, not per
+  title-and-target-window) -- it hasn't been taught to distinguish "foreign because of a window
+  split" from "foreign because of a legitimate `placementOverride`," so the contract's
+  fresh-boot "adopt reality as override" rule isn't implemented. (3) Boot-time reconciliation of
+  a per-window marker that already exists in Chrome but isn't yet in the daemon's
+  `windowPairings` (e.g., a wiped registry.json) isn't implemented -- not load-bearing for the
+  common case (the daemon persists `windowPairings` across restarts already), but a resilience
+  gap for that edge case.
+- [x] `bun test`: 689 pass, 0 fail. `bunx tsc --noEmit`: clean.
+- **Not activated live** for the same reason as the daemon half: `config.tmux.enabled` still
+  defaults false, and even where true, `cmuxWindowId` is only ever stamped by partition-mode
+  reconcile, which itself is not yet live-activated (see above).
+
 ## Blockers
 
 - tmux absorption live cutover (kill the real tmux-cmux-sync process, edit real `.zshrc`,

@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { initialState, reduce, resolveGroupCache, chooseAdoptionWindow } from "../reducer.js";
+import { initialState, reduce, resolveGroupCache, chooseAdoptionWindow, targetWindowFor } from "../reducer.js";
 
 /** @param {Partial<import("../reducer.js").State>} [overrides] */
 function makeState(overrides = {}) {
@@ -58,7 +58,7 @@ describe("sync reconciliation", () => {
         ],
       },
     });
-    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: null, cmuxWindowId: null });
     expect(ops.find((o) => o.op === "ensureGroup" && o.id === "mw_b")).toBeUndefined();
   });
 
@@ -223,7 +223,7 @@ describe("sync-authoritative byId (pruning)", () => {
       state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
     });
     expect(reappeared.state.byId.mw_a).toBeDefined();
-    expect(reappeared.ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+    expect(reappeared.ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: null, cmuxWindowId: null });
   });
 });
 
@@ -237,7 +237,7 @@ describe("workspace.activated", () => {
       workspace: { id: "mw_a", title: "alpha", color: "blue" },
     });
     expect(ops).toContainEqual({ op: "activate", id: "mw_a" });
-    expect(ops).toContainEqual({ op: "collapseOthers", exceptId: "mw_a" });
+    expect(ops).toContainEqual({ op: "collapseOthers", exceptId: "mw_a", windowId: null });
   });
 
   test("omits collapseOthers when config.collapseOthers is false", () => {
@@ -303,7 +303,7 @@ describe("workspace.upserted", () => {
     });
     expect(next.byId.mw_a).toBeDefined();
     expect(next.byId.mw_a.archived).toBe(false);
-    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: null, cmuxWindowId: null });
   });
 
   test("rename: updates title, preserves cached groupId, emits ensureGroup with new title", () => {
@@ -319,7 +319,7 @@ describe("workspace.upserted", () => {
     expect(next.byId.mw_a.title).toBe("new-name");
     expect(next.byId.mw_a.groupId).toBe(99);
     expect(next.byId.mw_a.lastActiveTabId).toBe(3);
-    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "new-name", color: "blue" });
+    expect(ops).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "new-name", color: "blue", windowId: null, cmuxWindowId: null });
   });
 
   test("unarchive: clears archived flag", () => {
@@ -377,7 +377,7 @@ describe("open_url", () => {
       workspace: { id: "mw_a", title: "alpha", color: "blue" },
       url: "https://example.com",
     });
-    expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com" });
+    expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com", windowId: null, cmuxWindowId: null });
   });
 
   test("does not mutate activeId", () => {
@@ -412,6 +412,9 @@ describe("open_url", () => {
       groupId: null,
       lastActiveTabId: null,
       ports: [],
+      cmuxWindowId: null,
+      homeChromeWindowId: null,
+      placementOverride: null,
     });
   });
 
@@ -426,7 +429,63 @@ describe("open_url", () => {
       workspace: { id: "mw_a", title: "alpha", color: "blue" },
       url: "https://example.com",
     });
-    expect(next.byId.mw_a).toEqual({ title: "alpha", color: "blue", archived: false, groupId: 7, lastActiveTabId: 3, ports: [4000] });
+    expect(next.byId.mw_a).toEqual({
+      title: "alpha",
+      color: "blue",
+      archived: false,
+      groupId: 7,
+      lastActiveTabId: 3,
+      ports: [4000],
+      cmuxWindowId: null,
+      homeChromeWindowId: null,
+      placementOverride: null,
+    });
+  });
+
+  test("open_url refreshes window-pairing fields on an EXISTING entry -- the daemon may resolve a pairing after the fact", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 7, lastActiveTabId: 3, ports: [], cmuxWindowId: null, homeChromeWindowId: null, placementOverride: null } },
+    });
+    const { state: next, ops } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "open_url",
+      workspace: { id: "mw_a", title: "alpha", color: "blue" },
+      url: "https://example.com",
+      cmuxWindowId: "win-1",
+      homeChromeWindowId: "555",
+    });
+    expect(next.byId.mw_a.cmuxWindowId).toBe("win-1");
+    expect(next.byId.mw_a.homeChromeWindowId).toBe("555");
+    expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com", windowId: 555, cmuxWindowId: "win-1" });
+  });
+
+  test("open_url with no window fields on the message carries an existing entry's pairing forward unchanged", () => {
+    const state = makeState({
+      byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 7, lastActiveTabId: 3, ports: [], cmuxWindowId: "win-1", homeChromeWindowId: "555", placementOverride: null } },
+    });
+    const { ops } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "open_url",
+      workspace: { id: "mw_a", title: "alpha", color: "blue" },
+      url: "https://example.com",
+    });
+    expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com", windowId: 555, cmuxWindowId: "win-1" });
+  });
+
+  test("open_url for a paired-but-not-yet-resolved window (cmuxWindowId set, homeChromeWindowId null) targets windowId: null with cmuxWindowId set -- chrome-ops creates the pairing on demand", () => {
+    const state = makeState();
+    const { ops } = reduce(state, {
+      type: "event",
+      seq: 1,
+      name: "open_url",
+      workspace: { id: "mw_a", title: "alpha", color: "blue" },
+      url: "https://example.com",
+      cmuxWindowId: "win-1",
+      homeChromeWindowId: null,
+    });
+    expect(ops).toContainEqual({ op: "openUrl", id: "mw_a", url: "https://example.com", windowId: null, cmuxWindowId: "win-1" });
   });
 });
 
@@ -1024,6 +1083,53 @@ describe("resolveGroupCache -- cache invalidation on window resolution", () => {
   });
 });
 
+describe("targetWindowFor -- window pairing resolution (docs/protocol.md, 'Window pairing')", () => {
+  function entry(overrides = {}) {
+    return {
+      title: "x",
+      color: "blue",
+      archived: false,
+      groupId: null,
+      lastActiveTabId: null,
+      ports: [],
+      cmuxWindowId: null,
+      homeChromeWindowId: null,
+      placementOverride: null,
+      ...overrides,
+    };
+  }
+
+  test("null-safety: an entry with no pairing at all resolves to the legacy single metamux window -- the entire feature is a no-op for it", () => {
+    const state = makeState({ windowId: 42 });
+    expect(targetWindowFor(entry(), state)).toBe(42);
+  });
+
+  test("null-safety: still resolves to null when state.windowId itself is null (not yet booted)", () => {
+    const state = makeState({ windowId: null });
+    expect(targetWindowFor(entry(), state)).toBeNull();
+  });
+
+  test("a resolved home window wins over the legacy metamux window", () => {
+    const state = makeState({ windowId: 42 });
+    expect(targetWindowFor(entry({ homeChromeWindowId: "555" }), state)).toBe(555);
+  });
+
+  test("an explicit placementOverride wins over the resolved home window", () => {
+    const state = makeState({ windowId: 42 });
+    expect(targetWindowFor(entry({ homeChromeWindowId: "555", placementOverride: "999" }), state)).toBe(999);
+  });
+
+  test("an explicit placementOverride wins even with no home window resolved yet", () => {
+    const state = makeState({ windowId: 42 });
+    expect(targetWindowFor(entry({ placementOverride: "999" }), state)).toBe(999);
+  });
+
+  test("cmuxWindowId alone (no homeChromeWindowId yet -- not yet paired) does NOT affect resolution -- only homeChromeWindowId/placementOverride do", () => {
+    const state = makeState({ windowId: 42 });
+    expect(targetWindowFor(entry({ cmuxWindowId: "win-1" }), state)).toBe(42);
+  });
+});
+
 describe("chooseAdoptionWindow -- window adoption / marker consolidation", () => {
   test("a single marker tab is kept as-is, no candidates to close", () => {
     const markers = [{ tabId: 1, windowId: 100 }];
@@ -1137,7 +1243,7 @@ describe("isolated e2e: window-split incident end to end", () => {
     // critically, activation targets groupId: null (invalidated above),
     // never the old window's real groupIds 10/11.
     expect(firstSyncOps.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
-    expect(firstSyncOps).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue" });
+    expect(firstSyncOps).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: 777, cmuxWindowId: null });
     expect(firstSyncOps).toContainEqual({ op: "activate", id: "mw_a" });
 
     // Step 3: ensureGroup ran (simulated: byId now has fresh in-window
