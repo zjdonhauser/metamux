@@ -18,6 +18,7 @@ import {
 import { loadConfig } from "../daemon/src/config.ts";
 import { createHttpToolHandlers, runStdioServer } from "../daemon/src/mcp-server.ts";
 import { atomicWriteJson, CONFIG_PATH, ensureSecret, secretPath } from "../daemon/src/paths.ts";
+import { parseOpenArgs } from "./open-args.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DAEMON_MAIN = join(HERE, "..", "daemon", "src", "main.ts");
@@ -53,14 +54,18 @@ async function requireToken(): Promise<string> {
   return token;
 }
 
-async function cmdOpen(url: string | undefined): Promise<void> {
+async function cmdOpen(args: string[]): Promise<void> {
+  const { url, active } = parseOpenArgs(args);
   if (!url) {
-    console.error("usage: metamux open <url>");
+    console.error("usage: metamux open <url> [--active]");
     process.exit(1);
   }
   const port = await resolvePort();
   const token = await requireToken();
-  const cmuxWorkspaceId = process.env.CMUX_WORKSPACE_ID || undefined;
+  // --active: target the visually active workspace explicitly (omit
+  // cmuxWorkspaceId, letting the daemon fall back to its own activeId) --
+  // without it, the caller's own shell workspace stays the default.
+  const cmuxWorkspaceId = active ? undefined : process.env.CMUX_WORKSPACE_ID || undefined;
 
   let res: Response;
   try {
@@ -266,7 +271,7 @@ async function main() {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
     case "open":
-      await cmdOpen(rest[0]);
+      await cmdOpen(rest);
       break;
     case "status":
       await cmdStatus();
@@ -296,7 +301,7 @@ async function main() {
       await cmdConfig(rest);
       break;
     default:
-      console.error("usage: metamux <open <url>|current|status|state|secret|focus|prune|doctor|mcp|config [--json | <key> <value>]>");
+      console.error("usage: metamux <open <url> [--active]|current|status|state|secret|focus|prune|doctor|mcp|config [--json | <key> <value>]>");
       process.exit(1);
   }
 }

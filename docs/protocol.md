@@ -828,6 +828,52 @@ internal host post-navigate -- this gate only checks the URL handed to it, not e
 redirect chain might take. Catching that needs the CDP `Network` domain's request-intercept
 (`Fetch.enable` + pausing on `Network.requestWillBeSent`), out of scope here.
 
+## Link routing (2026-08-27, metamux-opener)
+
+cmux has no link-handler setting of its own (checked its config schema directly) -- a cmd-click
+on a link inside a cmux terminal goes through plain macOS default-browser handling, identical to
+any other app. `metamux-opener` (`opener/metamux-opener.swift`, a single Swift file, no Xcode
+project -- compiled and bundled by `scripts/install-opener.sh`) makes metamux itself that default
+handler.
+
+**Decision table** (not mirrored as a TS module -- Swift isn't in this repo's test rig, and the
+table is genuinely two branches; duplicating it as an untested TS file would test a copy with no
+real connection to the Swift source, not the actual behavior. Documented here instead, and
+verified via the Swift binary's own `--test` flag, below):
+
+1. **Capture the frontmost app's bundle id FIRST**, before this process itself steals focus by
+   handling the URL event (`NSWorkspace.frontmostApplication`, read in
+   `applicationDidFinishLaunching`, before Apple Event dispatch).
+2. **Frontmost `== com.cmuxterm.app`** -> `POST http://127.0.0.1:<port>/open {token, url}` (no
+   `cmuxWorkspaceId` -- the daemon's existing "target the active workspace" fallback, same as
+   `metamux open --active`), 1s timeout. Port comes from `~/.config/metamux/config.json`'s `port`
+   key (falls back to 8377); the secret is read fresh from `~/.local/state/metamux/secret` on
+   EVERY event, never cached, so a daemon restart's new secret is picked up immediately.
+3. **Daemon down (no secret file, request error) OR any other frontmost app OR a non-2xx
+   response** -> passthrough: open the URL with **Google Chrome explicitly**
+   (`NSWorkspace.open(_:withApplicationAt:configuration:)`), never via the OS default handler --
+   the default handler is US, so that would loop forever.
+4. **Never shows UI, never a Dock icon** (`LSUIElement: true` in the generated Info.plist, plus
+   `NSApplication.shared.setActivationPolicy(.prohibited)` belt-and-suspenders).
+
+**Registration**: `metamux-opener --register` calls `LSSetDefaultHandlerForURLScheme` for
+`http`/`https`. macOS shows its own confirmation dialog for a default-browser change -- **Zac
+clicks it**, this is a real user click, not scriptable around: `Do you want to make
+"metamux-opener" your default web browser?` -> **Use "metamux-opener"**. If no dialog appears
+(varies by macOS version), the fallback is manual: System Settings -> Desktop & Dock -> Default
+web browser -> metamux-opener. `install-opener.sh` builds and ad-hoc code-signs the app bundle at
+`~/Applications/metamux-opener.app` but deliberately does NOT call `--register` itself -- flipping
+the OS default browser is a separate, deliberate step the human takes, not something a build
+script does silently.
+
+**Verification without controlling real frontmost-app state** (a test harness can't reliably make
+cmux vs. something else the actually-frontmost app): `metamux-opener --test <cmux|passthrough>
+<url>` forces the branch directly and runs the same `route()` function a real URL event would,
+blocking on a semaphore until the async work (the daemon POST or the Chrome open) completes. Both
+branches were run live this round: `--test cmux` landed a real tab in the real daemon's active
+workspace group (confirmed via `/status` staying healthy); `--test passthrough` opened Chrome
+directly.
+
 ## Testing conventions
 
 - Runner: `bun test` (workspace root `bunfig.toml` not required; tests live in `daemon/test/*.test.ts` and `extension/test/*.test.js`).

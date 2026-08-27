@@ -60,11 +60,15 @@ Reverse sync (click a Chrome group → cmux switches) is available, default off.
    settings.json hook + `~/.claude/skills/metamux`), Codex (`~/.codex/config.toml` MCP +
    hook, `~/.codex/skills`), Grok (`grok mcp add`, `~/.grok/hooks/metamux-url-hook.json`,
    `~/.grok/skills`). Codex/Grok trust-gate user hooks: approve "metamux URL auto-open" once.
+4. **Link routing** (optional): `bun scripts/install-opener.sh` builds `metamux-opener.app`,
+   then its `--register` flag makes it the default browser so a cmd-click on a link inside
+   cmux routes there too, not just agent-driven opens. See "Link routing" below.
 
 ## CLI
 
 ```
-metamux open <url>     # open in the calling shell's workspace group
+metamux open <url> [--active]  # open in the calling shell's workspace group
+                                # (--active: the visually active workspace instead)
 metamux current        # this shell's workspace (JSON)
 metamux focus          # bring the paired Chrome window forward
 metamux status|state   # daemon health / full registry
@@ -78,6 +82,34 @@ Config lives at `~/.config/metamux/config.json`; every key is in `metamux config
 menubar. Notables: `groupBy` (title), `createGroups` (on-open), `colorMode` (palette),
 `agentBrowser` (read), `reverseSync` (false), `janitor` (true), `tmux.mirror` (partition),
 `ports.mode` (auto), `pruneArchivedAfterDays` (7).
+
+## Link routing (default-browser shim)
+
+cmux has no built-in link-handler setting -- a cmd-click on a link in a cmux terminal goes
+through plain macOS default-browser handling, same as any other app. `metamux-opener`
+(`opener/metamux-opener.swift`) makes metamux the default browser instead: it's a tiny
+LSUIElement app (no Dock icon, no window) that registers for http/https URL events, and on
+each one, routes to `metamux open` if the frontmost app was cmux, else passes straight
+through to Chrome. See docs/protocol.md, "Link routing" for the full decision table.
+
+```
+bun scripts/install-opener.sh                              # compile + bundle + ad-hoc sign
+~/Applications/metamux-opener.app/Contents/MacOS/metamux-opener --register   # make it default
+```
+
+`--register` requests the change via `LSSetDefaultHandlerForURLScheme`; macOS shows its own
+confirmation dialog ("Do you want to make "metamux-opener" your default web browser?") --
+click **Use "metamux-opener"**. If no dialog appears (varies by macOS version), set it
+manually: **System Settings → Desktop & Dock → Default web browser → metamux-opener**. To
+revert, pick Chrome/Safari/whatever the same way.
+
+Verify either branch without touching the real default browser or needing to control which
+app is actually frontmost:
+
+```
+metamux-opener --test cmux https://example.com          # forces the cmux branch
+metamux-opener --test passthrough https://example.com   # forces the passthrough branch
+```
 
 ## Architecture
 

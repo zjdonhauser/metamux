@@ -571,3 +571,28 @@ looked identical to "this group is gone" to it. This round resolves "Known incom
   `extension/test/reducer.test.js`, `docs/protocol.md`, this file) -- daemon-builder's concurrent
   WIP (`daemon/src/main.ts`, `daemon/src/server.ts`, `daemon/src/backflow-failure-tracker.ts`,
   new automation-crash-safety/backflow-failure-tracker tests) intentionally left untouched.
+
+## Link routing: metamux-opener (2026-08-27, daemon-builder)
+
+- [x] `opener/metamux-opener.swift` (single file, no Xcode project): LSUIElement app,
+      registers http/https URL events, captures frontmost bundle id before anything steals
+      focus, routes `com.cmuxterm.app` -> `POST /open` (1s timeout, port/secret read fresh
+      per event), everything else (daemon down, non-2xx, other frontmost app) -> passthrough
+      to Chrome explicitly (never the OS default handler -- that's ourselves, infinite loop).
+      `--register` (LSSetDefaultHandlerForURLScheme, real user-click dialog) and `--test
+      <cmux|passthrough> <url>` (forces each branch, no real frontmost-app control needed).
+- [x] `scripts/install-opener.sh`: swiftc-compiles, assembles the .app bundle + Info.plist
+      (CFBundleURLTypes for http/https), ad-hoc code-signs, lsregisters. Does NOT call
+      `--register` itself -- flipping the default browser is Zac's own deliberate click.
+- [x] Built + installed live at `~/Applications/metamux-opener.app`; both branches verified
+      for real: `--test cmux` landed a live tab in the daemon's active workspace group
+      (`/status` stayed healthy throughout, also re-confirming this round's crash-safety fix
+      held under real load); `--test passthrough` opened Chrome directly.
+- [x] `metamux open --active` CLI flag (`cli/open-args.ts`, pure, TDD'd, 5 tests): targets the
+      daemon's active workspace explicitly (omits `cmuxWorkspaceId`) regardless of
+      `$CMUX_WORKSPACE_ID` -- what metamux-opener's cmux branch relies on.
+- [x] Decision table documented in docs/protocol.md ("Link routing") rather than mirrored as
+      an untested TS module -- Swift isn't in this repo's test rig, and duplicating two
+      branches as a disconnected TS copy would test the copy, not the real behavior.
+- [x] README "Link routing" section + Setup step 4 + `--active` in the CLI table.
+- [x] `bun test`: 716 pass, 0 fail. `bunx tsc --noEmit`: clean.
