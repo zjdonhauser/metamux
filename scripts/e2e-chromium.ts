@@ -180,6 +180,12 @@ async function main() {
         process.stdout.write(`[daemon] ${new TextDecoder().decode(chunk)}`);
       }
     })();
+    void (async () => {
+      if (!daemonProc?.stderr) return;
+      for await (const chunk of daemonProc.stderr as ReadableStream<Uint8Array>) {
+        process.stderr.write(`[daemon:stderr] ${new TextDecoder().decode(chunk)}`);
+      }
+    })();
 
     const status = await waitForStatus(port, secret);
     console.log("isolated daemon /status:", JSON.stringify(status));
