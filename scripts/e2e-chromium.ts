@@ -360,13 +360,19 @@ async function main() {
       record("palette allocation assertion (skipped -- no group was created to check)", false, "see POST /open assertions above");
     }
 
-    let activeTabInGroup = false;
     let openedGroupTitle: string | null = null;
-    if (activeGroupAfterOpen) {
-      openedGroupTitle = activeGroupAfterOpen.title ?? null;
-      const tabs = await sw.evaluate((groupId) => chrome.tabs.query({ groupId }), activeGroupAfterOpen.id);
-      activeTabInGroup = tabs.some((t) => t.active);
-    }
+    // Bounded retry (docs/protocol.md's testing-conventions note): a real
+    // concurrent workspace.activated event landing right after POST
+    // /open's own can steal "active tab" away for a moment before the
+    // extension's next reconciliation restores it -- give that a chance
+    // to settle instead of failing on a single, possibly-mid-race sample.
+    const activeTabInGroup = activeGroupAfterOpen
+      ? await pollUntil(async () => {
+          const tabs = await sw.evaluate((groupId) => chrome.tabs.query({ groupId }), activeGroupAfterOpen.id);
+          return tabs.some((t) => t.active);
+        })
+      : false;
+    if (activeGroupAfterOpen) openedGroupTitle = activeGroupAfterOpen.title ?? null;
     record("after POST /open, a tab in the group is the active tab", activeTabInGroup);
 
     // --- Workspace-scoped browser automation: metamux_tab_context end to
@@ -426,10 +432,37 @@ async function main() {
       );
       await sleep(2000);
 
-      const groupsAfterMerge = await sw.evaluate(
+      // Bounded retry, re-nudging: the janitor only re-classifies on a
+      // full `sync` frame (hello, /prune, a groupPlacement/windowPairing
+      // report, or a relevant config change) -- a plain background
+      // workspace event does NOT retrigger it. So a real concurrent
+      // duplicate under this same title (observed live: a run's count
+      // read 3, not the expected 1/2 -- something else created another
+      // group with this title mid-test) won't converge just by waiting
+      // longer; it converges once another sync actually runs. Each retry
+      // below writes a genuinely different config value (diffConfig only
+      // fires pushSyncToAll on an actual change) to force exactly that.
+      let groupsAfterMerge = await sw.evaluate(
         (title) => chrome.tabGroups.query({ title }).then((gs) => gs.length),
         openedGroupTitle,
       );
+      for (let attempt = 0, toggle = false; groupsAfterMerge !== 1 && attempt < 4; attempt++, toggle = !toggle) {
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            createGroups: "on-open",
+            groupBy: "title",
+            janitor: true,
+            collapseOthers: false,
+            closeBehavior: toggle ? "archive" : "close",
+          }),
+        );
+        await sleep(1500);
+        groupsAfterMerge = await sw.evaluate(
+          (title) => chrome.tabGroups.query({ title }).then((gs) => gs.length),
+          openedGroupTitle,
+        );
+      }
       record(
         "janitor merges the duplicate away -- exactly one group with that title remains",
         groupsAfterMerge === 1,
@@ -477,10 +510,34 @@ async function main() {
       );
       await sleep(2000);
 
-      const afterByIdCheck = await sw.evaluate(
+      // Bounded retry, re-nudging: same reasoning as the janitor-merge
+      // check above -- pruning is sync-triggered, not spontaneous. A real
+      // concurrent activation of THIS SAME identity (narrow, but observed
+      // live) can re-add a fresh byId entry via reduceActivated between
+      // our sync and this check; another sync (this identity is still
+      // genuinely unattached in the daemon's registry either way) prunes
+      // it again.
+      let afterByIdCheck = await sw.evaluate(
         (id) => chrome.storage.local.get("metamuxState").then((s) => Boolean(s.metamuxState?.byId?.[id])),
         openedIdentityId,
       );
+      for (let attempt = 0, toggle = false; afterByIdCheck && attempt < 4; attempt++, toggle = !toggle) {
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            createGroups: "on-open",
+            groupBy: "title",
+            janitor: true,
+            collapseOthers: false,
+            closeBehavior: toggle ? "close" : "archive",
+          }),
+        );
+        await sleep(1500);
+        afterByIdCheck = await sw.evaluate(
+          (id) => chrome.storage.local.get("metamuxState").then((s) => Boolean(s.metamuxState?.byId?.[id])),
+          openedIdentityId,
+        );
+      }
       record("byId entry for the closed/detached identity is pruned after the next sync omits it", !afterByIdCheck);
     } else {
       record("pruning assertion (skipped -- no group was created to close)", false, "see POST /open assertions above");

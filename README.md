@@ -1,106 +1,136 @@
 # metamux
 
-The metaharness multiplexer. v1: every cmux workspace gets a tab group in your REAL Chrome
-(real profile, real extensions, real passkeys) that switches in lockstep with the active
-workspace. No focus theft, no syncing, no fork of cmux.
+The metaharness multiplexer. One daemon makes your tmux sessions, cmux tabs, and real-Chrome
+tab groups projections of the same thing: each tmux session gets one cmux tab and one
+color-matched Chrome tab group (your real profile — real extensions, logins, and passkeys),
+all switching in lockstep with where you're working. Agents in any harness (Claude Code,
+Codex, Grok) can see which workspace they're in, put tabs in front of you, and drive their
+own workspace's tabs — never anyone else's.
 
-## QUICKSTART (do these 4 steps)
+## What it actually does
 
-1. **Start the daemon:**
-   ```sh
-   cd ~/Documents/GitHub/metamux && bun run daemon
-   ```
-   You should see `tailing ~/.cmuxterm/events.jsonl ✓` and a seeded workspace count.
+**The core loop.** `metamuxd` (a Bun daemon, zero runtime deps) watches tmux and tails cmux's
+event log into a workspace registry + event bus, then drives two actuators: the cmux CLI
+(tabs) and a Chrome MV3 extension (tab groups over a local WebSocket). Switch cmux tabs and
+the paired Chrome window's visible group follows in ~250ms without stealing focus. Create,
+rename, color, or kill a tmux session and both sides track it.
 
-2. **Load the extension:** Chrome → `chrome://extensions` → enable *Developer mode* (top right)
-   → *Load unpacked* → select `~/Documents/GitHub/metamux/extension`.
+**Groups exist on demand, and clean themselves.** A Chrome group is only born when something
+real opens a tab for its session (`createGroups: "on-open"`) — an agent's `metamux open`, the
+PR-URL hook, a dev-server port, or you. Close a group's last tab and the session detaches
+until something opens there again. A sync-time janitor merges duplicate groups, closes blank
+orphans, and never touches groups it doesn't recognize.
 
-3. **Connect it:** click the metamux extension → *Options* → port `8377`, secret = output of
-   ```sh
-   bun cli/metamux.ts secret
-   ```
-   → Save → *Test connection* (expect `ok`). The daemon terminal prints `extension connected ✓`,
-   and a Chrome window appears with a "metamux" marker tab. That window is yours to place;
-   metamux only manages tab groups inside it.
+**Colors actually match.** Sessions claim colors from an ordered palette whose first nine
+entries use all nine distinct Chrome group colors, so under ten open groups nothing is
+ambiguous; colors free up when groups close. metamux paints each cmux tab with the exact
+Chrome swatch hex its group displays — same color both sides. Set a color yourself in cmux
+and it wins everywhere.
 
-4. **Switch cmux tabs.** The Chrome window's visible tab group follows within ~200ms.
-   `bun cli/metamux.ts open https://example.com` from any cmux shell drops a URL into the
-   current workspace's group.
+**One session, one tab, per-monitor pairs.** tmux partition mode (default) keeps exactly one
+cmux tab per session, spawned in whichever cmux window you're focused on. Chrome windows pair
+1:1 with cmux windows (per-window marker tabs), so two monitors can each run a fullscreen
+cmux + Chrome pair whose tabs correspond — and switching in one pair never disturbs the
+other. Drag a group to another window and metamux records the override instead of fighting you.
 
-Optional layout: append `layout/metamux-dock.lua` to your Hammerspoon config, then
-`hs -c 'metamuxDock()'` tiles cmux left / the paired Chrome window right.
+**Agents are first-class.** Via MCP (wired for Claude Code, Codex, and Grok), any agent gets:
+`metamux_current` / `metamux_workspaces` (where am I, what exists), `metamux_open` (put a URL
+in my group), `metamux_tab_context` (list my tabs), and workspace-scoped browser automation —
+`metamux_browser_snapshot` / `_screenshot` / `_navigate` / `_click` / `_type` via
+chrome.debugger, fenced to the calling workspace's group with a fail-closed SSRF gate
+(`agentBrowser`: off / read / full, default read). A PostToolUse hook in each harness
+auto-opens GitHub PR/compare URLs from any shell output into that session's group. The
+`metamux` skill teaches agents to open their deliverables instead of printing links.
 
-## Zero-command integrations
+**You drive it without commands.** The SwiftBar menubar item (event-driven, no polling) shows
+the active workspace, one-click Focus, open-clipboard-URL, and an Experimental features
+submenu generated from the config — every new flag appears there automatically, applied live
+via hot-reload (~300ms). Ports opened by a workspace's dev servers show as clickable pills
+and can auto-open (guarded: baseline on first sight, ephemeral ports excluded, 2 per cycle).
+Reverse sync (click a Chrome group → cmux switches) is available, default off.
 
-No metamux commands to type -- a button or a hook runs them for you.
+## Setup (once)
 
-- **cmux Dock button**: `layout/dock.json.example` is a ready-to-copy `~/.config/cmux/dock.json`
-  control that focuses the paired Chrome window. Dock controls are seeded panes, not
-  per-click buttons (cmux only re-runs a control's command when its pane is freshly created,
-  e.g. a brand-new workspace/window with no saved Dock snapshot), so treat this as "focus on
-  open" rather than a repeatable menu action -- use the SwiftBar menu bar item below for a
-  real per-click button. Back up any existing `dock.json` before copying this in.
-- **SwiftBar menubar plugin**: `layout/metamux.30s.sh` shows the active workspace title and a
-  dropdown (focus browser, open clipboard URL, toggle reverse sync, status line). Install with
-  `scripts/install-menubar.sh`; re-run it after editing the plugin.
-- **Claude Code URL hook**: `scripts/claude-url-hook.ts` is a `PostToolUse` hook for the `Bash`
-  matcher. When a Bash command's output contains a GitHub PR or compare URL, it opens that URL
-  in the active cmux workspace's Chrome tab group. Wire it up in `~/.claude/settings.json`
-  yourself (this repo doesn't touch that file):
-  ```json
-  {"hooks": {"PostToolUse": [{"matcher": "Bash",
-    "hooks": [{"type": "command", "command": "bun /Users/zachary/Documents/GitHub/metamux/scripts/claude-url-hook.ts"}]}]}}
-  ```
+1. **Daemon**: auto-ensured by `.zshrc` in every cmux shell (`scripts/ensure-daemon.sh`);
+   manual start is `bun run daemon` from a cmux shell (socket features need cmux's env).
+2. **Extension**: `chrome://extensions` → Developer mode → Load unpacked →
+   `~/Documents/GitHub/metamux/extension`. In its Options: port `8377`, secret from
+   `bun cli/metamux.ts secret`, Test connection, Save.
+3. **Harness wiring** (already done on this machine): Claude Code (`claude mcp add` +
+   settings.json hook + `~/.claude/skills/metamux`), Codex (`~/.codex/config.toml` MCP +
+   hook, `~/.codex/skills`), Grok (`grok mcp add`, `~/.grok/hooks/metamux-url-hook.json`,
+   `~/.grok/skills`). Codex/Grok trust-gate user hooks: approve "metamux URL auto-open" once.
 
-## Phase 2 features (also ready)
+## CLI
 
-- **Port auto-open**: when a dev server STARTS in the active workspace (new port appearing
-  while the daemon watches, below 49152, max 2 per cycle), its `http://localhost:PORT` opens
-  in that workspace's group. Config `ports.mode`: `auto` (default) / `notify` / `off` in
-  `~/.config/metamux/config.json`. All ports show as clickable pills in the marker tab.
-- **Reverse sync (default OFF)**: click a tab group in Chrome → cmux switches to that
-  workspace. Enable with `"reverseSync": true` in the config. Echo-suppressed both ways so
-  it cannot loop.
-- **Window follow**: focusing a different cmux window activates that window's selected
-  workspace's group.
-- **`metamux focus`**: explicitly brings the paired Chrome window forward (the only thing
-  allowed to focus it).
-- **MCP server**: `claude mcp add metamux -- bun ~/Documents/GitHub/metamux/cli/metamux.ts mcp`
-  gives any harness `metamux_current` / `metamux_workspaces` / `metamux_open` tools.
-- **Agent skill**: `skills/metamux/SKILL.md`, personal-installable via plugin-builder.
-- **launchd**: `scripts/install-launchd.sh` renders a plist into `~/Library/LaunchAgents`
-  (you run `launchctl load` yourself). Note: under launchd the daemon is tail-only; socket
-  features (ports, reverse sync, window follow) need a daemon started from a cmux shell.
+```
+metamux open <url>     # open in the calling shell's workspace group
+metamux current        # this shell's workspace (JSON)
+metamux focus          # bring the paired Chrome window forward
+metamux status|state   # daemon health / full registry
+metamux config [--json | <key> <value>]   # view/set config, hot-reloads live
+metamux prune          # drop archived workspaces from the registry
+metamux doctor         # replay recent cmux events, show what would happen
+metamux secret|mcp     # extension secret / stdio MCP server
+```
 
-Note: `cmux rpc`-backed features require the daemon to be started from a cmux shell
-(the QUICKSTART's step 1 already does this). The daemon says which mode it's in at startup.
+Config lives at `~/.config/metamux/config.json`; every key is in `metamux config` and the
+menubar. Notables: `groupBy` (title), `createGroups` (on-open), `colorMode` (palette),
+`agentBrowser` (read), `reverseSync` (false), `janitor` (true), `tmux.mirror` (partition),
+`ports.mode` (auto), `pruneArchivedAfterDays` (7).
 
-## What's what
+## Architecture
 
-| Piece | Path | Job |
-|---|---|---|
-| Daemon (`metamuxd`) | `daemon/` | Tails cmux's event log, owns the workspace registry, serves WS+HTTP on 127.0.0.1:8377 |
-| Chrome extension | `extension/` | One tab group per workspace in the metamux window; pure reducer + thin chrome glue |
-| CLI | `cli/metamux.ts` | `open <url>` / `status` / `state` / `secret` / `doctor` |
-| Fake extension | `scripts/fake-extension.ts` | Debugging harness: prints everything the extension would receive |
-| Contract | `docs/protocol.md` | The protocol. Change it first, code second. |
-| PRD | `~/Documents/Obsidian/Vault/Metamux/metamux-prd.md` | Why everything is the way it is |
+```
+  tmux sessions ──┐                                ┌── cmux tabs (create/rename/reap/color)
+                  ├──► metamuxd: registry + bus ───┤
+  cmux events ────┘    (WS/HTTP on 127.0.0.1:8377) ├── Chrome ext: groups, janitor, automation
+                                                   ├── menubar (streamable SwiftBar)
+  MCP / CLI / hooks (all harnesses) ───────────────┘
+```
+
+Contract: `docs/protocol.md` (change it first, code second). History: `BUILD-STATUS.md`.
+Design rationale: the PRD in the Obsidian vault (`Metamux/metamux-prd.md`). Tests:
+`bun test` (~700, TDD); `scripts/e2e-chromium.ts` is a fully isolated real-Chromium e2e
+(own daemon/port/state; note it still tails the real events log, so background cmux
+activity can flake assertions — run when quiet).
 
 ## Debugging
 
-- `bun cli/metamux.ts status` — daemon health, connected clients, last seq.
-- `bun cli/metamux.ts config` — prints the effective config, marking each value `(file)` or
-  `(default)`; `bun cli/metamux.ts config <key> <value>` sets one (e.g. `reverseSync true`,
-  `ports.mode notify`) in `~/.config/metamux/config.json`, restart the daemon to pick it up.
-- `bun cli/metamux.ts doctor` — replays the last 200 real cmux events, shows what would happen.
-- `bun scripts/fake-extension.ts` — watch the event stream live without Chrome.
-- Extension side: the "metamux" marker tab shows connection status; service worker logs in
-  `chrome://extensions` → metamux → *service worker*.
+- Marker tab shows connection status + workspaces; SW console via `chrome://extensions`.
+- `bun scripts/fake-extension.ts` — watch the event stream without Chrome.
+- `metamux doctor`, `metamux status`, `~/.local/state/metamux/daemon.log`.
+- Rollbacks: every activation step (tmux cutover, partition) has a documented rollback in
+  BUILD-STATUS.md.
 
-## Design notes
+## Known gaps (honest list)
 
-- Trigger: `~/.cmuxterm/events.jsonl` tail (auth-free, survives daemon restarts via cursor).
-- `workspace.selected` is debounced 200ms, and a selection within 500ms of a programmatic
-  `workspace.created` (tmux-cmux-sync churn) is suppressed.
-- Chrome `groupId`/`windowId` are never trusted across restarts; groups re-resolve by title.
-- The daemon never focuses Chrome and the extension never focuses the window (hard rule).
+- Reverse sync and detach-on-close watchers are single-window; they don't yet fire for
+  groups living in secondary paired windows.
+- Janitor cross-window recovery doesn't yet distinguish a window-split leftover from a
+  deliberate `placementOverride` on fresh boot (adopt-reality rule pending).
+- Registry accumulates archived refs between prunes (auto-compact covers >7 days).
+- Chrome shows its "debugging this browser" banner during automation operations (API-inherent).
+
+## Future plans
+
+The PRD's roadmap, in order (metamuxd is deliberately a metaharness kernel — sources and
+actuators plug into the same registry/bus):
+
+1. **Env actuator**: each workspace optionally binds an isolated environment (OrbStack /
+   devcontainer / cmux remote workspaces), ports forwarded to the host so the real browser
+   keeps real passkeys.
+2. **Automations (Hermes-style)**: an automation = a registry entry with a trigger — bus
+   subscriptions (cmux/GitHub/Linear/Slack via a webhook feed), a small scheduler, incident
+   dedupe with acknowledge-to-silence, draft-only outward actions (e.g. review-requested →
+   run a review flow → stage a draft, never auto-post).
+3. **Factory workers**: persona workers (lens + harness config + entry/exit events + craft
+   memory) composed into gated pipelines fed by tickets; bounded retry then human handback;
+   responsibility never transfers.
+4. **Chief-of-staff / multiplayer**: a project-scoped standing bot owning shared context
+   (versioned, attributed, redactable memory files) and that project's factory — the
+   metaharness endgame: multiplayer project management and context sharing between users.
+5. **Optional custom shell**: only if cmux's limits ever bite; the kernel, extension, and
+   actuators all carry over by swapping one source adapter.
+
+Personal project by @zjdonhauser, built with Claude. Private until it proves itself.
