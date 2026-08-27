@@ -7,7 +7,7 @@
 // least once. In-memory only (like Gate's pending-select and PortsTracker's
 // dedupe state) -- resets each daemon restart, not persisted to disk.
 
-import type { ActuatorEvent, ActuatorWorkspace } from "./registry.ts";
+import type { ActuatorEvent, ActuatorWorkspace, WorkspaceRef } from "./registry.ts";
 
 export class LazyGroupTracker {
   private attachedAt = new Map<string, string>();
@@ -16,6 +16,21 @@ export class LazyGroupTracker {
    * given id records a timestamp; later calls are no-ops. */
   markAttached(id: string, atIso: string = new Date().toISOString()): void {
     if (!this.attachedAt.has(id)) this.attachedAt.set(id, atIso);
+  }
+
+  /** Seeds attachment from persisted WorkspaceRef.attachedAt timestamps at
+   * daemon startup, so createGroups: "lazy" doesn't re-hide a group the
+   * user already had open just because the daemon restarted (registry.json
+   * survives the restart; this in-memory tracker otherwise wouldn't).
+   * `identityFor` maps each ref to its wire identity (itself in groupBy:
+   * "workspace", its alias in groupBy: "title") -- alias-level attachment
+   * ("any member attached") falls out for free since markAttached is
+   * idempotent and multiple members seeding the same alias id is a no-op
+   * after the first. Refs with attachedAt: null are skipped. */
+  seedFromRefs(refs: WorkspaceRef[], identityFor: (ref: WorkspaceRef) => string): void {
+    for (const ref of refs) {
+      if (ref.attachedAt !== null) this.markAttached(identityFor(ref), ref.attachedAt);
+    }
   }
 
   isAttached(id: string): boolean {

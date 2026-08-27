@@ -17,9 +17,11 @@ import { PortsTracker } from "./ports.ts";
 import { colorFor, Registry, type ActuatorEvent, type WorkspaceRef } from "./registry.ts";
 import { shouldReverseSyncSelect } from "./reverse-sync.ts";
 import { ActuatorServer } from "./server.ts";
+import { SocketHealthMonitor } from "./socket-health.ts";
 import { Tailer } from "./tail.ts";
 
 const PORTS_POLL_INTERVAL_MS = 4000;
+const SOCKET_PROBE_INTERVAL_MS = 30_000;
 
 interface CursorState {
   bootId: string;
@@ -59,21 +61,21 @@ function extractRawIdentity(line: string): { bootId: string | null; seq: number 
   }
 }
 
-function hydrateRegistry(
+export function hydrateRegistry(
   saved: { workspaces: WorkspaceRef[]; activeId: string | null } | null,
   namedSlots: Record<string, string> | null,
 ): Registry {
   const registry = new Registry(namedSlots);
   if (!saved) return registry;
   for (const ref of saved.workspaces ?? []) {
-    // registry.json written before this feature has no cmuxColor field.
-    registry.workspaces.set(ref.id, { ...ref, cmuxColor: ref.cmuxColor ?? null });
+    // registry.json written before these features has no cmuxColor/attachedAt field.
+    registry.workspaces.set(ref.id, { ...ref, cmuxColor: ref.cmuxColor ?? null, attachedAt: ref.attachedAt ?? null });
   }
   registry.activeId = saved.activeId ?? null;
   return registry;
 }
 
-function serializeRegistry(registry: Registry) {
+export function serializeRegistry(registry: Registry) {
   return { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
 }
 
@@ -102,21 +104,55 @@ async function runDaemon(): Promise<void> {
   };
 
   // Socket-gated features (Phase 2): ports watcher, reverse sync, window
-  // follow all need a cmux-spawned shell's env. Probe once at startup.
-  const socketFeaturesEnabled = await cmuxRpc.probeSocketFeatures();
+  // follow all need a cmux-spawned shell's env. Probed at startup, then
+  // kept live: metamuxd is long-lived (zshrc-ensured), so a later cmux
+  // restart must not leave these silently dead for the rest of the
+  // process's life (docs/tmux-port-plan.md §2.7). socketHealth.getState()
+  // is the live source of truth from here on -- every gate below reads it
+  // fresh, not a frozen startup boolean.
+  const initialProbe = await cmuxRpc.probeSocketFeatures();
+  const socketHealth = new SocketHealthMonitor(initialProbe ? "enabled" : "disabled");
   log(
-    socketFeaturesEnabled
+    initialProbe
       ? "socket features enabled ✓"
       : "socket features disabled (start the daemon from a cmux shell to enable)",
   );
 
-  const portsTracker = socketFeaturesEnabled ? new PortsTracker() : undefined;
+  // Tied to the INITIAL probe, not the live state: if the daemon starts
+  // enabled and cmux later restarts, this instance persists and simply
+  // resumes polling once pollPorts() sees socketHealth recover -- no need
+  // to reconstruct it. If the daemon starts disabled (no cmux shell at
+  // all), ports stays unavailable even after a later recovery; the
+  // realistic "cmux restarted under a long-running daemon" case this
+  // round targets always starts enabled.
+  const portsTracker = initialProbe ? new PortsTracker() : undefined;
+
+  // Shared by every socket-dependent call site (reverse sync's
+  // workspace.select, the ports poll's getCurrentWorkspace) so a run of
+  // FAILURE_THRESHOLD consecutive failures trips the breaker exactly once,
+  // regardless of which call site hit it.
+  const reportSocketCallOutcome = (ok: boolean): void => {
+    const transition = socketHealth.recordCallOutcome(ok);
+    if (transition) {
+      log("socket features lost (cmux restarted?); probing for recovery");
+    }
+  };
 
   // groupBy (title-aliasing) and createGroups (lazy inclusion) both live
   // here so main.ts's reverse-sync resolution and server.ts's broadcast/
   // buildSync/getState share the exact same projection state.
   const groupProjection = new GroupProjection(config.groupBy);
   const lazyGroups = new LazyGroupTracker();
+
+  // Seed lazy-inclusion attachment from registry.json's persisted
+  // attachedAt fields -- otherwise every daemon restart would re-hide
+  // every group in createGroups: "lazy" mode until re-activated, and the
+  // extension's offline-archive sync rule would then collapse groups the
+  // user had open. A restart should not reshuffle the browser.
+  {
+    const seedSnapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
+    lazyGroups.seedFromRefs(seedSnapshot.workspaces, (ref) => groupProjection.identityFor(ref, seedSnapshot).id);
+  }
 
   const server = new ActuatorServer({
     port: config.port,
@@ -139,7 +175,7 @@ async function runDaemon(): Promise<void> {
     const snapshot = { workspaces: [...registry.workspaces.values()], activeId: registry.activeId };
     const eligible = shouldReverseSyncSelect({
       reverseSyncEnabled: config.reverseSync,
-      socketFeaturesEnabled,
+      socketFeaturesEnabled: socketHealth.getState() === "enabled",
       requestedId: id,
       activeId: groupProjection.currentActiveIdentity(snapshot),
     });
@@ -149,6 +185,7 @@ async function runDaemon(): Promise<void> {
     const ref = registry.workspaces.get(targetWorkspaceId);
     if (!ref) return;
     const result = await cmuxRpc.selectWorkspace(ref.sourceId);
+    reportSocketCallOutcome(result.ok);
     if (!result.ok) {
       log(`[reverseSync] workspace.select failed for ${ref.title} (${ref.id}): ${result.error}`);
     } else {
@@ -239,7 +276,9 @@ async function runDaemon(): Promise<void> {
   // PortsTracker, and act per config.ports.mode.
   const pollPorts = async (): Promise<void> => {
     if (!portsTracker) return;
+    if (socketHealth.getState() !== "enabled") return;
     const current = await cmuxRpc.getCurrentWorkspace();
+    reportSocketCallOutcome(current !== null);
     if (!current) return;
 
     let targetRef: WorkspaceRef | null = null;
@@ -341,8 +380,14 @@ async function runDaemon(): Promise<void> {
   // Color backfill: set_color/clear_color only appear in the log from
   // whenever the daemon started tailing -- a color set before that never
   // shows up as an event. Ask cmux directly for every workspace's current
-  // custom_color and apply it once, post-seed.
-  if (socketFeaturesEnabled) {
+  // custom_color and apply it once, post-seed. Extracted into a function so
+  // socket-recovery can re-run the same backfill (see trySocketRecovery
+  // below) -- a cmux restart can leave colors set/changed while the socket
+  // was down. Its outcome is NOT reported to the breaker: an empty result
+  // is ambiguous (no workspace has a color set vs. the call failing), so
+  // this call site can't distinguish "healthy but nothing to backfill" from
+  // "unreachable" the way getCurrentWorkspace's null/non-null can.
+  const runColorBackfill = async (): Promise<void> => {
     const colorSeeds = await cmuxRpc.listAllWorkspaceColors();
     const colorEvents: ActuatorEvent[] = [];
     for (const seed of colorSeeds) {
@@ -353,22 +398,41 @@ async function runDaemon(): Promise<void> {
       await persist();
       log(`backfilled ${colorEvents.length} workspace color(s) from cmux`);
     }
-  }
+  };
+  if (initialProbe) await runColorBackfill();
 
   // Live tail from here on.
   tailer.start((lines) => {
     for (const line of lines) {
-      processLine(line, true, socketFeaturesEnabled);
+      processLine(line, true, socketHealth.getState() === "enabled");
     }
     scheduleLivePoll();
     void persist();
   });
 
-  if (socketFeaturesEnabled) {
+  if (initialProbe) {
     portsPollTimer = setInterval(() => {
       void pollPorts();
     }, PORTS_POLL_INTERVAL_MS);
   }
+
+  // Recovery: re-probe every 30s, but only actually make the RPC call while
+  // disabled -- a healthy daemon should never pay for a probe it doesn't
+  // need (docs/tmux-port-plan.md §2.7). Runs unconditionally (not gated on
+  // initialProbe) so it also covers a daemon started outside a cmux shell
+  // entirely, not just the "cmux restarted under a long-lived daemon" case.
+  const trySocketRecovery = async (): Promise<void> => {
+    if (socketHealth.getState() !== "disabled") return;
+    const ok = await cmuxRpc.probeSocketFeatures();
+    const transition = socketHealth.recordProbeOutcome(ok);
+    if (transition) {
+      log("socket features restored ✓");
+      await runColorBackfill();
+    }
+  };
+  const socketProbeTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    void trySocketRecovery();
+  }, SOCKET_PROBE_INTERVAL_MS);
 
   configWatcher.start(applyConfigChanges);
 
@@ -377,6 +441,7 @@ async function runDaemon(): Promise<void> {
     configWatcher.stop();
     if (pendingTimer) clearTimeout(pendingTimer);
     if (portsPollTimer) clearInterval(portsPollTimer);
+    clearInterval(socketProbeTimer);
     await persist();
     server.stop();
     process.exit(0);

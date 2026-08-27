@@ -16,10 +16,13 @@ All components conform to this file. Change this file first, code second.
     "eventsPath": "~/.cmuxterm/events.jsonl",
     "closeBehavior": "archive",        // "archive" | "close"
     "collapseOthers": true,
-    "debounceMs": 200
+    "debounceMs": 200,
+    "groupBy": "title",                // "title" | "workspace" -- see Grouping
+    "createGroups": "lazy"             // "lazy" | "eager" -- see Grouping
   }
   ```
-  All fields optional; defaults above. `~` expansion required.
+  All fields optional; defaults above. `~` expansion required. `ports.*` and `reverseSync` are
+  also valid top-level keys -- see their own sections below.
 
 ## cmux source (input)
 
@@ -51,12 +54,13 @@ interface WorkspaceRef {
   sourceId: string;      // cmux workspace UUID (per-boot stable)
   archived: boolean;
   cmuxColor: string | null;  // resolved "#RRGGBB" hex, or null if never set/cleared
+  attachedAt: string | null; // ISO, set on first activation/open_url -- see Grouping (createGroups: lazy)
   updatedAt: string;     // ISO
 }
 ```
 
 Re-bind on upsert: match by (source, sourceId); else by (title, cwd) among archived+live; else create new.
-`workspace.closed` sets `archived: true` (never delete). `workspace.renamed`/`selected` refresh title/cwd. Selected also sets registry-level `activeId`.
+`workspace.closed` sets `archived: true` (never delete). `workspace.renamed`/`selected` refresh title/cwd. Selected also sets registry-level `activeId` and calls `markAttached` (idempotent, first call wins) on the ref. `activateBySourceId` (window follow) does the same.
 A `colored` event resolves its raw color (hex or named cmux.json slot, via a `namedSlots` table injected into the Registry at construction, read once from `~/.config/cmux/cmux.json`) and sets `cmuxColor` on the matching ref (found by sourceId only -- a color change carries no title/cwd to re-bind against); no-op if the workspace is unknown. Either way, `workspace.upserted` fires so the extension re-applies the group color (it already updates color on `ensureGroup`).
 Startup backfill: `set_color`/`clear_color` only appear in the JSONL log from whenever the daemon started tailing, so a color set earlier never shows up as an event. When socket features are on, right after seeding the daemon asks cmux directly (`cmux rpc window.list` + `workspace.list` per window) for every workspace's current `custom_color` and applies it once via the same path.
 
@@ -98,6 +102,73 @@ When `cmuxColor` is unset (or unresolvable), fall back to a deterministic hash o
   Resolve target: by sourceId if given, else current activeId. 200 `{"ok":true,"workspace":"mw_..."}`; 404 if no target.
 - `GET /status?token=...` → `{"ok":true,"clients":1,"lastSeq":127,"activeId":"mw_...","workspaces":9,"cursor":{...},"skippedLines":0}`
 - `GET /state?token=...` → full registry JSON.
+
+## Grouping: groupBy + createGroups (2026-08-27, afternoon)
+
+Config: `"groupBy": "title" | "workspace"` (default `"title"`), `"createGroups": "lazy" | "eager"`
+(default `"lazy"`). Both hot-reloadable; a change pushes a fresh `sync` frame to every client.
+
+Both live entirely in a wire-projection layer between the Registry and the actuator wire
+(`daemon/src/group-projection.ts`, `daemon/src/lazy-groups.ts`) -- the Registry itself is
+UNCHANGED and keeps full per-workspace fidelity regardless of config. The extension is unaware
+of either: identity ids are opaque to it.
+
+### groupBy: title (alias projection)
+
+Rationale: tmux-cmux-sync mirrors every tmux session into every cmux window, so the registry
+legitimately holds several same-title `WorkspaceRef`s. In `groupBy: "title"`, ALL workspaces
+sharing a title alias to ONE canonical actuator identity before anything reaches the wire:
+
+- **Id scheme**: `"t_" + 8-hex-of-FNV-1a-hash(title)`. Stable regardless of which/how-many real
+  workspaces carry the title.
+- **Activated on ANY member** -> `workspace.activated` for the shared alias.
+- **All-archived rule**: `workspace.archived` for the alias only when every member with that
+  title is archived (or the last member moved away by a rename -- the degenerate empty case).
+  While at least one member is live, the alias stays live even if others archive.
+- **Rename = bucket move**: a member's title change is detected by comparing against the last
+  title seen for that real workspace id. Reports the OLD bucket archived-if-now-empty (per the
+  all-archived rule above) and the NEW bucket's `workspace.upserted`.
+- **Color aggregation**: the first non-null `cmuxColor` among LIVE members (archived members'
+  colors don't leak through), else the alias title's hash -- same fallback rule as a single
+  workspace.
+- **Ports union**: `GET /state` / sync-frame `ports` for an alias is the union (deduped, sorted)
+  of every live member's ports, since one alias can represent several real workspaces.
+- **Dedup**: an unrelated field change on one member that doesn't change the bucket's aggregate
+  (title/color/archived) emits nothing new -- one `workspace.upserted` per actual change, not
+  per member update.
+
+`groupBy: "workspace"` is pass-through: one identity per real workspace, the pre-grouping
+behavior, unchanged.
+
+### createGroups: lazy
+
+An identity (alias id in `groupBy: "title"`, real workspace id in `"workspace"`) is "attached"
+once it's been ACTIVATED or targeted by `open_url` at least once. In `createGroups: "lazy"`:
+- The sync frame's `state.workspaces` and any `workspace.upserted` event only include identities
+  that are the CURRENT active one or have ever been attached. `workspace.activated` and
+  `workspace.archived` always pass through regardless (an archive of something never attached is
+  a harmless no-op for the extension).
+- Prevents 40+ groups materializing on first connect just because the registry has seen that
+  many workspaces historically.
+
+`createGroups: "eager"` includes everything -- the pre-lazy behavior.
+
+Attachment is PERSISTED on `WorkspaceRef.attachedAt` so a daemon restart does not re-hide groups
+the user already had open (the extension's offline-archive sync rule would otherwise collapse
+them the moment lazy mode re-hid their identities -- a restart must not reshuffle the browser).
+Alias-level attachment ("any member attached") falls out of that for free: on daemon start, the
+in-memory lazy tracker is seeded from every ref's persisted `attachedAt`, projected through the
+same `groupBy`-aware identity mapping used everywhere else, so a single attached member seeds
+the whole alias.
+
+### Reverse sync alias resolution
+
+`userActivatedGroup`'s `id` (Wire protocol, above) is a wire identity -- an alias id in
+`groupBy: "title"`, not necessarily a real workspace id. The daemon resolves it before acting:
+- The already-active guard compares against the PROJECTED active identity (the active alias in
+  title mode), not the raw registry `activeId`.
+- The RPC target is resolved via the alias's currently-active member if one exists, else its
+  first live member. `cmux rpc workspace.select` targets that member's `sourceId`.
 
 ## Extension behavior (Chrome MV3)
 

@@ -11,6 +11,7 @@ function ref(overrides: Partial<WorkspaceRef> = {}): WorkspaceRef {
     sourceId: overrides.sourceId ?? "SRC-1",
     archived: overrides.archived ?? false,
     cmuxColor: overrides.cmuxColor ?? null,
+    attachedAt: overrides.attachedAt ?? null,
     updatedAt: overrides.updatedAt ?? new Date().toISOString(),
   };
 }

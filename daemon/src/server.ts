@@ -232,7 +232,8 @@ export class ActuatorServer {
   pushOpenUrl(target: WorkspaceRef, urlStr: string): ActuatorWorkspace {
     const snapshot = this.currentSnapshot();
     const identity = this.groupProjection.identityFor(target, snapshot);
-    this.lazyGroups.markAttached(identity.id);
+    this.registry.markAttached(target.id); // persisted -- survives a restart
+    this.lazyGroups.markAttached(identity.id); // in-memory wire-identity cache for this session
     this.seq++;
     this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr });
     this.log(`[open_url] ${identity.title} (${identity.id}) -> ${urlStr}`);

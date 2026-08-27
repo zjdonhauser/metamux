@@ -21,6 +21,11 @@ export interface WorkspaceRef {
    * (or cleared). Named cmux.json slots are resolved to hex before
    * landing here -- see colors.ts's resolveCmuxColor. */
   cmuxColor: string | null;
+  /** ISO timestamp of the first activation/open_url, or null if never
+   * attached. Persisted (survives a daemon restart) so createGroups:
+   * "lazy" doesn't re-hide a group the user already had open -- see
+   * LazyGroupTracker.seedFromRefs in lazy-groups.ts. */
+  attachedAt: string | null;
   updatedAt: string; // ISO
 }
 
@@ -109,6 +114,7 @@ export class Registry {
       sourceId,
       archived: false,
       cmuxColor: null,
+      attachedAt: null,
       updatedAt: new Date().toISOString(),
     };
     this.workspaces.set(ref.id, ref);
@@ -129,6 +135,15 @@ export class Registry {
     existing.cmuxColor = resolved;
     existing.updatedAt = new Date().toISOString();
     return [{ name: "workspace.upserted", workspace: toActuator(existing) }];
+  }
+
+  /** Marks a workspace attached (idempotent -- the first call for a given
+   * id records the timestamp; later calls are no-ops). Called on
+   * activation (selected, window follow) and when open_url targets a
+   * workspace directly (server.ts). No-op for an unknown id. */
+  markAttached(id: string, atIso: string = new Date().toISOString()): void {
+    const ref = this.workspaces.get(id);
+    if (ref && ref.attachedAt === null) ref.attachedAt = atIso;
   }
 
   /** Apply one parsed cmux workspace event to the registry, returning the
@@ -153,6 +168,7 @@ export class Registry {
 
     if (event.name === "selected") {
       this.activeId = ref.id;
+      this.markAttached(ref.id);
       out.push({ name: "workspace.activated", workspace: toActuator(ref) });
     }
 
@@ -167,6 +183,7 @@ export class Registry {
     const target = this.findBySourceId(sourceId);
     if (!target || this.activeId === target.id) return [];
     this.activeId = target.id;
+    this.markAttached(target.id);
     return [{ name: "workspace.activated", workspace: toActuator(target) }];
   }
 }

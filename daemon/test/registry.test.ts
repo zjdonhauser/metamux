@@ -225,6 +225,55 @@ describe("Registry applyEvent(colored)", () => {
   });
 });
 
+describe("Registry attachedAt persistence", () => {
+  test("a newly created workspace starts with attachedAt: null", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(ref.attachedAt).toBeNull();
+  });
+
+  test("markAttached sets attachedAt on first call", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markAttached(ref.id, "2026-01-01T00:00:00.000Z");
+    expect(ref.attachedAt).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  test("markAttached is idempotent -- the first timestamp wins", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    reg.markAttached(ref.id, "2026-01-01T00:00:00.000Z");
+    reg.markAttached(ref.id, "2026-06-01T00:00:00.000Z");
+    expect(ref.attachedAt).toBe("2026-01-01T00:00:00.000Z");
+  });
+
+  test("markAttached on an unknown id is a no-op, not a throw", () => {
+    const reg = new Registry();
+    expect(() => reg.markAttached("mw_unknown")).not.toThrow();
+  });
+
+  test("a workspace.selected event automatically marks the workspace attached", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    reg.applyEvent(ev("selected", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(typeof ref.attachedAt).toBe("string");
+  });
+
+  test("attachedAt survives a later rename/upsert (never cleared by unrelated updates)", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    reg.applyEvent(ev("selected", "W1", "cmux", "/repo"));
+    const ref = [...reg.workspaces.values()][0]!;
+    const firstAttachedAt = ref.attachedAt;
+    reg.applyEvent(ev("renamed", "W1", "renamed-cmux", "/repo"));
+    expect(ref.attachedAt).toBe(firstAttachedAt);
+  });
+});
+
 describe("Registry.activateBySourceId", () => {
   test("activates a known ref by cmux sourceId and emits workspace.activated", () => {
     const reg = new Registry();
@@ -252,6 +301,14 @@ describe("Registry.activateBySourceId", () => {
     const out = reg.activateBySourceId("unknown");
     expect(out).toEqual([]);
     expect(reg.activeId).toBeNull();
+  });
+
+  test("activating via window follow also marks the workspace attached", () => {
+    const reg = new Registry();
+    reg.applyEvent(ev("created", "W1", "cmux", "/repo"));
+    reg.activateBySourceId("W1");
+    const ref = [...reg.workspaces.values()][0]!;
+    expect(typeof ref.attachedAt).toBe("string");
   });
 
   test("already-active workspace is a no-op (avoids redundant broadcasts)", () => {
