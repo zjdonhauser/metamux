@@ -302,6 +302,38 @@ the new window and the janitor, scoped to that new window only, never saw the ol
 - Not yet activated live: per the task, the supervisor activates this (Zac reloads the extension
   once) -- not performed here, same category of live-environment action as the tmux cutover.
 
+## Color backflow: paint swatch hexes, not brand hexes (2026-08-27)
+
+Zac feedback on the live system: painted cmux tab colors visibly didn't match their Chrome group
+-- we were painting `colorMode: "palette"`'s brand hexes (e.g. `#2779FB`), Chrome renders its own
+fixed swatches for the same `chromeColor` name. Fix: backflow now ALWAYS paints
+`CHROME_GROUP_REPRESENTATIVE_HEX[chromeColor]` (the exact hex `colorMode: "hash"` already used),
+in both colorModes -- `colorMode` only changes which `chromeColor` an identity resolves to, never
+what hex gets painted for it.
+
+- [x] `color-backflow.ts`: dropped the `colorMode === "palette"` branch that used
+      `palette[i].hex`; `targetHex` is now unconditionally the swatch hex.
+- [x] `palette.ts` simplified: `PaletteEntry` drops `hex` (down to `{name, chromeColor}`);
+      `FALLBACK_HEXES` and the `cmux.json` hex-reading deleted entirely (nothing consumes hex
+      anymore); `buildPalette()`/`loadPalette()` are now pure/no-I/O, kept `async` on
+      `loadPalette` only so `main.ts`'s existing `await` call sites didn't need touching. The
+      ordering + first-9-distinct-`chromeColor` property (the only thing that was ever
+      load-bearing for allocation) is untouched.
+- [x] Repaint convergence verified explicitly: a ref with `cmuxColor === paintedColor === ` an old
+      brand hex is NOT user-owned (backflow still recognizes it as its own prior paint) and DOES
+      get repainted to the new swatch-hex target -- exactly what every already-painted live tab
+      looks like the moment this build restarts. Tested at both the `decideBackflow` matrix level
+      and end-to-end through `computeBackflowCandidates`/`planBackflow`, both colorModes.
+- [x] Loop safety unchanged in substance, simplified in practice: the old `colorMode: "palette"`
+      "ownership-echo trap" (an allocated brand hex hue-mapping to a DIFFERENT chromeColor than
+      its own allocation) can't happen anymore -- there's no brand hex left to disagree with
+      anything. `colors.test.ts`'s existing fixed-point test already covers it.
+- [x] `docs/protocol.md` updated: "The palette" (drops hex description), "Color backflow" (new
+      swatch-hex-always framing + why), "Loop safety" (simplified, palette caveat removed).
+- [x] `bun test`: 565 pass, 0 fail. `bunx tsc --noEmit`: clean.
+- Not activated live -- supervisor's call (a daemon restart repaints every backflow-owned tab to
+  the matching swatch hex).
+
 ## Blockers
 
 - tmux absorption live cutover (kill the real tmux-cmux-sync process, edit real `.zshrc`,

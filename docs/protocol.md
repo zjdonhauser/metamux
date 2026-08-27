@@ -526,15 +526,14 @@ projection):
 
 ### The palette (`daemon/src/palette.ts`)
 
-A static, ordered list of `{name, hex, chromeColor}`, built once at daemon startup from Zac's
-real `~/.config/cmux/cmux.json` `workspaceColors.colors` table (via `cmux-config.ts`'s existing
-`loadCmuxNamedColorSlots` reader), falling back to a hardcoded copy of that same table for any
-name the live file is missing. Ordered for maximal pairwise distinguishability going down: the
-first 9 entries use 9 DISTINCT Chrome `tabGroups` colors and 9 visually distinct hexes, so every
-identity gets a genuinely different color for as long as possible; entries 10+ reuse
-`chromeColor`s (Chrome only has 9) but stay hex-distinct, so Color backflow still paints a
-unique cmux tab color even once the visible Chrome group color repeats. Full ordering + rationale
-lives in `palette.ts`'s header comment.
+A static, ordered list of `{name, chromeColor}` -- purely an allocation ORDER now (2026-08-27:
+the per-entry brand hex this list used to also carry was dropped, see Color backflow below for
+why). Ordered for maximal pairwise distinguishability going down: the first 9 entries use 9
+DISTINCT Chrome `tabGroups` colors, so every identity gets a genuinely different color for as
+long as possible; entries 10+ necessarily reuse `chromeColor`s (Chrome only has 9). No I/O left --
+`buildPalette()` is a pure, argument-less copy of the static order; `loadPalette()` stays `async`
+only so its existing `main.ts` call sites don't need to change. Full ordering + rationale lives in
+`palette.ts`'s header comment.
 
 ### Allocation (`daemon/src/palette-allocator.ts`, pure + `Registry.claimPaletteColor`)
 
@@ -577,7 +576,7 @@ separate wire concept, `resolveColor` just changed what feeds it. `GroupProjecti
 `Registry` each hold their own mutable `groupBy`/`colorMode`/palette state (mirrors the existing
 `attachOnActivate` precedent), kept in lockstep by `main.ts` at startup and on hot-reload.
 
-## Color backflow (2026-08-27, palette-aware 2026-08-27)
+## Color backflow (2026-08-27, palette-aware 2026-08-27, swatch-hex-only 2026-08-27)
 
 Paints a cmux tab's own color to match its Chrome group's color, so the two visually agree at a
 glance ("a colored flag that matches the color of the browser tab the cmux tab relates to" --
@@ -585,14 +584,23 @@ Zac). Config: `"colorBackflow": true` (default), hot-reloadable. Socket-gated (n
 workspace-action set-color`); polls every 5s, same unconditional-timer-with-internal-gate shape
 as the tmux poller above.
 
+**The painted hex is ALWAYS `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` for the identity's
+resolved `chromeColor` -- in BOTH `colorMode: "hash"` and `"palette"`.** This replaced an earlier
+design (same day) that painted `colorMode: "palette"`'s own allocated brand hex directly: Zac
+reported the painted cmux tab and its Chrome group visibly didn't match on the live system, even
+though both were nominally the same `chromeColor` -- Chrome renders its 9 `tabGroups` colors from
+its own internal swatches, not from any hex metamux supplies, so a distinct brand hex sharing a
+color NAME with a Chrome swatch still reads as a different color next to it. Painting the swatch
+hex itself is what makes them genuinely match. `palette.ts`'s per-entry hex became fully unused
+by this change and was dropped (see "The palette" above) -- only `chromeColor` (via
+`registry.ts`'s `resolveColor`) matters to backflow now; `colorMode` only ever changes WHICH
+`chromeColor` an identity resolves to, never what hex gets painted for a given one.
+
 **Only acts on a color that isn't the user's.** Backflow never invents a color for an identity
 the user already colored -- for every identity (in `groupBy: "title"`, every member sharing a
 title; in `"workspace"`, the ref itself), if ANY live member has a genuinely user-set `cmuxColor`
 (`cmuxColor !== paintedColor`), that identity is untouched by backflow entirely. Otherwise it
-paints EVERY member's cmux tab (not just one) to the identity's resolved color -- the target hex
-depends on `colorMode`: the allocated palette entry's own hex in `colorMode: "palette"` (once one
-has been claimed; before that, the same Chrome-representative hex as hash mode), or the
-Chrome-representative hex for the title-hash color in `colorMode: "hash"`.
+paints EVERY member's cmux tab (not just one) to the identity's resolved color's swatch hex.
 
 **Never overwrites a user-set color.** `WorkspaceRef.paintedColor` (Registry section, above)
 tracks the hex backflow itself last painted. A ref is eligible for backflow to act on unless it
@@ -612,19 +620,18 @@ does, whether it's reporting the user's action or backflow's own echo).
   event already does -- backflow doesn't change that pipeline at all, it only stops trying to
   paint that one tab.
 
-**Loop safety.** In `colorMode: "hash"`, `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` (all 9
-Chrome colors, including grey) is, by construction, a FIXED POINT of `nearestChromeGroupColor`:
-painting a ref with `CHROME_GROUP_REPRESENTATIVE_HEX[X]` produces a `colored` event that resolves
-back to the same `X` through the daemon's own color pipeline. In `colorMode: "palette"`, an
-allocated brand hex is generally NOT such a fixed point (e.g. Navy's `#152744` hue-maps to
-`"blue"`, but its palette entry's `chromeColor` is `"grey"` by explicit design -- see palette.ts's
-ordering rationale) -- loop safety instead comes entirely from `resolveColor`'s ownership check:
-once a backflow-painted hex round-trips through the tailed `colored` event and `markPainted`
-records the same hex as `paintedColor`, `cmuxColor === paintedColor` holds, step 1 above is
-skipped, and the allocated `chromeColor` stays authoritative regardless of what hue-mapping would
-say. Proven directly in `color-backflow.test.ts`'s "ownership-echo trap" test. Dedupe
-(`already-matches`, above) additionally means a converged identity issues zero `set-color` calls
-per poll, not just "eventually stops."
+**Loop safety.** `colors.ts`'s `CHROME_GROUP_REPRESENTATIVE_HEX` (all 9 Chrome colors, including
+grey) is, by construction, a FIXED POINT of `nearestChromeGroupColor`: painting a ref with
+`CHROME_GROUP_REPRESENTATIVE_HEX[X]` produces a `colored` event that resolves back to the same
+`X` through the daemon's own color pipeline -- proven directly in `colors.test.ts`. This holds
+unconditionally now, in both `colorMode`s, since backflow only ever paints swatch hexes: the
+`colorMode: "palette"` ownership-trap this section used to describe (an allocated brand hex
+hue-mapping to a DIFFERENT color than its own `chromeColor`) can no longer happen -- there's no
+brand hex left to disagree with anything. `resolveColor`'s ownership check
+(`cmuxColor === paintedColor` skips hue-mapping) is still what keeps a genuinely user-set color
+from being reinterpreted, but it's no longer load-bearing for backflow's OWN paint converging
+cleanly the way it was before this change. Dedupe (`already-matches`, above) additionally means a
+converged identity issues zero `set-color` calls per poll, not just "eventually stops."
 
 `WorkspaceRef.paintedColor` is persisted (survives a daemon restart) for the same reason
 `attachedAt` is -- without it, every restart would forget what backflow owns and misclassify
@@ -693,3 +700,44 @@ gathering glue (`extension/test/reducer.test.js` has the fixture coverage for al
 - Pure modules get TDD: parser, registry, reducer(s), tail rotation (temp-file integration).
 - `scripts/fake-extension.ts`: permanent WS client that connects, prints sync + every event human-readably. This is the debugging harness.
 - `metamux doctor`: replays the last 200 real events through the parser+registry and prints what WOULD have happened (no side effects), plus flags selected-within-500ms-of-created clusters.
+
+## Window pairing (partition model, replaces mirroring — 2026-08-27 evening)
+
+Zac's directive: mirroring dies. Each tmux session lives in EXACTLY ONE cmux tab and one
+Chrome group. Chrome windows pair 1:1 with cmux windows (per-monitor fullscreen pairs).
+
+### tmux reconcile: partition mode
+
+- `tmux.mirror` gains value `"partition"` (new DEFAULT). "windows" (mirror) and "global"
+  remain for compatibility but are deprecated.
+- Partition: a session with NO cmux tab spawns ONE tab, in the FOCUSED cmux window
+  (fallback: lowest-index window). A session with tabs in MULTIPLE windows (mirror-era
+  legacy) keeps the most-recently-selected one (fallback lowest window index) and reaps
+  the rest — one-time convergence, then steady-state is one tab each.
+- A session's cmux tab MOVING between windows (user drag / move_to_window) is respected:
+  the ref's window attachment updates; nothing moves it back.
+
+### Chrome window pairing
+
+- Registry tracks per cmux window a paired Chrome window (persisted map cmuxWindowId ->
+  chromeWindowRef, resolved by marker tab: the marker becomes per-window, marker URL
+  carries the cmuxWindowId as a query param, e.g. panel.html?win=<uuid>).
+- A group's HOME window = the Chrome window paired to the cmux window hosting its
+  session's tab. Group creation (on-open) happens in the home window, creating the
+  paired Chrome window on demand (focused:false) if absent.
+- Activation: switching cmux tabs in window W activates/collapses groups ONLY within
+  W's paired Chrome window. Other pairs are untouched (per-monitor independence).
+- `focus_window` focuses the pair of the currently focused cmux window.
+
+### Placement ownership (the non-exclusive part)
+
+- Initial placement = home window. If the user MOVES a group to another Chrome window
+  (observed via tabGroups.onCreated-in-other-window with a managed title while a
+  server-driven move marker is absent), record `placementOverride` on the identity
+  (persisted). Overridden groups: activation still works (targeted by groupId wherever
+  it lives), janitor cross-window recovery SKIPS them, home-window logic ignores them
+  until the user closes the group (override clears with detach).
+- janitorCrossWindow recovery only applies to groups with NO override whose title's
+  home window disagrees with reality AND that were not observed as user-moved (default
+  posture after a fresh boot with no observations: adopt reality as override rather
+  than move things — never fight placement we didn't watch happen).

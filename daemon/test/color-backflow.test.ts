@@ -23,14 +23,12 @@ function ref(overrides: Partial<BackflowRef> = {}): BackflowRef {
   };
 }
 
-// A small fixed palette for tests -- entry 0 deliberately has a chromeColor
-// ("grey") that DISAGREES with what colors.ts's hue-mapping would say for
-// its own hex (nearestChromeGroupColor("#152744") is "blue"), exactly like
-// palette.ts's real Navy entry -- this is what exercises the ownership-echo
-// trap below.
+// A small fixed palette for tests. No hex field (2026-08-27) -- backflow
+// paints CHROME_GROUP_REPRESENTATIVE_HEX for the resolved chromeColor now,
+// never a palette entry's own hex (palette.ts no longer even has one).
 const TEST_PALETTE: PaletteEntry[] = [
-  { name: "Navy", hex: "#152744", chromeColor: "grey" },
-  { name: "Blue", hex: "#2779FB", chromeColor: "blue" },
+  { name: "Navy", chromeColor: "grey" },
+  { name: "Blue", chromeColor: "blue" },
 ];
 
 describe("decideBackflow -- the paint/skip/repaint matrix", () => {
@@ -114,13 +112,33 @@ describe("computeBackflowCandidates -- colorMode: hash (unchanged behavior)", ()
 });
 
 describe("computeBackflowCandidates -- colorMode: palette", () => {
-  test("targetHex is the allocated palette entry's own hex, not a Chrome-representative hex", () => {
+  test("targetHex is the Chrome-representative hex for the allocated entry's chromeColor, never a brand hex (2026-08-27)", () => {
     const refs = [ref({ id: "mw_a", title: "compliance", paletteIndex: 0 })];
     const candidates = computeBackflowCandidates(refs, "title", "palette", TEST_PALETTE);
-    expect(candidates[0]!.identityColor).toBe("grey");
-    expect(candidates[0]!.targetHex).toBe("#152744");
-    // NOT the generic grey swatch backflow would use in hash mode:
-    expect(candidates[0]!.targetHex).not.toBe(CHROME_GROUP_REPRESENTATIVE_HEX.grey);
+    expect(candidates[0]!.identityColor).toBe("grey"); // TEST_PALETTE[0] = Navy, chromeColor "grey"
+    expect(candidates[0]!.targetHex).toBe(CHROME_GROUP_REPRESENTATIVE_HEX.grey);
+  });
+
+  test("colorMode: hash and colorMode: palette paint the IDENTICAL hex for the same resolved chromeColor", () => {
+    // The whole point of this change: the two modes only ever differed in
+    // which chromeColor an identity resolves to, never in what hex gets
+    // painted for a given chromeColor. Pick a hash-mode title guaranteed to
+    // resolve to "grey" (TEST_PALETTE[0]'s chromeColor) by computing it,
+    // rather than guessing a title whose hash happens to land there.
+    let hashTitle = "x";
+    while (colorFor(hashTitle, null) !== "grey") hashTitle += "x";
+
+    const hashCandidate = computeBackflowCandidates([ref({ id: "mw_hash", title: hashTitle })], "title", "hash", [])[0]!;
+    const paletteCandidate = computeBackflowCandidates(
+      [ref({ id: "mw_palette", title: "compliance", paletteIndex: 0 })],
+      "title",
+      "palette",
+      TEST_PALETTE,
+    )[0]!;
+    expect(hashCandidate.identityColor).toBe("grey");
+    expect(paletteCandidate.identityColor).toBe("grey");
+    expect(hashCandidate.targetHex).toBe(paletteCandidate.targetHex); // same swatch hex
+    expect(hashCandidate.targetHex).toBe(CHROME_GROUP_REPRESENTATIVE_HEX.grey);
   });
 
   test("no claim yet (paletteIndex null) falls back to the Chrome-representative hex for the title hash", () => {
@@ -136,39 +154,92 @@ describe("computeBackflowCandidates -- colorMode: palette", () => {
     expect(candidates[0]!.identityColor).toBe("blue"); // hue-mapped from the user's #2779FB
   });
 
-  test(
-    "the ownership-echo trap: painting an allocated hex whose chromeColor DISAGREES with hue-mapping must not " +
-      "flip back on the next tick -- once cmuxColor === paintedColor, resolveColor skips hue-mapping entirely",
-    () => {
-      // Round 1: nothing painted yet -- backflow should want to paint Navy's
-      // allocated hex (#152744, chromeColor "grey").
-      const before = ref({ id: "mw_a", title: "compliance", paletteIndex: 0, cmuxColor: null, paintedColor: null });
-      const candidatesBefore = computeBackflowCandidates([before], "title", "palette", TEST_PALETTE);
-      const decisionBefore = decideBackflow({
-        hasRealColor: candidatesBefore[0]!.hasRealColor,
-        targetHex: candidatesBefore[0]!.targetHex,
-        ref: { cmuxColor: before.cmuxColor, paintedColor: before.paintedColor },
-      });
-      expect(decisionBefore).toEqual({ action: "paint", targetHex: "#152744" });
-      expect(nearestChromeGroupColor("#152744")).toBe("blue"); // confirms the hue-mapping trap is real
+  test("painting the swatch hex converges cleanly: it hue-maps back to the exact allocated chromeColor, no ownership trap possible", () => {
+    // Round 1: nothing painted yet -- backflow wants to paint Navy's
+    // resolved chromeColor's swatch hex (grey's representative, not
+    // Navy's own brand hex -- there is no brand hex anymore).
+    const before = ref({ id: "mw_a", title: "compliance", paletteIndex: 0, cmuxColor: null, paintedColor: null });
+    const candidatesBefore = computeBackflowCandidates([before], "title", "palette", TEST_PALETTE);
+    const targetHex = candidatesBefore[0]!.targetHex;
+    expect(targetHex).toBe(CHROME_GROUP_REPRESENTATIVE_HEX.grey);
+    const decisionBefore = decideBackflow({
+      hasRealColor: candidatesBefore[0]!.hasRealColor,
+      targetHex,
+      ref: { cmuxColor: before.cmuxColor, paintedColor: before.paintedColor },
+    });
+    expect(decisionBefore).toEqual({ action: "paint", targetHex });
+    // Unlike the old brand-hex design, the swatch hex is a PROVEN fixed
+    // point (colors.test.ts) -- painting it can never disagree with the
+    // chromeColor that produced it, so there's no trap left to guard here.
+    expect(nearestChromeGroupColor(targetHex)).toBe("grey");
 
-      // Round 2: the paint round-tripped through the tailed `colored` event
-      // (cmuxColor = "#152744") and markPainted recorded the same hex --
-      // ownership established. The group's resolved color must STAY grey
-      // (the allocated chromeColor), not flip to blue via hue-mapping, and
-      // backflow must now skip it as already-matching.
-      const after = ref({ id: "mw_a", title: "compliance", paletteIndex: 0, cmuxColor: "#152744", paintedColor: "#152744" });
-      const candidatesAfter = computeBackflowCandidates([after], "title", "palette", TEST_PALETTE);
-      expect(candidatesAfter[0]!.identityColor).toBe("grey");
-      expect(candidatesAfter[0]!.hasRealColor).toBe(false); // still ours, not the user's
-      const decisionAfter = decideBackflow({
-        hasRealColor: candidatesAfter[0]!.hasRealColor,
-        targetHex: candidatesAfter[0]!.targetHex,
-        ref: { cmuxColor: after.cmuxColor, paintedColor: after.paintedColor },
-      });
-      expect(decisionAfter).toEqual({ action: "skip", reason: "already-matches" });
-    },
-  );
+    // Round 2: the paint round-tripped through the tailed `colored` event
+    // and markPainted recorded the same hex -- ownership established,
+    // resolved color stays grey, backflow now skips as already-matching.
+    const after = ref({ id: "mw_a", title: "compliance", paletteIndex: 0, cmuxColor: targetHex, paintedColor: targetHex });
+    const candidatesAfter = computeBackflowCandidates([after], "title", "palette", TEST_PALETTE);
+    expect(candidatesAfter[0]!.identityColor).toBe("grey");
+    expect(candidatesAfter[0]!.hasRealColor).toBe(false); // still ours, not the user's
+    const decisionAfter = decideBackflow({
+      hasRealColor: candidatesAfter[0]!.hasRealColor,
+      targetHex: candidatesAfter[0]!.targetHex,
+      ref: { cmuxColor: after.cmuxColor, paintedColor: after.paintedColor },
+    });
+    expect(decisionAfter).toEqual({ action: "skip", reason: "already-matches" });
+  });
+});
+
+describe("repaint convergence: a tab painted before this change (a real brand hex) repaints to the swatch hex", () => {
+  // Simulates exactly what every already-painted live tab looks like right
+  // after this daemon build ships: cmuxColor/paintedColor both still hold
+  // the OLD brand hex (it round-tripped through the tailed `colored` event
+  // before the restart, so it's not "user-owned" -- cmuxColor ===
+  // paintedColor), but the identity's target is now the swatch hex.
+  const OLD_BRAND_HEX = "#152744"; // palette.ts's old Navy entry, now gone
+  const swatchHex = CHROME_GROUP_REPRESENTATIVE_HEX.grey;
+
+  test("decideBackflow treats it as a repaint, not user-owned and not already-matching", () => {
+    const decision = decideBackflow({
+      hasRealColor: false,
+      targetHex: swatchHex,
+      ref: { cmuxColor: OLD_BRAND_HEX, paintedColor: OLD_BRAND_HEX },
+    });
+    expect(decision).toEqual({ action: "paint", targetHex: swatchHex });
+  });
+
+  test("end to end through computeBackflowCandidates + planBackflow: colorMode palette", () => {
+    const refs = [
+      ref({
+        id: "mw_a",
+        sourceId: "cmux-a",
+        title: "compliance",
+        paletteIndex: 0,
+        cmuxColor: OLD_BRAND_HEX,
+        paintedColor: OLD_BRAND_HEX,
+      }),
+    ];
+    const candidates = computeBackflowCandidates(refs, "title", "palette", TEST_PALETTE);
+    expect(candidates[0]!.hasRealColor).toBe(false); // still recognized as ours, not the user's
+    expect(planBackflow(candidates)).toEqual([{ refId: "mw_a", cmuxWorkspaceId: "cmux-a", targetHex: swatchHex }]);
+  });
+
+  test("end to end through computeBackflowCandidates + planBackflow: colorMode hash", () => {
+    // Same shape can happen in hash mode too if a prior daemon build ever
+    // painted a non-swatch hex for any reason -- the convergence isn't
+    // palette-specific.
+    const refs = [
+      ref({ id: "mw_a", sourceId: "cmux-a", title: "compliance", cmuxColor: OLD_BRAND_HEX, paintedColor: OLD_BRAND_HEX }),
+    ];
+    const candidates = computeBackflowCandidates(refs, "title", "hash", []);
+    const target = CHROME_GROUP_REPRESENTATIVE_HEX[colorFor("compliance", null)];
+    expect(planBackflow(candidates)).toEqual([{ refId: "mw_a", cmuxWorkspaceId: "cmux-a", targetHex: target }]);
+  });
+
+  test("once repainted to the swatch hex, the NEXT tick sees already-matches -- convergence is stable, not a loop", () => {
+    const refs = [ref({ id: "mw_a", sourceId: "cmux-a", title: "compliance", paletteIndex: 0, cmuxColor: swatchHex, paintedColor: swatchHex })];
+    const candidates = computeBackflowCandidates(refs, "title", "palette", TEST_PALETTE);
+    expect(planBackflow(candidates)).toEqual([]);
+  });
 });
 
 describe("planBackflow", () => {
@@ -197,9 +268,11 @@ describe("planBackflow", () => {
     expect(planBackflow(candidates)).toEqual([]);
   });
 
-  test("end to end: colorMode palette paints the allocated brand hex", () => {
+  test("end to end: colorMode palette paints the Chrome-representative swatch hex for the allocated chromeColor", () => {
     const refs = [ref({ id: "mw_a", sourceId: "cmux-a", title: "compliance", paletteIndex: 0 })];
     const candidates = computeBackflowCandidates(refs, "title", "palette", TEST_PALETTE);
-    expect(planBackflow(candidates)).toEqual([{ refId: "mw_a", cmuxWorkspaceId: "cmux-a", targetHex: "#152744" }]);
+    expect(planBackflow(candidates)).toEqual([
+      { refId: "mw_a", cmuxWorkspaceId: "cmux-a", targetHex: CHROME_GROUP_REPRESENTATIVE_HEX.grey },
+    ]);
   });
 });

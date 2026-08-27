@@ -15,8 +15,8 @@ function roundTrip(registry: Registry, namedSlots: Record<string, string> | null
 }
 
 const TEST_PALETTE: PaletteEntry[] = [
-  { name: "Navy", hex: "#152744", chromeColor: "grey" },
-  { name: "Blue", hex: "#2779FB", chromeColor: "blue" },
+  { name: "Navy", chromeColor: "grey" },
+  { name: "Blue", chromeColor: "blue" },
 ];
 
 describe("registry persistence round-trip -- attachedAt", () => {

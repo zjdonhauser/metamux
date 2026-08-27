@@ -6,16 +6,20 @@
 // from what we last painted) -- backflow never invents a color for a
 // group the user already colored, it only extends an already-existing
 // color (the title-hash fallback in colorMode: "hash", or the allocated
-// palette entry in colorMode: "palette") outward onto the cmux side.
+// palette entry's chromeColor in colorMode: "palette") outward onto the
+// cmux side.
 //
-// In colorMode: "palette", the hex painted is the SPECIFIC allocated
-// palette.ts entry's hex, not a Chrome-representative hex -- distinct
-// identities land on visually distinct brand colors on the cmux side too,
-// not just on the 9-color Chrome side. registry.ts's resolveColor is what
-// keeps this from fighting with hue-mapping on the next tick: once this
-// hex round-trips through the tailed `colored` event and paintedColor
-// catches up to match it (registry.ts's markPainted), cmuxColor ===
-// paintedColor holds and hue-mapping is skipped for this ref from then on.
+// The hex painted is ALWAYS the Chrome-representative hex for the
+// identity's resolved chromeColor (colors.ts's
+// CHROME_GROUP_REPRESENTATIVE_HEX), in BOTH colorMode: "hash" and
+// "palette" -- never a palette entry's own brand hex (2026-08-27, Zac
+// feedback on the live system: a painted brand hex visibly didn't match
+// Chrome's own fixed swatch rendering for the same chromeColor, since
+// Chrome renders its 9 tabGroups colors from its own internal swatches,
+// not from any hex metamux supplies. Painting the swatch hex itself is
+// what makes the colors genuinely match, not just share a color NAME).
+// palette.ts's per-entry hex is unused by backflow as of this change --
+// only chromeColor (via registry.ts's resolveColor) matters here.
 //
 // No I/O -- daemon/src/main.ts's poll loop is the thin wrapper that reads
 // the registry, calls this, and executes the resulting actions via
@@ -48,11 +52,11 @@ export interface BackflowCandidate {
    * (registry.ts's resolveColor -- same precedence the wire protocol
    * uses). */
   identityColor: ChromeGroupColor;
-  /** The hex backflow should paint if it decides to act at all: the
-   * allocated palette entry's hex when one is held in colorMode:
-   * "palette", else the Chrome-representative hex for identityColor (the
-   * entire behavior in colorMode: "hash", and palette mode's own
-   * fallback before an identity has attached/claimed one). */
+  /** The hex backflow should paint if it decides to act at all: ALWAYS
+   * the Chrome-representative hex for identityColor (colors.ts's
+   * CHROME_GROUP_REPRESENTATIVE_HEX) -- same in both colorMode: "hash"
+   * and "palette", so the painted tab genuinely matches what Chrome
+   * renders for that chromeColor, not just shares its name. */
   targetHex: string;
   /** Whether identityColor came from a real, user-set cmuxColor (true) --
    * decideBackflow only acts when this is false, regardless of
@@ -67,10 +71,12 @@ export interface BackflowCandidate {
  * group's color exactly the way group-projection.ts's computeBucketIdentity
  * does (registry.ts's resolveColor, colorMode-aware) -- so backflow's
  * notion of "the Chrome group's color" always matches what the extension
- * is actually showing. Archived refs and tmux-sourced refs (nothing to
- * paint via `cmux workspace-action` for a tmux session id) are excluded.
- * Pure: same refs + groupBy + colorMode + palette, same candidates, every
- * time. */
+ * is actually showing. `palette` is still needed here even though its
+ * hexes are unused (see the file header): resolveColor needs each entry's
+ * chromeColor to resolve a "palette" mode identity's color at all. Archived
+ * refs and tmux-sourced refs (nothing to paint via `cmux workspace-action`
+ * for a tmux session id) are excluded. Pure: same refs + groupBy +
+ * colorMode + palette, same candidates, every time. */
 export function computeBackflowCandidates(
   refs: BackflowRef[],
   groupBy: "title" | "workspace",
@@ -102,8 +108,7 @@ export function computeBackflowCandidates(
       colorMode,
       palette,
     );
-    const allocatedHex = colorMode === "palette" && palettePicked ? palette[palettePicked.paletteIndex!]?.hex : undefined;
-    const targetHex = allocatedHex ?? CHROME_GROUP_REPRESENTATIVE_HEX[identityColor];
+    const targetHex = CHROME_GROUP_REPRESENTATIVE_HEX[identityColor];
 
     for (const ref of members) {
       out.push({
