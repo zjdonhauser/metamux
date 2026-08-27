@@ -518,3 +518,10 @@ identity there is cmux-sourced) both stayed green through every change.
   config's next restart/reload now defaults to `"partition"` and performs a one-time multi-window
   convergence reap against real state; needs Zac watching when it happens, same category as the
   tmux cutover itself.
+
+## Final activation (2026-08-27 ~19:05 UTC)
+
+Partition convergence activated live: 6 mirror-era duplicate tabs reaped, verified 7 tmux
+sessions = 7 cmux tabs (window 0: 6, window 1: 1), all tmux clients alive. README rewritten
+to current reality + future roadmap. Remaining user step: ONE extension reload activates
+window pairing + automation + all extension-side work. Known gaps listed in README.
