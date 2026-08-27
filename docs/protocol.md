@@ -21,14 +21,15 @@ All components conform to this file. Change this file first, code second.
     "createGroups": "on-open",         // "on-open" | "on-activate" | "eager" -- see Grouping
     "tmux": {                          // see "tmux source + cmux actuator" below
       "enabled": false,
-      "mirror": "windows",             // "windows" | "global"
+      "mirror": "partition",           // "partition" (default) | "windows" | "global" (deprecated)
       "alphabetize": true,
       "reattachGraceMs": 8000,
       "spawnCwd": "~/Documents/GitHub"
     },
     "colorBackflow": true,             // see "Color backflow" below
     "pruneArchivedAfterDays": 7,       // 0 = off -- see "Registry compaction" below
-    "colorMode": "palette"             // "palette" | "hash" -- see "Palette allocation" below
+    "colorMode": "palette",            // "palette" | "hash" -- see "Palette allocation" below
+    "agentBrowser": "read"             // "off" | "read" | "full" -- see "Workspace-scoped browser automation" below
   }
   ```
   All fields optional; defaults above. `~` expansion required. `ports.*`, `reverseSync`,
@@ -502,8 +503,10 @@ problem.
 
 ### Config
 
-`"tmux": {"enabled": false, "mirror": "windows"|"global", "alphabetize": true,
+`"tmux": {"enabled": false, "mirror": "partition"|"windows"|"global", "alphabetize": true,
 "reattachGraceMs": 8000, "spawnCwd": "~/Documents/GitHub"}`. All five keys hot-reloadable.
+`"partition"` is the default (see "Window pairing" below); `"windows"`/`"global"` remain for
+compatibility but are deprecated.
 Toggling `tmux.enabled` false->true live triggers the same one-time migration a fresh startup
 gets (below), not just a resume.
 
@@ -710,12 +713,129 @@ gathering glue (`extension/test/reducer.test.js` has the fixture coverage for al
   in-window janitor's own FOREIGN classification -- cross-window recovery only ever acts on
   titles the daemon actually manages.
 
+## Workspace-scoped browser automation (2026-08-27)
+
+Lets an agent (via the metamux MCP server) drive the CALLING workspace's own Chrome tab -- read
+its content, screenshot it, navigate it, click and type into it -- scoped strictly to that
+workspace's own tab group. Real Chrome 136+ blocks external CDP connections (Playwright, `--
+remote-debugging-port`) on the user's real profile; the `chrome.debugger` EXTENSION API is
+exempt, so the metamux extension itself is the automation actuator, reached through the daemon's
+existing WS connection to it, exposed as new MCP tools.
+
+### Config: `agentBrowser`
+
+`"off" | "read" | "full"`, default `"read"`, allowlisted (`config-cli.ts`), hot-reloadable. `"off"`
+refuses every automation op. `"read"` allows `metamux_tab_context` / `metamux_browser_snapshot` /
+`metamux_browser_screenshot`. `"full"` adds `metamux_browser_navigate` / `_click` / `_type` --
+real mouse/keyboard input and navigation on the user's live, cookied browser, so it's opt-in above
+the default. Enforced once, server-side (`automation-policy.ts`'s pure `toolAllowed(opKind,
+mode)`), in `POST /automation`, before a disallowed op ever reaches the extension.
+
+### MCP tools (`daemon/src/mcp-server.ts`)
+
+- `metamux_tab_context` -- list the calling workspace's group tabs (id/url/title/active). No
+  `chrome.debugger` involved at all (just `chrome.tabs.query`) -- works under `"read"` and needs
+  no new browser permission beyond what metamux already has.
+- `metamux_browser_snapshot` -- a compact, agent-readable list of interactive elements (link/
+  button/input/etc.) in the workspace's active tab, each with a stable `ref`, tag, role, and
+  visible text (see "Element refs" below).
+- `metamux_browser_screenshot` -- a PNG of the active tab, returned as an MCP `image` content
+  block (`McpToolContent.content` now accepts `{type:"image", data, mimeType}` alongside `text`).
+- `metamux_browser_navigate` -- `Page.navigate`, gated by the SSRF check below.
+- `metamux_browser_click` -- click an element by a `ref` from a prior snapshot.
+- `metamux_browser_type` -- `Input.insertText` into whatever currently has focus -- click a field
+  first with `metamux_browser_click` to focus it; `_type` does not itself click anything.
+
+Every automation tool accepts an optional `workspaceId` (metamux's own `mw_...` id) and, for the
+browser tools, an optional `tabId` (defaults to the group's active tab). **Workspace resolution**
+(`mcp-server.ts`'s `resolveAutomationWorkspaceId`): explicit `workspaceId` arg wins; else, if this
+MCP server process inherited `$CMUX_WORKSPACE_ID` from its spawning shell (a cmux sourceId, not
+metamux's own id -- resolved to the matching `mw_` id via `GET /state`), that; else the request
+omits `workspaceId` and `POST /automation` falls back to the daemon's own `activeId` server-side.
+**Caveat, not verified this round**: whether a spawned MCP server process actually inherits
+`$CMUX_WORKSPACE_ID` varies by launching harness -- the chain above is best-effort, not guaranteed
+for every caller.
+
+### Wire: `POST /automation` + `automationRequest`/`automationResponse` WS frames
+
+`POST /automation` body: `{token, workspaceId?, op: {kind, ...}}`. Server-side
+(`server.ts`'s `handleAutomation`): auth -> `agentBrowser` gate -> resolve the target ref
+(`workspaceId` else `activeId`; 404 if neither resolves) -> for `op.kind === "navigate"`, the SSRF
+gate (below) -> if the check passes, resolve the ref's WIRE identity (`groupProjection.identityFor`
+-- the extension's `byId` is keyed by identity, not the real ref id) -> if no extension client is
+currently connected, an IMMEDIATE `503` (never a 15s wait for a peer that isn't there) -> send
+`{type:"automationRequest", id, identityId, op}` over the WS to the extension client, and await
+its `{type:"automationResponse", id, ok, result|error}` by `id`
+(`automation-rpc.ts`'s `PendingRequestTable`: a pure-ish, injected-scheduler correlation map, same
+shape as `gate.ts`/`ports.ts` -- `register(id, timeoutMs)` returns the promise the endpoint awaits,
+`resolveRequest`/`rejectRequest` settle it by id, an unanswered request rejects on its own after
+15s). The daemon tracks the MOST RECENTLY connected `client: "extension"` socket
+(`ActuatorServer.extensionSocket`) and sends only to it -- a raw broadcast would also reach a
+non-extension test client (`fake-extension.ts`-style) that could never answer.
+
+### Extension: `automation.js` (thin, `chrome.debugger`-driven)
+
+`sw.js` intercepts an incoming `automationRequest` frame BEFORE `dispatch()` -- this is a
+request/response op, not a state fact, so it never touches the pure reducer, same as the janitor
+group-enumeration enrichment already bypasses it for its own I/O. `resolveTarget` (pure, TDD'd in
+`extension/test/automation.test.js`) is the scoping enforcement: refuses if the identity has no
+live group (`byId[identityId].groupId == null`), the group has no tabs, or an explicit `tabId`
+isn't actually among that group's tabs -- a `tabId` belonging to a DIFFERENT identity's group is
+never found, since the caller only ever passes the ONE group's tab list being resolved. The daemon
+already resolved `workspaceId` -> identity before sending; the extension re-checks independently
+rather than trusting the frame -- belt and suspenders, cheap on both sides.
+
+**Debugger lifecycle**: `chrome.debugger.attach` per request, `detach` in a `finally` (covers
+both success and a thrown error) -- never left dangling. While attached, Chrome shows its own "metamux is debugging this browser" infobar on the target tab; it clears automatically on detach.
+**Not verified this round** (couldn't observe live without a real automation call landing on a
+tab mid-session): the exact infobar wording/behavior across repeated attach/detach cycles in quick
+succession.
+
+**Element refs** (`snapshot`/`click`): one injected `Runtime.evaluate` serializer walks a fixed
+selector (`a[href], button, input, textarea, select, [role=button/link/textbox], [onclick],
+[tabindex]`), skips zero-size (hidden) elements, and stamps each surviving one with a
+`data-metamux-ref` DOM attribute plus a `{ref, tag, role, text}` snapshot entry. `click` resolves
+`ref` -> coordinates at CLICK TIME, via a second `Runtime.evaluate` that re-queries the DOM
+attribute and reads `getBoundingClientRect()` fresh -- deliberately NOT storing coordinates at
+snapshot time, since the page can scroll/reflow between snapshot and click and a stale coordinate
+click is the real failure mode. A full accessibility-tree (`Accessibility.getFullAXTree`)
+correlation was considered and rejected as more CDP-domain plumbing for no agent-readability gain
+over the DOM-attribute-ref approach here.
+
+### SSRF gate for `navigate` (`daemon/src/navigate-gate.ts`, pure)
+
+An agent driving the user's real, cookied Chrome profile must never be able to read an internal
+host through those cookies. `decideNavigate(url, observedLocalhostPorts, resolvedIps)`:
+
+1. Scheme must be `http`/`https` -- `file:`, `chrome:`, `chrome-extension:`, etc. are always
+   blocked regardless of host.
+2. A loopback hostname (`localhost`/`127.0.0.1`/`::1`) is allowed ONLY on a port in
+   `observedLocalhostPorts` -- the TARGET WORKSPACE's own `PortsTracker.portsFor(sourceId)`
+   (`server.ts`'s I/O wrapper, `decideNavigateForTarget`), so a dev server the human is already
+   running in that workspace stays reachable without opening loopback access to every other
+   workspace's automation calls.
+3. Any other hostname: a real DNS lookup (`node:dns/promises`'s `lookup(hostname, {all:true})`)
+   resolves it, and every resulting IP must be public -- blocking if ANY resolved IP is
+   private/reserved defends against DNS rebinding (a hostname that resolves differently between
+   this check and the browser's own later lookup). Covers RFC 1918 (`10/8`, `172.16/12`,
+   `192.168/16`), loopback, link-local (`169.254/16`, which covers the `169.254.169.254` cloud
+   metadata address), CGNAT (`100.64/10`), reserved/multicast ranges, and their IPv6 equivalents
+   (`::1`, `fe80::/10`, `fc00::/7` unique-local, `::ffff:`-mapped v4 unwrapped and re-checked). An
+   EMPTY resolved-IP list (DNS resolution itself failed) fails CLOSED, not open.
+
+**Known limitation, not built this round**: a permitted URL can itself `Location:`-redirect to an
+internal host post-navigate -- this gate only checks the URL handed to it, not every hop a
+redirect chain might take. Catching that needs the CDP `Network` domain's request-intercept
+(`Fetch.enable` + pausing on `Network.requestWillBeSent`), out of scope here.
+
 ## Testing conventions
 
 - Runner: `bun test` (workspace root `bunfig.toml` not required; tests live in `daemon/test/*.test.ts` and `extension/test/*.test.js`).
 - Pure modules get TDD: parser, registry, reducer(s), tail rotation (temp-file integration).
 - `scripts/fake-extension.ts`: permanent WS client that connects, prints sync + every event human-readably. This is the debugging harness.
 - `metamux doctor`: replays the last 200 real events through the parser+registry and prints what WOULD have happened (no side effects), plus flags selected-within-500ms-of-created clusters.
+- `extension/chain.js` (`chainStep`): the pure sequencing primitive behind `sw.js`'s `dispatchChain` (serializes WS message dispatch so one message's ops finish before the next starts) -- isolates a rejecting task's failure (logged, dropped) instead of letting it propagate, since `.then(task)` on an already-rejected promise skips `task` forever after the first failure. `sw.js` itself has top-level `chrome.*`/`boot()` side effects and isn't unit-testable directly; this is why the resilience logic lives in its own chrome-free module with `extension/test/chain.test.js` covering it in isolation.
+- `scripts/e2e-chromium.ts` forwards the extension service worker's own console output (and uncaught exceptions) to this script's stdout -- MV3 SW errors otherwise only show up in `chrome://extensions`, invisible to a scripted run.
 
 ## Window pairing (partition model, replaces mirroring — 2026-08-27 evening)
 
@@ -794,3 +914,19 @@ Chrome group. Chrome windows pair 1:1 with cmux windows (per-monitor fullscreen 
   An EXISTING `tmux.enabled: true` config with no explicit `tmux.mirror` key, however, picks up
   `"partition"` on its next daemon restart (or the next `TMUX_CMUX_MIRROR`-unset config reload)
   — see BUILD-STATUS.md for the runbook and why this daemon half stops short of activating it.
+
+### Contract correction: `cmuxWindowId` on the wire (2026-08-27, extension-half prep)
+
+The wire additions above (Wire protocol section) originally spread only `homeChromeWindowId` and
+`placementOverride` onto sync/state workspace objects and `open_url`, following the `ports`
+pattern exactly. That's a dead end for bootstrapping: `homeChromeWindowId` is null until a Chrome
+pairing already exists, and a pairing can only be ESTABLISHED by the extension creating a
+per-window marker tab at `panel.html?win=<cmuxWindowId>` — which requires knowing the cmux
+window's uuid first. With no field ever carrying that uuid, the extension has no way to learn it,
+so `windowPairings` can never be populated and the whole feature is dead on arrival.
+
+Fix: `cmuxWindowId` (the raw id backing `homeChromeWindowId`, same representative-member
+resolution) is now ALSO spread onto every sync/state workspace object and `open_url` event,
+alongside `homeChromeWindowId`/`placementOverride`. `null` under the same conditions as
+`homeChromeWindowId` (legacy windows/global-mode sessions, cmux-sourced refs). This is what the
+extension half actually reads to know which cmux window a group's session lives in.

@@ -19,7 +19,7 @@ export interface JsonRpcResponse {
 }
 
 export interface McpToolContent {
-  content: { type: "text"; text: string }[];
+  content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[];
   isError?: boolean;
 }
 
@@ -52,6 +52,97 @@ export const METAMUX_MCP_TOOLS: McpTool[] = [
         workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the active workspace" },
       },
       required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_tab_context",
+    description:
+      "List the open tabs in the calling workspace's own Chrome tab group: id, url, title, and which one is active. " +
+      "Read-only, no new browser permissions used. Scoped strictly to the calling workspace -- never any other group.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_browser_snapshot",
+    description:
+      "Get a compact, agent-readable snapshot of the calling workspace's active browser tab: interactive elements " +
+      "(links, buttons, inputs, ...) each with a stable `ref`, tag, role, and visible text. Pass a ref from this " +
+      "snapshot to metamux_browser_click. Requires agentBrowser: read or full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        tabId: { type: "number", description: "specific tab id within the workspace's group; defaults to its active tab" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_browser_screenshot",
+    description:
+      "Capture a PNG screenshot of the calling workspace's active browser tab, returned as an image content block. " +
+      "Requires agentBrowser: read or full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        tabId: { type: "number", description: "specific tab id within the workspace's group; defaults to its active tab" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_browser_navigate",
+    description:
+      "Navigate the calling workspace's active browser tab to a URL. http/https only -- internal/private/loopback " +
+      "hosts are blocked (a loopback URL is allowed only on a port metamux's own port watcher has actually observed " +
+      "in this workspace). Requires agentBrowser: full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "http/https URL to navigate to" },
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        tabId: { type: "number", description: "specific tab id within the workspace's group; defaults to its active tab" },
+      },
+      required: ["url"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_browser_click",
+    description:
+      "Click an element in the calling workspace's active browser tab, by the `ref` a prior metamux_browser_snapshot " +
+      "returned for it. Requires agentBrowser: full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ref: { type: "string", description: "an element ref from a recent metamux_browser_snapshot call" },
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        tabId: { type: "number", description: "specific tab id within the workspace's group; defaults to its active tab" },
+      },
+      required: ["ref"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "metamux_browser_type",
+    description:
+      "Type text into whatever element currently has focus in the calling workspace's active browser tab -- click " +
+      "the target field first with metamux_browser_click. Requires agentBrowser: full.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "text to type" },
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        tabId: { type: "number", description: "specific tab id within the workspace's group; defaults to its active tab" },
+      },
+      required: ["text"],
       additionalProperties: false,
     },
   },
@@ -150,6 +241,50 @@ async function fetchState(options: HttpBridgeOptions): Promise<{ activeId: strin
   };
 }
 
+/** Workspace resolution for automation tools: explicit `args.workspaceId`
+ * wins; else, when this MCP server process inherited a shell's
+ * $CMUX_WORKSPACE_ID (a cmux sourceId, NOT metamux's own mw_ id), resolve
+ * it to the matching mw_ id via GET /state; else undefined, and POST
+ * /automation falls back to the daemon's own activeId server-side. NOTE:
+ * whether a spawned MCP server actually inherits CMUX_WORKSPACE_ID varies
+ * by harness/launcher -- this chain is best-effort, not guaranteed (see
+ * the build report). */
+async function resolveAutomationWorkspaceId(args: Record<string, unknown>, options: HttpBridgeOptions): Promise<string | undefined> {
+  const explicit = typeof args.workspaceId === "string" ? args.workspaceId : null;
+  if (explicit) return explicit;
+
+  const envSourceId = process.env.CMUX_WORKSPACE_ID;
+  if (!envSourceId) return undefined;
+
+  const raw = await bridgeGet("/state", options);
+  const rawWorkspaces = (raw.workspaces as Record<string, unknown>[]) ?? [];
+  const match = rawWorkspaces.find((w) => w.sourceId === envSourceId);
+  return typeof match?.id === "string" ? match.id : undefined;
+}
+
+/** POSTs one automation op and returns its result, or throws with the
+ * daemon's own error message (unauthorized / disallowed by agentBrowser /
+ * no extension connected / op-level failure -- all surfaced the same way,
+ * createRouter's tools/call catch turns any thrown error into isError
+ * content). */
+async function postAutomation(
+  options: HttpBridgeOptions,
+  op: Record<string, unknown>,
+  workspaceId: string | undefined,
+): Promise<unknown> {
+  const f = options.fetchImpl ?? fetch;
+  const res = await f(`http://127.0.0.1:${options.port}/automation`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token: options.token, workspaceId, op }),
+  });
+  const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok || body.ok !== true) {
+    throw new Error(typeof body.error === "string" ? body.error : `automation request failed: ${res.status}`);
+  }
+  return body.result;
+}
+
 /** The real tool handlers: bridge each MCP tool to the daemon's HTTP API. */
 export function createHttpToolHandlers(options: HttpBridgeOptions): Record<string, ToolHandler> {
   return {
@@ -203,6 +338,53 @@ export function createHttpToolHandlers(options: HttpBridgeOptions): Record<strin
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`daemon returned ${res.status}: ${JSON.stringify(body)}`);
       return { content: [{ type: "text", text: JSON.stringify(body) }] };
+    },
+
+    metamux_tab_context: async (args) => {
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const result = await postAutomation(options, { kind: "tabContext" }, workspaceId);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+
+    metamux_browser_snapshot: async (args) => {
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const tabId = typeof args.tabId === "number" ? args.tabId : undefined;
+      const result = await postAutomation(options, { kind: "snapshot", tabId }, workspaceId);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+
+    metamux_browser_screenshot: async (args) => {
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const tabId = typeof args.tabId === "number" ? args.tabId : undefined;
+      const result = (await postAutomation(options, { kind: "screenshot", tabId }, workspaceId)) as { imageBase64: string };
+      return { content: [{ type: "image", data: result.imageBase64, mimeType: "image/png" }] };
+    },
+
+    metamux_browser_navigate: async (args) => {
+      const url = typeof args.url === "string" ? args.url : null;
+      if (!url) throw new Error("url is required");
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const tabId = typeof args.tabId === "number" ? args.tabId : undefined;
+      const result = await postAutomation(options, { kind: "navigate", url, tabId }, workspaceId);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+
+    metamux_browser_click: async (args) => {
+      const ref = typeof args.ref === "string" ? args.ref : null;
+      if (!ref) throw new Error("ref is required");
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const tabId = typeof args.tabId === "number" ? args.tabId : undefined;
+      const result = await postAutomation(options, { kind: "click", ref, tabId }, workspaceId);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    },
+
+    metamux_browser_type: async (args) => {
+      const text = typeof args.text === "string" ? args.text : null;
+      if (text === null) throw new Error("text is required");
+      const workspaceId = await resolveAutomationWorkspaceId(args, options);
+      const tabId = typeof args.tabId === "number" ? args.tabId : undefined;
+      const result = await postAutomation(options, { kind: "type", text, tabId }, workspaceId);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     },
   };
 }

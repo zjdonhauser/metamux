@@ -423,6 +423,7 @@ async function runDaemon(): Promise<void> {
       registry.colorMode = newConfig.colorMode;
       groupProjection.setColorMode(newConfig.colorMode);
     }
+    if (changes.some((c) => c.hotApplicable && c.key === "agentBrowser")) config.agentBrowser = newConfig.agentBrowser;
 
     if (extensionAffected) server.pushSyncToAll();
   };

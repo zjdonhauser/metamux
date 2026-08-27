@@ -10,6 +10,8 @@
 import { initialState, reduce } from "./reducer.js";
 import * as chromeOps from "./chrome-ops.js";
 import * as ws from "./ws.js";
+import { executeAutomation } from "./automation.js";
+import { chainStep } from "./chain.js";
 
 const HEARTBEAT_ALARM = "metamux-heartbeat";
 const HEARTBEAT_PERIOD_MINUTES = 0.5;
@@ -23,11 +25,17 @@ let dispatchChain = null;
 
 /**
  * Serializes dispatches so ops from one message always finish (including
- * their follow-up local facts) before the next message is processed.
+ * their follow-up local facts) before the next message is processed. Uses
+ * chain.js's chainStep (see its own doc comment) so one bad message's
+ * dispatchNow rejection is isolated -- logged and dropped -- rather than
+ * permanently poisoning dispatchChain for every message after it, the same
+ * way executeOps already isolates one bad op from the rest of its batch.
  * @param {import("./reducer.js").Msg} msg
  */
 function dispatch(msg) {
-  dispatchChain = (dispatchChain ?? Promise.resolve()).then(() => dispatchNow(msg));
+  dispatchChain = chainStep(dispatchChain, () => dispatchNow(msg), (err) => {
+    console.error("[metamux] dispatch failed, message dropped:", msg, err);
+  });
   return dispatchChain;
 }
 
@@ -91,6 +99,23 @@ async function boot() {
         const foreignJanitorGroups = allGroups.filter((g) => g.windowId !== windowId);
         msg = { ...msg, janitorGroups, foreignJanitorGroups };
       }
+
+      // Workspace-scoped browser automation (docs/protocol.md): a
+      // request/response op, not a state fact -- handled directly here
+      // rather than through reduce()/executeOps, same as the janitor
+      // enrichment above bypasses the reducer for its own I/O. The
+      // reducer stays untouched by this feature entirely.
+      if (msg && msg.type === "automationRequest") {
+        const { id, identityId, op } = msg;
+        try {
+          const result = await executeAutomation(state.byId, identityId, op);
+          ws.send({ type: "automationResponse", id, ok: true, result });
+        } catch (err) {
+          ws.send({ type: "automationResponse", id, ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+        return;
+      }
+
       dispatch(msg);
     },
     onStatus: (status) => {

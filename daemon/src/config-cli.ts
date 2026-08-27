@@ -24,6 +24,7 @@ export const CONFIG_ALLOWED_KEYS = [
   "colorBackflow",
   "pruneArchivedAfterDays",
   "colorMode",
+  "agentBrowser",
 ] as const;
 
 export type ConfigKey = (typeof CONFIG_ALLOWED_KEYS)[number];
@@ -103,6 +104,10 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
       return value === "palette" || value === "hash"
         ? { ok: true }
         : { ok: false, error: `${key} must be "palette" or "hash"` };
+    case "agentBrowser":
+      return value === "off" || value === "read" || value === "full"
+        ? { ok: true }
+        : { ok: false, error: `${key} must be "off", "read", or "full"` };
   }
 }
 

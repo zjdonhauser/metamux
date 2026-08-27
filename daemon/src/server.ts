@@ -8,11 +8,17 @@
 // a client. The Registry itself never sees either concern.
 
 import type { Server, ServerWebSocket } from "bun";
+import { lookup } from "node:dns/promises";
+import { PendingRequestTable } from "./automation-rpc.ts";
+import { toolAllowed } from "./automation-policy.ts";
+import { decideNavigate } from "./navigate-gate.ts";
 import type { MetamuxConfig } from "./config.ts";
 import type { GroupProjection, GroupProjectionSnapshot } from "./group-projection.ts";
 import type { LazyGroupTracker } from "./lazy-groups.ts";
 import type { PortsTracker } from "./ports.ts";
 import type { ActuatorEvent, ActuatorWorkspace, Registry, WorkspaceRef } from "./registry.ts";
+
+const AUTOMATION_TIMEOUT_MS = 15000;
 
 interface WsData {
   authed: boolean;
@@ -44,6 +50,12 @@ type PushedEvent =
        * window known yet, or the pair hasn't been created/reported) --
        * the extension falls back to its own current window in that case. */
       homeChromeWindowId: string | null;
+      /** The raw cmux window id backing `homeChromeWindowId` -- see
+       * `cmuxWindowIdForIdentity`'s doc comment for why this has to be on
+       * the wire at all (the extension can't establish a pairing without
+       * first learning the uuid to pair). null under the same conditions
+       * as `homeChromeWindowId`. */
+      cmuxWindowId: string | null;
     }
   | { type: "event"; seq: number; name: "focus_window" };
 
@@ -117,6 +129,19 @@ export class ActuatorServer {
   private onPrune?: () => void | Promise<void>;
   private port: number;
   private secret: string;
+  /** Workspace-scoped browser automation (docs/protocol.md): request/
+   * response correlation for automationRequest/automationResponse frames
+   * over the same WS the extension already uses. */
+  private pendingAutomation = new PendingRequestTable();
+  /** The most recently connected extension client's socket -- automation
+   * requests target this one specifically (a raw broadcast would send the
+   * same request to every connected client, including a non-extension
+   * `fake-extension.ts`-style test client that would never answer it).
+   * "Most recent" mirrors every other client-identity concern here: only
+   * one real extension is ever expected, but a reconnect (service worker
+   * restart) leaves the old socket's close event to clear this, and until
+   * then the newer one is authoritative. */
+  private extensionSocket: ServerWebSocket<WsData> | null = null;
 
   constructor(options: ActuatorServerOptions) {
     this.port = options.port;
@@ -148,6 +173,7 @@ export class ActuatorServer {
         message: (ws, message) => this.handleWsMessage(ws, message),
         close: (ws) => {
           this.clients.delete(ws);
+          if (this.extensionSocket === ws) this.extensionSocket = null;
         },
       },
     });
@@ -215,6 +241,25 @@ export class ActuatorServer {
     return member ? member.placementOverride : null;
   }
 
+  /** The raw cmux window id backing a projected identity's home, same
+   * representative-member shape as homeChromeWindowIdForIdentity --
+   * spread onto the wire alongside it. Without this, the extension has no
+   * way to LEARN a cmux window's uuid at all: `homeChromeWindowId` alone
+   * is null until a pairing already exists, and the pairing can only ever
+   * be established by the extension creating a per-window marker tab at
+   * `panel.html?win=<cmuxWindowId>` (docs/protocol.md, "Chrome window
+   * pairing") -- which requires knowing the uuid first. This was a gap in
+   * the contract as originally written; see protocol.md's "Implementation
+   * notes" for the correction. */
+  private cmuxWindowIdForIdentity(identity: ActuatorWorkspace, snapshot: GroupProjectionSnapshot): string | null {
+    if (this.config.groupBy === "workspace") {
+      const ref = snapshot.workspaces.find((w) => w.id === identity.id);
+      return ref ? ref.cmuxWindowId : null;
+    }
+    const member = snapshot.workspaces.find((w) => w.title === identity.title && !w.archived && w.cmuxWindowId !== null);
+    return member ? member.cmuxWindowId : null;
+  }
+
   private handleFetch(req: Request, server: Server<WsData>): Response | Promise<Response> | undefined {
     const url = new URL(req.url);
 
@@ -234,6 +279,10 @@ export class ActuatorServer {
 
     if (url.pathname === "/prune" && req.method === "POST") {
       return this.handlePrune(req);
+    }
+
+    if (url.pathname === "/automation" && req.method === "POST") {
+      return this.handleAutomation(req);
     }
 
     if (url.pathname === "/status" && req.method === "GET") {
@@ -340,6 +389,108 @@ export class ActuatorServer {
     return Response.json({ ok: true, removed: removed.map((r) => ({ id: r.id, title: r.title })) });
   }
 
+  /** Workspace-scoped browser automation (docs/protocol.md, "Workspace-
+   * scoped browser automation"): relays one op to the extension over the
+   * WS and awaits its response. Resolves the target workspace the same
+   * way POST /open does (explicit `workspaceId` -- metamux's own mw_ id,
+   * matching what the MCP layer already resolves via GET /state -- else
+   * the active workspace), then resolves that ref's WIRE identity (the
+   * extension's byId is keyed by identity, not real ref id) before
+   * sending. `agentBrowser` config gates which op kinds are allowed at
+   * all (automation-policy.ts); "no extension connected" is a distinct,
+   * immediate error, never a 15s timeout wait for a peer that isn't there. */
+  private async handleAutomation(req: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(JSON.stringify({ ok: false, error: "invalid body" }), { status: 400 });
+    }
+    const obj = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+    const token = typeof obj.token === "string" ? obj.token : null;
+    if (!this.checkToken(token)) {
+      return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), { status: 401 });
+    }
+
+    const op = obj.op && typeof obj.op === "object" ? (obj.op as Record<string, unknown>) : null;
+    const opKind = op && typeof op.kind === "string" ? op.kind : null;
+    if (!op || !opKind) {
+      return new Response(JSON.stringify({ ok: false, error: "missing op.kind" }), { status: 400 });
+    }
+    if (!toolAllowed(opKind, this.config.agentBrowser)) {
+      return new Response(
+        JSON.stringify({ ok: false, error: `"${opKind}" is not allowed under agentBrowser: "${this.config.agentBrowser}"` }),
+        { status: 403 },
+      );
+    }
+
+    const workspaceId = typeof obj.workspaceId === "string" ? obj.workspaceId : null;
+    const target = workspaceId ? (this.registry.workspaces.get(workspaceId) ?? null) : this.activeRef();
+    if (!target) {
+      return new Response(JSON.stringify({ ok: false, error: "no target workspace" }), { status: 404 });
+    }
+
+    if (opKind === "navigate") {
+      const urlStr = typeof op.url === "string" ? op.url : null;
+      if (!urlStr) return new Response(JSON.stringify({ ok: false, error: "missing op.url" }), { status: 400 });
+      const decision = await this.decideNavigateForTarget(urlStr, target);
+      if (decision.action === "block") {
+        return new Response(JSON.stringify({ ok: false, error: `navigate blocked: ${decision.reason}` }), { status: 403 });
+      }
+    }
+
+    if (!this.extensionSocket) {
+      return new Response(JSON.stringify({ ok: false, error: "no extension connected" }), { status: 503 });
+    }
+
+    const snapshot = this.currentSnapshot();
+    const identity = this.groupProjection.identityFor(target, snapshot);
+    const id = crypto.randomUUID();
+    const pending = this.pendingAutomation.register(id, AUTOMATION_TIMEOUT_MS);
+    this.extensionSocket.send(JSON.stringify({ type: "automationRequest", id, identityId: identity.id, op }));
+    this.log(`[automation] -> ${identity.title} (${identity.id}) op=${opKind}`);
+
+    try {
+      const result = await pending;
+      return Response.json({ ok: true, result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log(`[automation] FAILED op=${opKind}: ${message}`);
+      return new Response(JSON.stringify({ ok: false, error: message }), { status: 502 });
+    }
+  }
+
+  private activeRef(): WorkspaceRef | null {
+    return this.registry.activeId ? (this.registry.workspaces.get(this.registry.activeId) ?? null) : null;
+  }
+
+  /** SSRF gate for a navigate op (navigate-gate.ts's decideNavigate is
+   * pure -- this is its I/O wrapper): resolves the URL's hostname via a
+   * real DNS lookup and looks up the target workspace's OWN observed
+   * ports (PortsTracker) for the loopback allowlist, so a dev server
+   * running in one workspace doesn't open loopback access to every other
+   * workspace's automation calls. Resolution failure passes an empty IP
+   * list through -- decideNavigate itself fails closed on that. */
+  private async decideNavigateForTarget(urlStr: string, target: WorkspaceRef) {
+    let hostname: string | null = null;
+    try {
+      hostname = new URL(urlStr).hostname;
+    } catch {
+      // decideNavigate rejects the unparseable URL itself, below
+    }
+    let resolvedIps: string[] = [];
+    if (hostname) {
+      try {
+        const results = await lookup(hostname, { all: true });
+        resolvedIps = results.map((r) => r.address);
+      } catch {
+        resolvedIps = [];
+      }
+    }
+    const observedPorts = this.portsTracker ? this.portsTracker.portsFor(target.sourceId) : [];
+    return decideNavigate(urlStr, observedPorts, resolvedIps);
+  }
+
   /** Push an open_url event for a resolved workspace ref -- projected to
    * its alias in groupBy: "title". Shared by POST /open and the ports
    * watcher (main.ts). Returns the identity it was pushed to. Also marks
@@ -355,8 +506,9 @@ export class ActuatorServer {
     const identity = this.groupProjection.identityFor(target, snapshot);
     this.lazyGroups.markAttached(identity.id); // in-memory wire-identity cache for this session
     const homeChromeWindowId = this.homeChromeWindowIdForIdentity(identity, snapshot);
+    const cmuxWindowId = this.cmuxWindowIdForIdentity(identity, snapshot);
     this.seq++;
-    this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr, homeChromeWindowId });
+    this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr, homeChromeWindowId, cmuxWindowId });
     this.log(`[open_url] ${identity.title} (${identity.id}) -> ${urlStr}${homeChromeWindowId ? ` [win ${homeChromeWindowId}]` : ""}`);
     return identity;
   }
@@ -381,6 +533,7 @@ export class ActuatorServer {
       ws.data.authed = true;
       ws.data.client = client;
       this.clients.add(ws);
+      if (client === "extension") this.extensionSocket = ws;
       ws.send(JSON.stringify(this.buildSync()));
       const label = client === "extension" ? "extension connected ✓" : `${client} client connected ✓`;
       this.log(label);
@@ -422,6 +575,18 @@ export class ActuatorServer {
       const cmuxWindowId = typeof obj.cmuxWindowId === "string" ? obj.cmuxWindowId : null;
       const chromeWindowId = typeof obj.chromeWindowId === "string" ? obj.chromeWindowId : null;
       if (cmuxWindowId && chromeWindowId) this.onWindowPairing?.(cmuxWindowId, chromeWindowId);
+      return;
+    }
+
+    if (obj.type === "automationResponse") {
+      const id = typeof obj.id === "string" ? obj.id : null;
+      if (!id) return;
+      if (obj.ok === true) {
+        this.pendingAutomation.resolveRequest(id, obj.result);
+      } else {
+        const message = typeof obj.error === "string" ? obj.error : "automation request failed";
+        this.pendingAutomation.rejectRequest(id, new Error(message));
+      }
     }
   }
 
@@ -456,6 +621,7 @@ export class ActuatorServer {
           ...w,
           ...(this.portsTracker ? { ports: this.portsForIdentity(w, snapshot) } : {}),
           homeChromeWindowId: this.homeChromeWindowIdForIdentity(w, snapshot),
+          cmuxWindowId: this.cmuxWindowIdForIdentity(w, snapshot),
           placementOverride: this.placementOverrideForIdentity(w, snapshot),
         })),
       },
@@ -531,6 +697,7 @@ export class ActuatorServer {
           ...w,
           ...(this.portsTracker ? { ports: this.portsForIdentity(w, snapshot) } : {}),
           homeChromeWindowId: this.homeChromeWindowIdForIdentity(w, snapshot),
+          cmuxWindowId: this.cmuxWindowIdForIdentity(w, snapshot),
           placementOverride: this.placementOverrideForIdentity(w, snapshot),
         })),
       },

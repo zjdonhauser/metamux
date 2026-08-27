@@ -25,7 +25,8 @@ export type ConfigChangeKey =
   | "janitorCrossWindow"
   | "colorBackflow"
   | "pruneArchivedAfterDays"
-  | "colorMode";
+  | "colorMode"
+  | "agentBrowser";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -57,6 +58,7 @@ export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set(
   "janitorCrossWindow",
   "colorBackflow",
   "colorMode",
+  "agentBrowser",
 ]);
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -93,6 +95,7 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "colorBackflow", oldValue: oldConfig.colorBackflow, newValue: newConfig.colorBackflow },
     { key: "pruneArchivedAfterDays", oldValue: oldConfig.pruneArchivedAfterDays, newValue: newConfig.pruneArchivedAfterDays },
     { key: "colorMode", oldValue: oldConfig.colorMode, newValue: newConfig.colorMode },
+    { key: "agentBrowser", oldValue: oldConfig.agentBrowser, newValue: newConfig.agentBrowser },
   ];
 
   return candidates

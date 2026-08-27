@@ -305,6 +305,93 @@ describe("ActuatorServer.handlePrune (POST /prune)", () => {
   });
 });
 
+describe("ActuatorServer.handleAutomation (POST /automation)", () => {
+  // Same private-method-cast convention as handlePrune above. No extension
+  // socket is ever connected in these tests (no real WS), so only the
+  // early-exit paths (auth, op validation, the agentBrowser gate, no-target,
+  // no-extension) are reachable here -- the full round-trip through a real
+  // extension response is the isolated e2e's job.
+  function callAutomation(server: ActuatorServer, body: Record<string, unknown>): Promise<Response> {
+    const req = new Request("http://127.0.0.1/automation", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return (server as unknown as { handleAutomation(req: Request): Promise<Response> }).handleAutomation(req);
+  }
+
+  function registryWithActive(): Registry {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "cmux", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    registry.applyEvent({ name: "selected", workspaceId: "SRC-A", title: "cmux", cwd: "/a", bootId: "B1", seq: 2, occurredAtMs: 2 });
+    return registry;
+  }
+
+  test("rejects a missing/wrong token with 401", async () => {
+    const { server } = makeServer(cfg(), registryWithActive());
+    const res = await callAutomation(server, { token: "wrong", op: { kind: "tabContext" } });
+    expect(res.status).toBe(401);
+  });
+
+  test("rejects a missing op.kind with 400", async () => {
+    const { server } = makeServer(cfg(), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: {} });
+    expect(res.status).toBe(400);
+  });
+
+  test("agentBrowser: off refuses every op with 403", async () => {
+    const { server } = makeServer(cfg({ agentBrowser: "off" }), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "tabContext" } });
+    expect(res.status).toBe(403);
+  });
+
+  test("agentBrowser: read refuses a write op (navigate) with 403", async () => {
+    const { server } = makeServer(cfg({ agentBrowser: "read" }), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "navigate", url: "https://example.com" } });
+    expect(res.status).toBe(403);
+  });
+
+  test("agentBrowser: read allows a read op through to the next check (no extension -- 503, not 403)", async () => {
+    const { server } = makeServer(cfg({ agentBrowser: "read" }), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "tabContext" } });
+    expect(res.status).toBe(503);
+  });
+
+  test("no active/matching target workspace -- 404", async () => {
+    const { server } = makeServer(cfg(), new Registry());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "tabContext" } });
+    expect(res.status).toBe(404);
+  });
+
+  test("an unknown explicit workspaceId -- 404, not silently falling back to active", async () => {
+    const { server } = makeServer(cfg(), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", workspaceId: "mw_unknown", op: { kind: "tabContext" } });
+    expect(res.status).toBe(404);
+  });
+
+  test("no extension connected -- 503, a distinct immediate error", async () => {
+    const { server } = makeServer(cfg(), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "tabContext" } });
+    const body = await res.json();
+    expect(res.status).toBe(503);
+    expect(body.error).toMatch(/no extension connected/);
+  });
+
+  test("a navigate op to a blocked (private-range) URL is refused with 403 before ever reaching the extension-connected check", async () => {
+    const { server } = makeServer(cfg({ agentBrowser: "full" }), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "navigate", url: "http://10.0.0.5/" } });
+    const body = await res.json();
+    expect(res.status).toBe(403);
+    expect(body.error).toMatch(/navigate blocked/);
+  });
+
+  test("a navigate op with a missing op.url is a 400, not a DNS lookup attempt", async () => {
+    const { server } = makeServer(cfg({ agentBrowser: "full" }), registryWithActive());
+    const res = await callAutomation(server, { token: "test-secret", op: { kind: "navigate" } });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("ActuatorServer.pushOpenUrl -- groupBy: title routes to the alias", () => {
   test("open_url targeting one member logs the shared alias id", () => {
     const registry = new Registry();
@@ -331,7 +418,7 @@ describe("ActuatorServer -- window pairing (docs/protocol.md, 'Window pairing')"
     expect(state.workspaces[0]!.placementOverride).toBeNull();
   });
 
-  test("getState's projected view resolves homeChromeWindowId from the registry's windowPairings map", () => {
+  test("getState's projected view resolves homeChromeWindowId AND cmuxWindowId from the registry", () => {
     const registry = new Registry();
     registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
     registry.setWindowPairing("win-1", "chrome-win-a");
@@ -339,15 +426,26 @@ describe("ActuatorServer -- window pairing (docs/protocol.md, 'Window pairing')"
 
     const state = server.getState();
     expect(state.projected.workspaces[0]!.homeChromeWindowId).toBe("chrome-win-a");
+    expect(state.projected.workspaces[0]!.cmuxWindowId).toBe("win-1");
   });
 
-  test("an unpaired cmux window resolves homeChromeWindowId to null", () => {
+  test("an unpaired cmux window resolves homeChromeWindowId to null but still reports cmuxWindowId (the uuid the extension needs to pair)", () => {
     const registry = new Registry();
     registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-unpaired" });
     const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
 
     const state = server.getState();
     expect(state.projected.workspaces[0]!.homeChromeWindowId).toBeNull();
+    expect(state.projected.workspaces[0]!.cmuxWindowId).toBe("win-unpaired");
+  });
+
+  test("a cmux-sourced identity (no cmuxWindowId ever stamped) reports cmuxWindowId: null", () => {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "x", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    const { server } = makeServer(cfg({ groupBy: "workspace", createGroups: "eager" }), registry);
+
+    const state = server.getState();
+    expect(state.projected.workspaces[0]!.cmuxWindowId).toBeNull();
   });
 
   test("groupBy: title resolves homeChromeWindowId from the first live member carrying a cmuxWindowId", () => {
@@ -382,6 +480,31 @@ describe("ActuatorServer -- window pairing (docs/protocol.md, 'Window pairing')"
 
     server.pushOpenUrl(ref, "https://example.test");
     expect(logs.some((l) => l.includes("open_url") && l.includes("[win chrome-win-a]"))).toBe(true);
+  });
+
+  test("pushOpenUrl's broadcast event carries cmuxWindowId even before a Chrome pairing exists -- this is how the extension bootstraps one", () => {
+    const registry = new Registry();
+    registry.applyTmuxIntent({ type: "upsertTmuxRef", sessionId: "$1", sessionName: "compliance", cmuxWindowId: "win-1" });
+    // deliberately NOT calling setWindowPairing -- no pairing exists yet
+    const events: Array<Record<string, unknown>> = [];
+    const server = new ActuatorServer({
+      port: 0,
+      secret: "test-secret",
+      registry,
+      config: cfg({ groupBy: "workspace", createGroups: "eager" }),
+      cursor: { bootId: "B1", seq: 1 },
+      stats: { skippedLines: 0 },
+      groupProjection: new GroupProjection("workspace"),
+      lazyGroups: new LazyGroupTracker(),
+      log: () => {},
+    });
+    (server as unknown as { broadcastRaw(event: Record<string, unknown>): void }).broadcastRaw = (event) => events.push(event);
+    const ref = [...registry.workspaces.values()][0]!;
+
+    server.pushOpenUrl(ref, "https://example.test");
+    expect(events).toHaveLength(1);
+    expect(events[0]!.homeChromeWindowId).toBeNull(); // no pairing yet
+    expect(events[0]!.cmuxWindowId).toBe("win-1"); // but the uuid IS present -- enough to establish one
   });
 
   test("pushOpenUrl for an unpaired window omits the window suffix", () => {

@@ -123,7 +123,17 @@ describe("metamux mcp (real subprocess, real stdio)", () => {
       stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) + "\n");
       const listRes = await reader.next();
       const names = ((listRes.result as any).tools as { name: string }[]).map((t) => t.name).sort();
-      expect(names).toEqual(["metamux_current", "metamux_open", "metamux_workspaces"]);
+      expect(names).toEqual([
+        "metamux_browser_click",
+        "metamux_browser_navigate",
+        "metamux_browser_screenshot",
+        "metamux_browser_snapshot",
+        "metamux_browser_type",
+        "metamux_current",
+        "metamux_open",
+        "metamux_tab_context",
+        "metamux_workspaces",
+      ]);
 
       // 4. tools/call metamux_current -- bridges to the fake /state
       stdin.write(

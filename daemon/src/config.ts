@@ -86,6 +86,13 @@ export interface MetamuxConfig {
    * disables allocation entirely, restoring the original title-hash-only
    * fallback behavior. */
   colorMode: "palette" | "hash";
+  /** Workspace-scoped browser automation (docs/protocol.md, "Workspace-
+   * scoped browser automation"): "off" refuses every automation op; "read"
+   * (default) allows tabContext/snapshot/screenshot; "full" adds
+   * navigate/click/type (chrome.debugger-driven, real mouse/keyboard
+   * input on the user's live browser). Enforced server-side, POST
+   * /automation, before a request ever reaches the extension. */
+  agentBrowser: "off" | "read" | "full";
 }
 
 export const DEFAULT_CONFIG: MetamuxConfig = {
@@ -104,6 +111,7 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   colorBackflow: true,
   pruneArchivedAfterDays: 7,
   colorMode: "palette",
+  agentBrowser: "read",
 };
 
 export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxConfig> {
@@ -169,6 +177,10 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
     pruneArchivedAfterDays:
       typeof obj.pruneArchivedAfterDays === "number" ? obj.pruneArchivedAfterDays : DEFAULT_CONFIG.pruneArchivedAfterDays,
     colorMode: obj.colorMode === "hash" ? "hash" : DEFAULT_CONFIG.colorMode,
+    agentBrowser:
+      obj.agentBrowser === "off" || obj.agentBrowser === "full" || obj.agentBrowser === "read"
+        ? obj.agentBrowser
+        : DEFAULT_CONFIG.agentBrowser,
   };
 
   config.eventsPath = expandHome(config.eventsPath);

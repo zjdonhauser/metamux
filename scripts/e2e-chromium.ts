@@ -211,6 +211,18 @@ async function main() {
     }
     const extensionId = sw.url().split("/")[2];
     console.log("extension id:", extensionId);
+    // Surface the SW's own console output and any uncaught exceptions --
+    // MV3 service worker errors otherwise only show up in
+    // chrome://extensions, never in this script's own stdout, which made
+    // an earlier live regression report much harder to diagnose than it
+    // needed to be.
+    sw.on("console", (msg) => console.log(`[SW console:${msg.type()}]`, msg.text()));
+    // "pageerror" isn't in playwright-core's typed Worker event union for a
+    // ServiceWorker, but Chrome still emits it for uncaught exceptions --
+    // cast rather than drop this debug aid.
+    (sw as unknown as { on: (event: "pageerror", cb: (err: unknown) => void) => void }).on("pageerror", (err) =>
+      console.log("[SW pageerror]", err),
+    );
 
     async function getState(): Promise<any> {
       const res = await fetch(`http://127.0.0.1:${port}/state?token=${secret}`);
@@ -336,6 +348,33 @@ async function main() {
       activeTabInGroup = tabs.some((t) => t.active);
     }
     record("after POST /open, a tab in the group is the active tab", activeTabInGroup);
+
+    // --- Workspace-scoped browser automation: metamux_tab_context end to
+    // end (POST /automation -> extension -> chrome.tabs.query, no
+    // chrome.debugger involved -- cheap, ship-it-even-if-debugger-stalls
+    // per the round's spec). ---
+    if (openedIdentityId) {
+      console.log("--- POST /automation (metamux_tab_context) ---");
+      // No workspaceId: POST /open (above) targeted the daemon's own
+      // active ref (no cmuxWorkspaceId was passed to it either), so the
+      // daemon's activeId-fallback here resolves to the SAME target --
+      // workspaceId would need a real mw_ id, not openedIdentityId (the
+      // wire/alias id POST /open returned).
+      const automationRes = await fetch(`http://127.0.0.1:${port}/automation`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: secret, op: { kind: "tabContext" } }),
+      });
+      const automationBody = await automationRes.json();
+      const tabs: Array<{ url?: string }> = Array.isArray(automationBody.result) ? automationBody.result : [];
+      record(
+        "metamux_tab_context returns the tab this script just opened, scoped to its own group",
+        automationRes.ok && automationBody.ok === true && tabs.some((t) => t.url?.includes("metamux-e2e")),
+        JSON.stringify(automationBody),
+      );
+    } else {
+      record("metamux_tab_context assertion (skipped -- no group was created to check)", false, "see POST /open assertions above");
+    }
 
     // --- Janitor: pre-create a duplicate-titled group, assert it merges. ---
     if (activeGroupAfterOpen && openedGroupTitle) {

@@ -44,12 +44,22 @@ describe("createRouter", () => {
     expect(res?.result).toEqual({});
   });
 
-  test("tools/list returns exactly the three metamux tools", async () => {
+  test("tools/list returns exactly the metamux tools", async () => {
     const handle = createRouter(makeHandlers());
     const res = await handle({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const names = ((res?.result as any).tools as { name: string }[]).map((t) => t.name).sort();
-    expect(names).toEqual(["metamux_current", "metamux_open", "metamux_workspaces"]);
-    expect(METAMUX_MCP_TOOLS.length).toBe(3);
+    expect(names).toEqual([
+      "metamux_browser_click",
+      "metamux_browser_navigate",
+      "metamux_browser_screenshot",
+      "metamux_browser_snapshot",
+      "metamux_browser_type",
+      "metamux_current",
+      "metamux_open",
+      "metamux_tab_context",
+      "metamux_workspaces",
+    ]);
+    expect(METAMUX_MCP_TOOLS.length).toBe(9);
   });
 
   test("tools/call dispatches to the named handler with its arguments", async () => {

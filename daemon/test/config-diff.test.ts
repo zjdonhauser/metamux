@@ -107,6 +107,7 @@ describe("diffConfig", () => {
       "janitorCrossWindow",
       "colorBackflow",
       "colorMode",
+      "agentBrowser",
     ].sort();
     expect(actual).toEqual(expected);
   });
