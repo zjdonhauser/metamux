@@ -75,7 +75,11 @@ async function main(): Promise<void> {
   }
 
   const obj = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
-  if (obj.tool_name !== "Bash") return;
+  // Harness-agnostic shell-tool gate: Claude Code names it "Bash", Codex
+  // "shell"/"local_shell"; match by substring so harness renames don't
+  // silently disable the hook.
+  const toolName = typeof obj.tool_name === "string" ? obj.tool_name.toLowerCase() : "";
+  if (!toolName.includes("bash") && !toolName.includes("shell")) return;
 
   // Shape-tolerant: scan the whole payload (tool_input + tool_response,
   // whatever fields this Claude Code version sends) rather than betting on
