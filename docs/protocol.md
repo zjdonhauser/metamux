@@ -930,3 +930,45 @@ resolution) is now ALSO spread onto every sync/state workspace object and `open_
 alongside `homeChromeWindowId`/`placementOverride`. `null` under the same conditions as
 `homeChromeWindowId` (legacy windows/global-mode sessions, cmux-sourced refs). This is what the
 extension half actually reads to know which cmux window a group's session lives in.
+
+### Implementation notes (extension half — placement following, 2026-08-27 evening, finishing round)
+
+Fixes the live gap the daemon/extension window-pairing halves above left open: a group MOVED by
+hand (not just paired via `?win=`) stopped following, because cache invalidation only ever
+compared a cached groupId against ONE legacy window and nulled anything else — silently dropping
+tracking of a group that was simply somewhere else now, rather than gone.
+
+- `reducer.js`'s `resolveGroupCache(byId, state, allGroups)` (signature changed — was
+  `(byId, windowId, allGroups)`) resolves each entry against its OWN `targetWindowFor(entry,
+  state)` instead of one global window. A cached groupId that still exists ANYWHERE is now
+  authoritative regardless of window — a real move is reported as `placementObserved`, never
+  invalidated. Only a groupId that's genuinely gone falls back to title re-resolution, which
+  itself now also searches every window: found at the target, plain `groupCreated`; found
+  elsewhere, `groupCreated` AND `placementObserved` together — the contract's fresh-boot "adopt
+  reality" rule.
+- New local fact `placementObserved` (id, chromeWindowId): sets the entry's `placementOverride`
+  optimistically and emits a new op `reportGroupPlacement`, which `chrome-ops.js` sends as the
+  `groupPlacement` frame (Wire protocol, above — daemon-side handling already existed).
+- `chrome-ops.js`'s `watchGroupRemap` is REPLACED by `watchGroupPlacement`: listens to BOTH
+  `tabGroups.onCreated` and `tabGroups.onMoved` (Chrome's cross-window group move mechanics
+  aren't consistent — a drag typically mints a new group id in the target window via onCreated,
+  per the original window-split incident's own finding, but some moves preserve the id and
+  surface via onMoved instead) across ALL windows, debounced 400ms, and reruns the same
+  `resolveGroupCache` decision boot uses.
+- `watchGroupRemoved` (detach-on-close) no longer filters to one window, and no longer assumes
+  every removal is a close: a cross-window drag fires `onRemoved` for the OLD group id
+  indistinguishably from a genuine close at the instant it fires (there's no atomic Chrome signal
+  for "this group's window changed"), so it now waits 500ms and re-checks whether a group with
+  the same title exists anywhere before concluding it's really gone — `watchGroupPlacement`'s
+  shorter debounce normally already re-established tracking by then if it was a move.
+- `watchTabActivation` (F9 reverse sync) no longer filters to one window either — safe by
+  construction, since the match lookup only ever fires for a groupId genuinely in `state.byId`.
+- `classifyJanitor`'s cross-window recovery now skips any title with an active
+  `placementOverride` (docs/protocol.md's own "SKIPS them" rule, above) — its "foreign" window IS
+  its home now.
+- **Known limitation, unchanged from the prior round**: the janitor's own duplicate-merging scan
+  (`janitorGroups`/`scanTabGroups`) is still scoped to the single legacy window, not per-paired-
+  window — a genuine duplicate spanning two non-legacy windows isn't resolved by this round
+  either. `resolveGroupCache`'s "cached groupId is always authoritative once found to exist"
+  priority means a coincidental same-titled group elsewhere is simply left alone rather than
+  merged in that scenario.

@@ -4,6 +4,7 @@
 
 import { appendFile } from "node:fs/promises";
 import * as cmuxActuator from "./cmux-actuator.ts";
+import { BackflowFailureTracker } from "./backflow-failure-tracker.ts";
 import { loadCmuxNamedColorSlots } from "./cmux-config.ts";
 import { computeBackflowCandidates, planBackflow, type BackflowRef } from "./color-backflow.ts";
 import * as cmuxRpc from "./cmux-rpc.ts";
@@ -36,6 +37,11 @@ const PORTS_POLL_INTERVAL_MS = 4000;
 const SOCKET_PROBE_INTERVAL_MS = 30_000;
 const TMUX_POLL_INTERVAL_MS = 2000; // matches tmux-cmux-sync's own TMUX_CMUX_INTERVAL default
 const COLOR_BACKFLOW_INTERVAL_MS = 5000;
+// A not_found paint failure archives its ref outright (definitive, no
+// retries needed); anything else (a transient cmux CLI timeout/hiccup)
+// gets this many consecutive tries before backflow gives up on that one
+// target and stops hammering it every 5s -- see backflow-failure-tracker.ts.
+const BACKFLOW_MAX_CONSECUTIVE_FAILURES = 3;
 
 interface CursorState {
   bootId: string;
@@ -150,6 +156,30 @@ async function runDaemon(): Promise<void> {
     console.log(stamped);
     void appendFile(logPath(), stamped + "\n").catch(() => {});
   };
+
+  // Process-level safety net (2026-08-27, incident: /automation testing
+  // coincided with the daemon dying with no trace in daemon.log). Verified
+  // directly: Bun.serve's `fetch:` callback safely catches a handler's
+  // throw/rejection and turns it into a 500 -- but its `websocket.message`
+  // callback does NOT; an uncaught exception there kills the WHOLE process
+  // instantly, with no stack trace surviving into daemon.log (a native-
+  // level abort, not a JS-catchable one from inside the handler). Any
+  // "fire and forget" `void asyncFn()` poll-loop call (persist, backflow,
+  // tmux reconcile, socket recovery -- all over this file) that rejects
+  // without an internal .catch is the same class of risk: an unhandled
+  // rejection. This is the deliberate, explicit fallback for whatever
+  // throw site isn't (or can't be) hardened directly: log loudly and keep
+  // running -- a daemon driving the user's live browser must degrade, not
+  // die. It does NOT replace hardening a specific known-unsafe call site
+  // (see handleWsMessage's own try/catch in server.ts); it's the net
+  // underneath everything else.
+  process.on("uncaughtException", (err) => {
+    log(`[FATAL, CAUGHT] uncaughtException: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+  });
+  process.on("unhandledRejection", (reason) => {
+    const detail = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    log(`[FATAL, CAUGHT] unhandledRejection: ${detail}`);
+  });
 
   // Registry compaction (auto, startup-only): archived refs older than
   // config.pruneArchivedAfterDays are dropped before anything else touches
@@ -509,6 +539,11 @@ async function runDaemon(): Promise<void> {
   // being a cache rather than a ledger).
   let tmuxReconcileState: ReconcileState = emptyReconcileState();
 
+  // Color backflow's per-target consecutive-failure backoff (see
+  // BACKFLOW_MAX_CONSECUTIVE_FAILURES above) -- never persisted, a
+  // restart just starts every target with a clean slate.
+  const backflowFailures = new BackflowFailureTracker(BACKFLOW_MAX_CONSECUTIVE_FAILURES);
+
   const executeTmuxAction = async (action: CmuxActuatorAction): Promise<void> => {
     switch (action.type) {
       case "spawn": {
@@ -631,22 +666,52 @@ async function runDaemon(): Promise<void> {
       archived: ref.archived,
     }));
     const candidates = computeBackflowCandidates(refs, config.groupBy, config.colorMode, palette);
-    const actions = planBackflow(candidates);
+    // Skip a target that's already given up (backflow-failure-tracker.ts) --
+    // a transient failure gets bounded retries, not hammered forever.
+    const actions = planBackflow(candidates).filter((action) => !backflowFailures.isGivenUp(action.refId));
     if (actions.length === 0) return;
 
     let anyPainted = false;
+    let anyArchived = false;
     for (const action of actions) {
       const result = await cmuxActuator.setTabColor({ workspaceRef: action.cmuxWorkspaceId, color: action.targetHex });
       reportSocketCallOutcome(result.ok);
       if (result.ok) {
         registry.markPainted(action.refId, action.targetHex);
+        backflowFailures.recordSuccess(action.refId);
         anyPainted = true;
         log(`[color-backflow] painted ${action.cmuxWorkspaceId} -> ${action.targetHex}`);
-      } else {
-        log(`[color-backflow] paint FAILED ${action.cmuxWorkspaceId}: ${result.error}`);
+        continue;
       }
+
+      // not_found is DEFINITIVE proof the workspace no longer exists in
+      // cmux -- not something a retry could ever fix. Archive it right
+      // here rather than retrying: this is the self-healing half of the
+      // fix (a stale ref that survives seed-replay resurrection -- e.g.
+      // its close event fell before an events.jsonl rotation boundary --
+      // stops getting targeted the moment backflow proves it's gone,
+      // instead of retrying every 5s forever).
+      if (result.error?.startsWith("not_found")) {
+        const derived = registry.archiveBySourceId("cmux", action.cmuxWorkspaceId);
+        backflowFailures.recordSuccess(action.refId); // no longer a live target -- nothing to back off
+        anyArchived = derived.length > 0;
+        if (derived.length > 0) {
+          server.broadcast(derived);
+          log(`[color-backflow] ${action.cmuxWorkspaceId} not_found -- archived (workspace no longer exists in cmux)`);
+        }
+        continue;
+      }
+
+      const outcome = backflowFailures.recordFailure(action.refId);
+      if (outcome === "just-gave-up") {
+        log(
+          `[color-backflow] paint FAILED ${action.cmuxWorkspaceId} (${BACKFLOW_MAX_CONSECUTIVE_FAILURES} times in a row) -- giving up on this target: ${result.error}`,
+        );
+      } else if (outcome === "keep-retrying") {
+        log(`[color-backflow] paint FAILED ${action.cmuxWorkspaceId}: ${result.error}`);
+      } // "already-given-up" -- silent, already logged once above
     }
-    if (anyPainted) void persist();
+    if (anyPainted || anyArchived) void persist();
   };
 
   // F7 window follow (best effort, live-tail only -- see report for why

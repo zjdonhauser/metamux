@@ -968,6 +968,32 @@ describe("tab group janitor -- cross-window recovery", () => {
     expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
   });
 
+  test("a title with an active placementOverride is SKIPPED by cross-window recovery -- its 'foreign' window IS its home now (docs/protocol.md, 'Placement ownership')", () => {
+    const state = makeState({
+      byId: {
+        mw_a: {
+          title: "alpha",
+          color: "blue",
+          archived: false,
+          groupId: 20,
+          lastActiveTabId: null,
+          cmuxWindowId: null,
+          homeChromeWindowId: null,
+          placementOverride: "999", // window 999 IS home now
+        },
+      },
+    });
+    const { ops } = reduce(state, {
+      type: "sync",
+      seq: 1,
+      config: { collapseOthers: true, closeBehavior: "archive" },
+      state: { activeId: null, workspaces: [{ id: "mw_a", title: "alpha", color: "blue", archived: false }] },
+      janitorGroups: [{ groupId: 10, title: "alpha", tabs: [] }], // a leftover in the LEGACY window
+      foreignJanitorGroups: [{ groupId: 20, windowId: 999, title: "alpha" }], // the real, overridden home
+    });
+    expect(ops.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
+  });
+
   test("janitorCrossWindow defaults to enabled when absent from config", () => {
     const state = makeState({
       byId: { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } },
@@ -1021,64 +1047,111 @@ describe("tab group janitor -- cross-window recovery", () => {
   });
 });
 
-describe("resolveGroupCache -- cache invalidation on window resolution", () => {
+describe("resolveGroupCache -- cache invalidation + placement following (docs/protocol.md, 'Placement ownership')", () => {
+  // 2026-08-27 evening, follow-up round: resolveGroupCache's philosophy
+  // changed from "a stale cross-window groupId is invalid, null it and
+  // rebuild in the resolved window" to "a group that still exists is
+  // authoritative wherever it is -- follow it (placementObserved), never
+  // fight it." This is the direct fix for the live incident Zac hit: he
+  // moved a paired window's groups to another Chrome window by hand and
+  // auto-switching stopped (the OLD invalidation nulled their groupIds
+  // the moment window resolution next ran).
   test("a cached groupId that still belongs to the target window is left alone (no correction)", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
     const allGroups = [{ groupId: 10, windowId: 1, title: "alpha" }];
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([]);
   });
 
-  test("a cached groupId that now belongs to a DIFFERENT window is corrected via title re-resolution in-window", () => {
+  test("a cached groupId that still EXISTS but now lives in a different window is followed, not invalidated", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
-    // groupId 10 is really in window 2 (stale, cross-window); window 1 (the
-    // target) has its own group titled "alpha" under a different id.
+    // groupId 10 (still our tracked group) moved to window 2; window 1
+    // separately has an unrelated same-titled group under a different id
+    // -- irrelevant here, the cached id is authoritative once it's found
+    // to still exist at all (a genuine same-title duplicate spanning
+    // windows is a known, out-of-scope edge case -- see BUILD-STATUS.md).
     const allGroups = [
       { groupId: 10, windowId: 2, title: "alpha" },
       { groupId: 20, windowId: 1, title: "alpha" },
     ];
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 2 },
+    ]);
   });
 
-  test("a cached groupId in the wrong window with NO matching title in-window falls back to null", () => {
+  test("a cached groupId in a different window with NO matching title at target is still followed, not nulled", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
     const allGroups = [{ groupId: 10, windowId: 2, title: "alpha" }]; // nothing at all in window 1
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: null }]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 2 },
+    ]);
   });
 
-  test("a cached groupId that no longer exists anywhere falls back to title re-resolution, same as a cross-window mismatch", () => {
+  test("a cached groupId that no longer exists anywhere ANY window falls back to title re-resolution at the target window", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null } };
     const allGroups = [{ groupId: 20, windowId: 1, title: "alpha" }]; // groupId 10 doesn't appear at all
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: 20 },
+    ]);
   });
 
-  test("a never-attached entry (groupId: null) with a real match in-window still resolves it", () => {
+  test("a never-attached entry (groupId: null) with a real match at the target window resolves it, no override", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } };
     const allGroups = [{ groupId: 20, windowId: 1, title: "alpha" }];
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([{ type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: 20 },
+    ]);
   });
 
-  test("archived entries are never touched, even with a stale cross-window groupId", () => {
+  test("adopt reality (fresh-boot rule): a never-attached entry whose only match is OUTSIDE the target window gets both the id AND an override -- never an attempt to move it", () => {
+    const byId = { mw_a: { title: "alpha", color: "blue", archived: false, groupId: null, lastActiveTabId: null } };
+    const allGroups = [{ groupId: 20, windowId: 2, title: "alpha" }]; // only match is window 2, not target window 1
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: 20 },
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 2 },
+    ]);
+  });
+
+  test("archived entries are never touched, even with a real group living in a different window", () => {
     const byId = { mw_a: { title: "alpha", color: "blue", archived: true, groupId: 10, lastActiveTabId: null } };
     const allGroups = [{ groupId: 10, windowId: 2, title: "alpha" }];
-    expect(resolveGroupCache(byId, 1, allGroups)).toEqual([]);
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([]);
   });
 
-  test("this is exactly the fix for the live incident: a stale groupId from the OLD window never survives window resolution", () => {
-    // The exact shape of the reported bug: byId still has the old window's
-    // groupIds cached; the new window (freshly created/adopted) has none of
-    // them, but DOES already carry freshly-created groups for some titles.
+  test("an entry already carrying a placementOverride resolves against ITS override window, not state.windowId", () => {
+    const byId = {
+      mw_a: {
+        title: "alpha",
+        color: "blue",
+        archived: false,
+        groupId: 10,
+        lastActiveTabId: null,
+        cmuxWindowId: null,
+        homeChromeWindowId: null,
+        placementOverride: "2",
+      },
+    };
+    // groupId 10 lives exactly at the override window (2) -- no drift, no new fact.
+    const allGroups = [{ groupId: 10, windowId: 2, title: "alpha" }];
+    expect(resolveGroupCache(byId, makeState({ windowId: 1 }), allGroups)).toEqual([]);
+  });
+
+  test("this is the fix for the reported live incident: groups moved to another Chrome window are followed there, not orphaned", () => {
+    // The exact shape of the reported bug: byId's cached groupIds now live
+    // in a window OTHER than state.windowId (the user dragged them there
+    // by hand). Both are still real, live groups -- resolveGroupCache
+    // must record where they actually are, never null them out.
     const byId = {
       mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: null },
       mw_b: { title: "beta", color: "red", archived: false, groupId: 11, lastActiveTabId: null },
     };
     const allGroups = [
-      { groupId: 10, windowId: 777, title: "alpha" }, // stale: really in the OLD window
-      { groupId: 11, windowId: 777, title: "beta" }, // stale: really in the OLD window
+      { groupId: 10, windowId: 777, title: "alpha" }, // moved by hand to window 777
+      { groupId: 11, windowId: 777, title: "beta" }, // moved by hand to window 777
     ];
-    const facts = resolveGroupCache(byId, 555, allGroups); // 555 = the newly-resolved window, empty
+    const facts = resolveGroupCache(byId, makeState({ windowId: 555 }), allGroups);
     expect(facts).toEqual([
-      { type: "local", name: "groupCreated", id: "mw_a", groupId: null },
-      { type: "local", name: "groupCreated", id: "mw_b", groupId: null },
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 777 },
+      { type: "local", name: "placementObserved", id: "mw_b", chromeWindowId: 777 },
     ]);
   });
 });
@@ -1182,13 +1255,15 @@ describe("chooseAdoptionWindow -- window adoption / marker consolidation", () =>
   });
 });
 
-describe("isolated e2e: window-split incident end to end", () => {
-  test("boot after a marker-tab loss recovers a full duplicate set without ever activating the old window's groups", () => {
-    // Simulates exactly the reported incident: byId still holds groupIds
-    // for the OLD window (777); the extension has just resolved a NEW
-    // window (555, adopted or created) with none of those groups yet.
+describe("isolated e2e: window-split incident end to end (superseded by placement following below)", () => {
+  test("boot with groups sitting in a window other than state.windowId adopts reality instead of orphaning them", () => {
+    // Same starting shape as the original window-split incident (byId's
+    // cached groupIds live in a window other than the one currently
+    // resolved) -- but the FIX changed: adopt reality (record where they
+    // actually are) rather than null them and wait for cross-window
+    // recovery to slowly pull them back in over several syncs.
     const staleState = makeState({
-      windowId: 777,
+      windowId: 555,
       activeId: "mw_a",
       byId: {
         mw_a: { title: "alpha", color: "blue", archived: false, groupId: 10, lastActiveTabId: 101 },
@@ -1196,33 +1271,38 @@ describe("isolated e2e: window-split incident end to end", () => {
       },
     });
 
-    // Step 1: window resolution runs cache invalidation (fix 1). The new
-    // window (555) has no groups of its own yet -- everything nulls out.
     const allGroupsAtOldWindow = [
       { groupId: 10, windowId: 777, title: "alpha" },
       { groupId: 11, windowId: 777, title: "beta" },
     ];
-    const corrections = resolveGroupCache(staleState.byId, 555, allGroupsAtOldWindow);
+    const corrections = resolveGroupCache(staleState.byId, staleState, allGroupsAtOldWindow);
     expect(corrections).toEqual([
-      { type: "local", name: "groupCreated", id: "mw_a", groupId: null },
-      { type: "local", name: "groupCreated", id: "mw_b", groupId: null },
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 777 },
+      { type: "local", name: "placementObserved", id: "mw_b", chromeWindowId: 777 },
     ]);
 
     let state = staleState;
+    /** @type {Op[]} */
+    const allOps = [];
     for (const fact of corrections) {
-      state = reduce(state, fact).state;
+      const result = reduce(state, fact);
+      state = result.state;
+      allOps.push(...result.ops);
     }
-    // Nothing in byId still points at the old window's groups.
-    expect(state.byId.mw_a.groupId).toBeNull();
-    expect(state.byId.mw_b.groupId).toBeNull();
+    // Both groupIds survive intact -- never invalidated -- and both now
+    // carry a placementOverride pointing at where they actually are.
+    expect(state.byId.mw_a.groupId).toBe(10);
+    expect(state.byId.mw_b.groupId).toBe(11);
+    expect(state.byId.mw_a.placementOverride).toBe("777");
+    expect(state.byId.mw_b.placementOverride).toBe("777");
+    // Both moves get reported to the daemon.
+    expect(allOps).toContainEqual({ op: "reportGroupPlacement", id: "mw_a", chromeWindowId: 777 });
+    expect(allOps).toContainEqual({ op: "reportGroupPlacement", id: "mw_b", chromeWindowId: 777 });
 
-    // Step 2: the next sync arrives. ensureGroup will (in the real
-    // extension) create fresh groups in window 555 for alpha/beta; the
-    // janitor's foreign-group scan reports the OLD window's groups as
-    // recoverable, but only once a canonical exists there -- so THIS
-    // sync's janitorGroups (window 555's own groups) is still empty at
-    // classification time (ensureGroup hasn't run yet this pass).
-    const { ops: firstSyncOps } = reduce(state, {
+    // The very next sync already targets them correctly -- activation and
+    // ensureGroup both resolve to window 777 (the override), not 555 --
+    // no waiting for cross-window recovery at all.
+    const { ops: syncOps } = reduce(state, {
       type: "sync",
       seq: 2,
       config: { collapseOthers: true, closeBehavior: "archive" },
@@ -1233,49 +1313,70 @@ describe("isolated e2e: window-split incident end to end", () => {
           { id: "mw_b", title: "beta", color: "red", archived: false },
         ],
       },
-      janitorGroups: [], // window 555 is still empty at classification time
-      foreignJanitorGroups: [
-        { groupId: 10, windowId: 777, title: "alpha" },
-        { groupId: 11, windowId: 777, title: "beta" },
-      ],
     });
-    // No recovery yet (no in-window canonical to recover into) -- and,
-    // critically, activation targets groupId: null (invalidated above),
-    // never the old window's real groupIds 10/11.
-    expect(firstSyncOps.find((o) => o.op === "recoverCrossWindow")).toBeUndefined();
-    expect(firstSyncOps).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: 777, cmuxWindowId: null });
-    expect(firstSyncOps).toContainEqual({ op: "activate", id: "mw_a" });
+    expect(syncOps).toContainEqual({ op: "ensureGroup", id: "mw_a", title: "alpha", color: "blue", windowId: 777, cmuxWindowId: null });
+    expect(syncOps).toContainEqual({ op: "collapseOthers", exceptId: "mw_a", windowId: 777 });
+  });
+});
 
-    // Step 3: ensureGroup ran (simulated: byId now has fresh in-window
-    // groupIds), and the NEXT sync arrives with the old window's groups
-    // still sitting there -- this is when cross-window recovery fires.
-    const afterEnsure = reduce(state, { type: "local", name: "groupCreated", id: "mw_a", groupId: 20 }).state;
-    const afterEnsure2 = reduce(afterEnsure, { type: "local", name: "groupCreated", id: "mw_b", groupId: 21 }).state;
-
-    const { ops: secondSyncOps } = reduce(afterEnsure2, {
-      type: "sync",
-      seq: 3,
-      config: { collapseOthers: true, closeBehavior: "archive" },
-      state: {
-        activeId: "mw_a",
-        workspaces: [
-          { id: "mw_a", title: "alpha", color: "blue", archived: false },
-          { id: "mw_b", title: "beta", color: "red", archived: false },
-        ],
+describe("placement following: the exact live case (docs/protocol.md, 'Placement ownership')", () => {
+  // Zac's report, reproduced end to end: he manually moved a paired
+  // window's groups into a second Chrome window; auto-switching stopped
+  // for them. Move observed -> override recorded -> activation (and
+  // collapseOthers scoping) target the group in its NEW window from then
+  // on, with NO further attempt to move it back.
+  test("a live move to window B is observed, recorded as an override, and immediately targeted there", () => {
+    const state = makeState({
+      windowId: 100, // window A, the group's original/legacy home
+      byId: {
+        mw_a: { title: "compliance", color: "blue", archived: false, groupId: 10, lastActiveTabId: 101 },
       },
-      janitorGroups: [
-        { groupId: 20, title: "alpha", tabs: [] },
-        { groupId: 21, title: "beta", tabs: [] },
-      ],
-      foreignJanitorGroups: [
-        { groupId: 10, windowId: 777, title: "alpha" },
-        { groupId: 11, windowId: 777, title: "beta" },
-      ],
     });
-    expect(secondSyncOps).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 10, fromWindowId: 777, intoId: 20 });
-    expect(secondSyncOps).toContainEqual({ op: "recoverCrossWindow", fromGroupId: 11, fromWindowId: 777, intoId: 21 });
-    // Still never a report -- these are recognized, managed titles, not
-    // unrecognized foreign groups.
-    expect(secondSyncOps.find((o) => o.op === "reportForeignGroups")).toBeUndefined();
+
+    // The user drags the "compliance" group into window B (200). Chrome
+    // mints a new group id there (watchGroupPlacement's onCreated path --
+    // see its own comment for why the id doesn't survive a cross-window
+    // drag on most Chrome versions).
+    const movedGroups = [{ groupId: 99, windowId: 200, title: "compliance" }];
+    const drift = resolveGroupCache(state.byId, state, movedGroups);
+    expect(drift).toEqual([
+      { type: "local", name: "groupCreated", id: "mw_a", groupId: 99 },
+      { type: "local", name: "placementObserved", id: "mw_a", chromeWindowId: 200 },
+    ]);
+
+    let next = state;
+    /** @type {Op[]} */
+    const driftOps = [];
+    for (const fact of drift) {
+      const result = reduce(next, fact);
+      next = result.state;
+      driftOps.push(...result.ops);
+    }
+    expect(next.byId.mw_a.groupId).toBe(99);
+    expect(next.byId.mw_a.placementOverride).toBe("200");
+    expect(driftOps).toContainEqual({ op: "reportGroupPlacement", id: "mw_a", chromeWindowId: 200 });
+
+    // Activating this identity now targets window B, not window A --
+    // activate() itself is window-agnostic (a real groupId works from any
+    // window), but collapseOthers' own scoping proves the override is
+    // actually being read: an unrelated identity still in window A must
+    // NOT be collapsed by this activation (docs/protocol.md, "Chrome
+    // window pairing": "activates/collapses groups ONLY within W's paired
+    // Chrome window").
+    const withOther = {
+      ...next,
+      byId: {
+        ...next.byId,
+        mw_other: { title: "other", color: "red", archived: false, groupId: 55, lastActiveTabId: null, cmuxWindowId: null, homeChromeWindowId: null, placementOverride: null },
+      },
+    };
+    const { ops: activateOps } = reduce(withOther, {
+      type: "event",
+      seq: 1,
+      name: "workspace.activated",
+      workspace: { id: "mw_a", title: "compliance", color: "blue" },
+    });
+    expect(activateOps).toContainEqual({ op: "activate", id: "mw_a" });
+    expect(activateOps).toContainEqual({ op: "collapseOthers", exceptId: "mw_a", windowId: 200 });
   });
 });

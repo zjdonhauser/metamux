@@ -525,3 +525,49 @@ Partition convergence activated live: 6 mirror-era duplicate tabs reaped, verifi
 sessions = 7 cmux tabs (window 0: 6, window 1: 1), all tmux clients alive. README rewritten
 to current reality + future roadmap. Remaining user step: ONE extension reload activates
 window pairing + automation + all extension-side work. Known gaps listed in README.
+
+## Placement following (2026-08-27 evening, finishing round)
+
+Zac hit the flagged gap live: he manually moved a paired window's groups into a second Chrome
+window by hand and auto-switching stopped for them. Root cause: `resolveGroupCache` only ever
+compared a cached groupId against ONE legacy window and nulled anything else -- a real move
+looked identical to "this group is gone" to it. This round resolves "Known incomplete" items
+(1) and (2) from the window-pairing-half entry above.
+
+- [x] `reducer.js`'s `resolveGroupCache(byId, state, allGroups)` (signature changed from
+      `(byId, windowId, allGroups)`): resolves each entry against ITS OWN `targetWindowFor`
+      instead of one global window. A cached groupId that still exists anywhere is authoritative
+      regardless of window -- a move is reported (`placementObserved`), never invalidated. Title
+      fallback now searches every window too: found at target, plain correction; found
+      elsewhere, correction + `placementObserved` -- the contract's "adopt reality" fresh-boot
+      rule.
+- [x] New local fact `placementObserved` + op `reportGroupPlacement`: sets `placementOverride`
+      optimistically, sends the existing `groupPlacement` frame (daemon-side handling untouched
+      -- confirmed already correct from the prior round).
+- [x] `chrome-ops.js`'s `watchGroupRemap` replaced by `watchGroupPlacement`: listens to BOTH
+      `tabGroups.onCreated` and `onMoved` (Chrome's cross-window move mechanics aren't
+      consistent) across ALL windows, debounced, reruns the same boot-time decision live.
+      `watchGroupRemoved` no longer filters to one window and no longer assumes every removal is
+      a close -- waits a beat and re-checks by title before concluding a group is really gone
+      (no atomic Chrome signal distinguishes "moved" from "closed" at the instant onRemoved
+      fires). `watchTabActivation` (F9) no longer filters to one window either.
+- [x] `classifyJanitor`'s cross-window recovery now skips any title with an active
+      `placementOverride` -- resolves "Known incomplete" item (2) from the daemon-half entry.
+- [x] TDD: `resolveGroupCache`'s whole describe block rewritten for the new signature/behavior;
+      new "placement following: the exact live case" describe block reproduces Zac's report end
+      to end (move to window B -> override recorded -> activation + collapseOthers scoping both
+      target it there, immediately, no waiting for cross-window recovery); new janitor
+      override-skip regression test.
+- **Still known incomplete** (unchanged, out of this round's scope too): the janitor's own
+  duplicate-MERGING scan (`janitorGroups`/`scanTabGroups`) stays scoped to the single legacy
+  window, not per-paired-window -- a genuine duplicate spanning two non-legacy windows isn't
+  resolved by this round either (a coincidental same-titled group elsewhere is left alone, not
+  merged, once the real cached groupId is found to still exist). Boot-time reconciliation of a
+  per-window marker that exists in Chrome but isn't yet in `windowPairings` (item 3 from the
+  daemon-half entry) also remains unimplemented.
+- [x] `bun test`: 711 pass, 0 fail (up from 689 at the start of this round). `bunx tsc --noEmit`:
+      clean (excluding pre-existing `extension/automation.js` errors, not mine).
+- Staged via explicit paths (`extension/reducer.js`, `extension/chrome-ops.js`, `extension/sw.js`,
+  `extension/test/reducer.test.js`, `docs/protocol.md`, this file) -- daemon-builder's concurrent
+  WIP (`daemon/src/main.ts`, `daemon/src/server.ts`, `daemon/src/backflow-failure-tracker.ts`,
+  new automation-crash-safety/backflow-failure-tracker tests) intentionally left untouched.

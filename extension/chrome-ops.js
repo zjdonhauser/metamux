@@ -95,6 +95,8 @@ function executeOp(op, state, ctx) {
       return recoverCrossWindow(op, ctx);
     case "reportForeignGroups":
       return reportForeignGroups(op, ctx);
+    case "reportGroupPlacement":
+      return reportGroupPlacement(op, ctx);
     default:
       return Promise.resolve(null);
   }
@@ -370,6 +372,19 @@ async function reportForeignGroups(op, ctx) {
 }
 
 /**
+ * Placement ownership (docs/protocol.md, "Placement ownership"): reports
+ * an observed group move (or the fresh-boot "adopt reality" placement) to
+ * the daemon, which persists it as the identity's placementOverride.
+ * @param {Op} op
+ * @param {{sendFrame?: (frame: Record<string, any>) => void}} ctx
+ * @returns {Promise<null>}
+ */
+async function reportGroupPlacement(op, ctx) {
+  ctx.sendFrame?.({ type: "groupPlacement", id: op.id, chromeWindowId: String(op.chromeWindowId) });
+  return null;
+}
+
+/**
  * Every tab group chrome currently knows about, across ALL windows (unlike
  * scanTabGroups, which is metamux-window-only and carries per-tab detail
  * for the blank-orphan check). Feeds resolveGroupCache's cache-
@@ -434,33 +449,35 @@ export async function resolveMetamuxWindow(byId = {}) {
 /**
  * groupId is never trusted across restarts OR across a window-resolution
  * change (window-split fix, 2026-08-27: the cached groupId itself is
- * checked for membership in `windowId` before anything is trusted -- see
- * resolveGroupCache for why "chrome APIs accept a groupId cross-window"
- * made the old title-only re-resolution insufficient on its own).
+ * checked against its entry's OWN target window before anything is
+ * trusted -- see resolveGroupCache for why "chrome APIs accept a groupId
+ * cross-window" made the old title-only re-resolution insufficient on its
+ * own, and for the placement-following follow-up that widened this from
+ * one global windowId to per-entry targetWindowFor).
  * @param {State} state
- * @param {number} windowId
  * @returns {Promise<Msg[]>}
  */
-export async function reresolveGroupIds(state, windowId) {
+export async function reresolveGroupIds(state) {
   const allGroups = await allGroupsSnapshot();
-  return resolveGroupCache(state.byId, windowId, allGroups);
+  return resolveGroupCache(state.byId, state, allGroups);
 }
 
 /**
- * Tracks lastActiveTabId per group, scoped to the metamux window only, and
- * reports user-initiated group activations for reverse sync (F9): a group
- * counts as "user-activated" only when its tab was activated outside the
- * echo-suppression window that follows a server-driven activate op. The
- * marker tab and ungrouped tabs are never grouped, so they're excluded by
- * the same groupId check that already guards lastActiveTabId tracking.
- * @param {number} windowId
+ * Tracks lastActiveTabId per group and reports user-initiated group
+ * activations for reverse sync (F9): a group counts as "user-activated"
+ * only when its tab was activated outside the echo-suppression window
+ * that follows a server-driven activate op. Covers EVERY window (not just
+ * the legacy metamux window -- docs/protocol.md, "Window pairing": F9
+ * reverse sync must work for a group wherever it's paired/moved to) --
+ * safe by construction: the match lookup below only ever succeeds for a
+ * groupId genuinely tracked in `state.byId`, so activity in some
+ * unrelated, unmanaged window/tab simply never matches anything.
  * @param {() => State} getState
  * @param {(fact: Msg) => void} onFact
  * @param {(id: string) => void} onUserActivation
  */
-export function watchTabActivation(windowId, getState, onFact, onUserActivation) {
+export function watchTabActivation(getState, onFact, onUserActivation) {
   chrome.tabs.onActivated.addListener(async (activeInfo) => {
-    if (activeInfo.windowId !== windowId) return;
     let tab;
     try {
       tab = await chrome.tabs.get(activeInfo.tabId);
@@ -499,22 +516,46 @@ export async function scanTabGroups(windowId) {
   return snapshot;
 }
 
+// Placement following debounce (docs/protocol.md, "Placement ownership",
+// follow-up round): a single drag can fire several onCreated/onMoved
+// events in a burst (Chrome's cross-window group move mechanics aren't a
+// single atomic event -- see the comment on watchGroupPlacement below).
+// Coalesce them into one rescan.
+const PLACEMENT_RESCAN_DEBOUNCE_MS = 400;
+// Give watchGroupPlacement's rescan a head start before watchGroupRemoved
+// decides a vanished group was genuinely closed rather than moved -- see
+// that function's own comment for why this can't be made airtight without
+// an atomic Chrome API for "this group's window changed".
+const GROUP_REMOVED_MOVE_CHECK_DELAY_MS = 500;
+
 /**
- * Cross-window moves fire tabGroups.onCreated with a new groupId for a group
- * we already track by title. Detect that and correct the cache.
+ * Placement following (docs/protocol.md, "Placement ownership" / "Window
+ * pairing"): a managed group appearing or moving ANYWHERE gets re-resolved
+ * against the SAME pure decision boot uses (resolveGroupCache), against a
+ * fresh any-window snapshot. Covers two ways Chrome can report a
+ * cross-window group move, since the mechanism isn't consistent: a whole-
+ * group drag mints a NEW group id in the target window (tabGroups.onCreated
+ * fires, tabGroups.onRemoved fires for the old one -- the ORIGINAL window-
+ * split incident's mechanism), while some moves preserve the id and
+ * surface via tabGroups.onMoved instead. Debounced: only the LAST event in
+ * a burst actually rescans.
  * @param {() => State} getState
- * @param {number} windowId
  * @param {(fact: Msg) => void} onFact
  */
-export function watchGroupRemap(getState, windowId, onFact) {
-  chrome.tabGroups.onCreated.addListener((group) => {
-    if (group.windowId !== windowId) return;
-    const state = getState();
-    const match = Object.entries(state.byId).find(([, entry]) => entry.title === group.title);
-    if (match && match[1].groupId !== group.id) {
-      onFact({ type: "local", name: "groupCreated", id: match[0], groupId: group.id });
-    }
-  });
+export function watchGroupPlacement(getState, onFact) {
+  let pending = false;
+  const rescan = () => {
+    if (pending) return;
+    pending = true;
+    setTimeout(async () => {
+      pending = false;
+      const state = getState();
+      const allGroups = await allGroupsSnapshot();
+      for (const fact of resolveGroupCache(state.byId, state, allGroups)) onFact(fact);
+    }, PLACEMENT_RESCAN_DEBOUNCE_MS);
+  };
+  chrome.tabGroups.onCreated.addListener(rescan);
+  chrome.tabGroups.onMoved.addListener(rescan);
 }
 
 /**
@@ -525,18 +566,24 @@ export function watchGroupRemap(getState, windowId, onFact) {
  * the daemon so attachedAt clears and future syncs stop including it.
  * Echo-suppressed against our own archiveGroup(close)/mergeGroup/
  * closeGroup removals via markServerRemoval, called by those three
- * functions. Note: dragging a managed group into a DIFFERENT window also
- * fires this in the metamux window (a cross-window move looks identical to
- * a removal here) -- treated as a close, consistent with "never manage
- * groups in other windows."
+ * functions. Covers every window a managed group could live in (docs/
+ * protocol.md, "Window pairing": detach-on-close must work wherever a
+ * group is paired/moved to).
+ *
+ * A cross-window drag ALSO fires onRemoved for the group's old id (Chrome
+ * mints a new one in the target window -- see watchGroupPlacement) --
+ * indistinguishable from a genuine close at the instant this fires. There
+ * is no atomic Chrome signal for "this specific group moved windows", so
+ * this waits a beat and re-checks whether a group with the same title
+ * exists ANYWHERE before concluding it's really gone; watchGroupPlacement's
+ * own rescan (debounced shorter, so it normally settles first) is what
+ * would have already re-established tracking if this was actually a move.
  * @param {() => State} getState
- * @param {number} windowId
  * @param {(fact: Msg) => void} onFact
  * @param {(id: string) => void} onUserClosedGroup
  */
-export function watchGroupRemoved(getState, windowId, onFact, onUserClosedGroup) {
+export function watchGroupRemoved(getState, onFact, onUserClosedGroup) {
   chrome.tabGroups.onRemoved.addListener((group) => {
-    if (group.windowId !== windowId) return;
     const suppressedAt = serverRemovedGroupIds.get(group.id);
     serverRemovedGroupIds.delete(group.id);
     if (suppressedAt !== undefined && Date.now() - suppressedAt < GROUP_REMOVE_ECHO_SUPPRESS_MS) return;
@@ -544,8 +591,14 @@ export function watchGroupRemoved(getState, windowId, onFact, onUserClosedGroup)
     const state = getState();
     const match = Object.entries(state.byId).find(([, entry]) => entry.groupId === group.id);
     if (!match) return;
-    const [id] = match;
-    onFact({ type: "local", name: "groupCreated", id, groupId: null });
-    onUserClosedGroup(id);
+    const [id, entry] = match;
+
+    setTimeout(async () => {
+      const allGroups = await allGroupsSnapshot();
+      const stillExists = allGroups.some((g) => g.title === entry.title);
+      if (stillExists) return; // moved, not closed -- watchGroupPlacement already handled it
+      onFact({ type: "local", name: "groupCreated", id, groupId: null });
+      onUserClosedGroup(id);
+    }, GROUP_REMOVED_MOVE_CHECK_DELAY_MS);
   });
 }

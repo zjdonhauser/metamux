@@ -166,11 +166,34 @@ export class ActuatorServer {
       port: this.port,
       hostname: "127.0.0.1",
       fetch: (req, server) => this.handleFetch(req, server),
+      // Defense-in-depth: Bun already catches a fetch handler's own
+      // throw/rejection and turns it into a generic 500 without this, but
+      // an explicit handler logs it through our own log() and confirms
+      // that safety net is actually wired, rather than relying on Bun's
+      // undocumented default staying that way.
+      error: (err) => {
+        this.log(`[FATAL, CAUGHT] fetch handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+        return new Response(JSON.stringify({ ok: false, error: "internal error" }), { status: 500 });
+      },
       websocket: {
         open: () => {
           // wait for hello before doing anything
         },
-        message: (ws, message) => this.handleWsMessage(ws, message),
+        // Unlike fetch:, an uncaught throw here is NOT safely caught by
+        // Bun -- it kills the entire process instantly (verified directly:
+        // a fetch handler throw produces a 500 and the process survives;
+        // a websocket.message handler throw does not, with no stack trace
+        // surviving into daemon.log -- see docs/protocol.md, "Process-
+        // level crash safety net"). handleWsMessage's own try/catch is the
+        // primary guard; process.on("uncaughtException") in main.ts is the
+        // last-resort net underneath it.
+        message: (ws, message) => {
+          try {
+            this.handleWsMessage(ws, message);
+          } catch (err) {
+            this.log(`[FATAL, CAUGHT] websocket.message handler error: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+          }
+        },
         close: (ws) => {
           this.clients.delete(ws);
           if (this.extensionSocket === ws) this.extensionSocket = null;

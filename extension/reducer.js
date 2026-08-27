@@ -134,12 +134,18 @@
 /**
  * @typedef {Object} LocalMsg
  * @property {"local"} type
- * @property {"tabActivated"|"groupCreated"|"windowResolved"} name
- * @property {string} [id]          metamux workspace id, for groupCreated
+ * @property {"tabActivated"|"groupCreated"|"windowResolved"|"placementObserved"} name
+ * @property {string} [id]          metamux workspace id, for groupCreated/placementObserved
  * @property {number|null} [groupId] group lookup key for tabActivated; for groupCreated, the
  *                                    resolved id, or null to invalidate a stale cache entry
  * @property {number} [tabId]       for tabActivated
  * @property {number} [windowId]    for windowResolved
+ * @property {number} [chromeWindowId]  for placementObserved -- see reduceLocal's own case.
+ *   Placement ownership (docs/protocol.md, "Placement ownership"): a managed group was OBSERVED
+ *   living in a Chrome window other than its current target -- either a live user move
+ *   (watchGroupPlacement) or the fresh-boot "adopt reality" rule (resolveGroupCache), which are
+ *   deliberately indistinguishable here (both just mean "record an override for wherever it
+ *   actually is, never try to move it").
  */
 
 /**
@@ -169,6 +175,9 @@
  *   identity's home is paired to, when windowId is null because no Chrome pairing exists YET --
  *   chrome-ops.js creates one on demand and reports it. null/absent for a cmux-sourced identity,
  *   or a tmux session in legacy windows/global mirror mode (see targetWindowFor).
+ * @property {number} [chromeWindowId]  reportGroupPlacement: the Chrome window (a real number --
+ *   this is chrome-ops.js's own observation, not a wire value) a managed group was observed
+ *   living in, to report to the daemon as a `groupPlacement` frame.
  */
 
 /**
@@ -332,6 +341,16 @@ function isBlankTabUrl(url) {
  * managed at all is never even considered, per "Foreign titles in other
  * windows: never touched."
  *
+ * Placement ownership (docs/protocol.md, "Placement ownership", follow-up
+ * round): a managed title with an active `placementOverride` is SKIPPED
+ * here entirely, even if it otherwise matches. Its "foreign" window IS its
+ * home now -- recovering it into the metamux window's canonical would
+ * fight the very override the user's move just established. With the
+ * fresh-boot "adopt reality" rule now recording an override for anything
+ * observed outside its target window (resolveGroupCache), cross-window
+ * recovery only ever fires for a genuine window-split leftover: a group
+ * NO override has ever legitimized.
+ *
  * Pure: every enumeration snapshot is passed in as data, not gathered here.
  * @param {Object<string, WorkspaceEntry>} byId
  * @param {JanitorGroupSnapshot[]} groups
@@ -389,6 +408,7 @@ function classifyJanitor(byId, groups, foreignGroups, crossWindowEnabled) {
     for (const group of foreignGroups) {
       const id = idByTitle[group.title];
       if (id === undefined) continue; // not a managed title -- never touched
+      if (byId[id].placementOverride != null) continue; // overridden -- this IS its home now, never recover
       const canonicalGroupId = canonicalGroupIdByTitle[group.title];
       if (canonicalGroupId === undefined) continue; // no in-window canonical yet -- next sync recovers it
       ops.push({ op: "recoverCrossWindow", fromGroupId: group.groupId, fromWindowId: group.windowId, intoId: canonicalGroupId });
@@ -643,9 +663,31 @@ function reduceLocal(state, msg) {
       return reduceGroupCreated(state, msg);
     case "windowResolved":
       return { state: { ...state, windowId: /** @type {number} */ (msg.windowId) }, ops: [] };
+    case "placementObserved":
+      return reducePlacementObserved(state, msg);
     default:
       return { state, ops: [] };
   }
+}
+
+/**
+ * Placement ownership (docs/protocol.md, "Placement ownership"): records
+ * the observed window as this identity's override, optimistically (same
+ * "act now, let the next sync confirm" pattern as markServerActivation
+ * and the daemon's own optimistic registry writes) -- and emits the op
+ * that reports it to the daemon. No-op for an unknown id (a stale
+ * observation racing a prune).
+ * @param {State} state
+ * @param {LocalMsg} msg
+ * @returns {{state: State, ops: Op[]}}
+ */
+function reducePlacementObserved(state, msg) {
+  const id = /** @type {string} */ (msg.id);
+  const existing = state.byId[id];
+  if (!existing) return { state, ops: [] };
+  const chromeWindowId = /** @type {number} */ (msg.chromeWindowId);
+  const byId = { ...state.byId, [id]: { ...existing, placementOverride: String(chromeWindowId) } };
+  return { state: { ...state, byId }, ops: [{ op: "reportGroupPlacement", id, chromeWindowId }, { op: "saveState" }] };
 }
 
 /**
@@ -676,55 +718,89 @@ function reduceGroupCreated(state, msg) {
   return { state: { ...state, byId }, ops: [{ op: "saveState" }] };
 }
 
-// --- Window-split recovery (2026-08-27) ---------------------------------
+// --- Window-split recovery (2026-08-27) / placement following (2026-08-27
+// evening, follow-up) --------------------------------------------------
 //
-// Root cause of the live incident this section fixes: resolveMetamuxWindow
-// picked a DIFFERENT window than the one holding Zac's real tab groups
-// (the original marker tab was closed during manual cleanup). Chrome's
-// tabGroups/tabs APIs accept a groupId regardless of which window it
-// actually lives in, so the cached groupIds from the old window kept
-// silently working for activation -- violating the F3-adjacent hard rule
-// that activation must never touch a group outside the managed window --
-// while ensureGroup's windowId-scoped query rebuilt a second full set in
-// the new window, and the janitor (scoped to the new window only) never
-// saw the old window's groups to report or merge them. Both functions
-// below are pure: chrome-ops.js gathers the snapshot, these decide.
+// Root cause of the ORIGINAL live incident this section fixed:
+// resolveMetamuxWindow picked a DIFFERENT window than the one holding
+// Zac's real tab groups (the original marker tab was closed during manual
+// cleanup). Chrome's tabGroups/tabs APIs accept a groupId regardless of
+// which window it actually lives in, so the cached groupIds from the old
+// window kept silently working for activation -- violating the
+// F3-adjacent hard rule that activation must never touch a group outside
+// the managed window -- while ensureGroup's windowId-scoped query rebuilt
+// a second full set in the new window, and the janitor (scoped to the new
+// window only) never saw the old window's groups to report or merge them.
+//
+// SECOND live incident (window pairing follow-up): Zac manually moved a
+// paired window's groups into another Chrome window by hand. The original
+// single-`windowId` version of resolveGroupCache below nulled their
+// cached groupIds (wrong window per that one check) instead of following
+// them -- activation silently no-op'd. Fixed by resolving each entry's
+// OWN target window (targetWindowFor, which already knows about
+// placementOverride/homeChromeWindowId) instead of one global `windowId`,
+// and by treating "the group moved" as valid tracking to correct/extend,
+// never as a reason to drop it. Both functions below are pure: chrome-
+// ops.js gathers the snapshot, these decide.
 
 /**
- * Cache invalidation on window resolution: verifies every cached groupId
- * for an unarchived entry actually belongs to `windowId`. A mismatch (or a
- * groupId that no longer exists in `allGroups` at all) re-resolves by
- * title WITHIN windowId; no match there either -> null, to be recreated
- * by the next ensureGroup. This is the check that closes the gap above --
- * a stale cross-window groupId is caught here instead of silently working.
+ * Cache invalidation + placement following, together: for every
+ * unarchived entry, resolves its groupId against its OWN target window
+ * (targetWindowFor -- placementOverride > homeChromeWindowId > the legacy
+ * single metamux window), using a full ANY-WINDOW snapshot.
+ *  - The cached groupId still exists somewhere: authoritative regardless
+ *    of which window it's actually in -- a group never silently drops out
+ *    of tracking just because it moved (docs/protocol.md, "Placement
+ *    ownership": a moved group keeps working wherever it lives). If its
+ *    real window differs from the target, that's an observed move ->
+ *    `placementObserved`, no `groupCreated` needed (the id itself is
+ *    still correct).
+ *  - No live cached groupId (never set, or Chrome minted a new id for a
+ *    cross-window move -- see watchGroupPlacement): falls back to title
+ *    match, preferring the target window if a candidate lives there. A
+ *    candidate found anywhere ELSE is the contract's fresh-boot "adopt
+ *    reality" rule -- `groupCreated` (the id) AND `placementObserved`
+ *    (wherever it is), never an attempt to move it back.
  * @param {Object<string, WorkspaceEntry>} byId
- * @param {number} windowId
+ * @param {State} state
  * @param {GroupSnapshot[]} allGroups  every tab group chrome knows about, ANY window
  * @returns {LocalMsg[]}
  */
-export function resolveGroupCache(byId, windowId, allGroups) {
+export function resolveGroupCache(byId, state, allGroups) {
   const groupsById = new Map(allGroups.map((g) => [g.groupId, g]));
-  /** @type {Map<string, number>} */
-  const inWindowByTitle = new Map();
+  /** @type {Map<string, GroupSnapshot[]>} */
+  const groupsByTitle = new Map();
   for (const g of allGroups) {
-    if (g.windowId === windowId && !inWindowByTitle.has(g.title)) inWindowByTitle.set(g.title, g.groupId);
+    const list = groupsByTitle.get(g.title);
+    if (list) list.push(g);
+    else groupsByTitle.set(g.title, [g]);
   }
 
   /** @type {LocalMsg[]} */
   const facts = [];
   for (const [id, entry] of Object.entries(byId)) {
     if (entry.archived) continue;
+    const targetWindowId = targetWindowFor(entry, state);
 
-    let groupId = null;
     if (entry.groupId != null) {
       const cached = groupsById.get(entry.groupId);
-      if (cached && cached.windowId === windowId) groupId = entry.groupId;
+      if (cached) {
+        if (cached.windowId !== targetWindowId) {
+          facts.push({ type: "local", name: "placementObserved", id, chromeWindowId: cached.windowId });
+        }
+        continue; // the id itself is still correct -- nothing to correct
+      }
     }
-    if (groupId == null) {
-      groupId = inWindowByTitle.get(entry.title) ?? null;
-    }
+
+    const candidates = groupsByTitle.get(entry.title) ?? [];
+    const atTarget = candidates.find((g) => g.windowId === targetWindowId);
+    const chosen = atTarget ?? candidates[0] ?? null;
+    const groupId = chosen ? chosen.groupId : null;
     if (groupId !== entry.groupId) {
       facts.push({ type: "local", name: "groupCreated", id, groupId });
+    }
+    if (chosen && !atTarget) {
+      facts.push({ type: "local", name: "placementObserved", id, chromeWindowId: chosen.windowId });
     }
   }
   return facts;

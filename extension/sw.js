@@ -59,21 +59,19 @@ async function boot() {
   windowId = await chromeOps.resolveMetamuxWindow(state.byId);
   state = { ...state, windowId };
 
-  const corrections = await chromeOps.reresolveGroupIds(state, windowId);
+  const corrections = await chromeOps.reresolveGroupIds(state);
   for (const fact of corrections) {
     await dispatch(fact);
   }
 
   chromeOps.watchTabActivation(
-    windowId,
     () => state,
     dispatch,
     (id) => ws.send({ type: "userActivatedGroup", id }),
   );
-  chromeOps.watchGroupRemap(() => state, /** @type {number} */ (windowId), dispatch);
+  chromeOps.watchGroupPlacement(() => state, dispatch);
   chromeOps.watchGroupRemoved(
     () => state,
-    /** @type {number} */ (windowId),
     dispatch,
     (id) => ws.send({ type: "userClosedGroup", id }),
   );
