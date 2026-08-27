@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>metamux options</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #111319;
+    color: #e6e6e6;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 360px;
+  }
+  h1 { font-size: 14px; font-weight: 600; margin: 0 0 16px; }
+  label { display: block; margin-bottom: 4px; color: #9aa0ac; }
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    margin-bottom: 12px;
+    background: #1b1e26;
+    border: 1px solid #2a2e38;
+    border-radius: 4px;
+    color: #e6e6e6;
+    font: inherit;
+  }
+  .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+  button {
+    padding: 6px 12px;
+    background: #2a2e38;
+    border: 1px solid #363b47;
+    border-radius: 4px;
+    color: #e6e6e6;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { background: #363b47; }
+  #test-result { color: #9aa0ac; }
+  #test-result.ok { color: #3fb950; }
+  #test-result.fail { color: #e5534b; }
+</style>
+</head>
+<body>
+  <h1>metamux</h1>
+  <form id="form">
+    <label for="port">Port</label>
+    <input id="port" type="number" min="1" max="65535" placeholder="8377" />
+
+    <label for="secret">Secret</label>
+    <input id="secret" type="text" autocomplete="off" spellcheck="false" />
+
+    <div class="row">
+      <button type="submit">Save</button>
+      <button type="button" id="test">Test connection</button>
+      <span id="test-result"></span>
+    </div>
+  </form>
+  <script type="module" src="options.js"></script>
+</body>
+</html>

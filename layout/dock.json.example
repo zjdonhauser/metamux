@@ -1,0 +1,10 @@
+{
+  "controls": [
+    {
+      "id": "metamux-focus",
+      "title": "🌐 Browser",
+      "command": "bun /Users/zachary/Documents/GitHub/metamux/cli/metamux.ts focus",
+      "height": 80
+    }
+  ]
+}

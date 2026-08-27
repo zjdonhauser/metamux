@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>metamux</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 20px;
+    background: #111319;
+    color: #e6e6e6;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    min-width: 220px;
+  }
+  h1 {
+    font-size: 12px;
+    font-weight: 600;
+    margin: 0 0 12px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #6b7280;
+  }
+  .active-workspace {
+    font-size: 18px;
+    font-weight: 700;
+    margin: 0 0 4px;
+    letter-spacing: 0.01em;
+  }
+  .active-workspace .none { color: #6b7280; font-weight: 400; }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 18px;
+    color: #9aa0ac;
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #555;
+    flex: none;
+  }
+  .dot.connected { background: #3fb950; }
+  .dot.disconnected { background: #e5534b; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 0;
+    border-bottom: 1px solid #22252d;
+  }
+  li.archived { opacity: 0.4; }
+  li.active { font-weight: 600; }
+  .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ports { display: flex; gap: 4px; flex-wrap: wrap; }
+  .ports a {
+    color: #8ab4f8;
+    text-decoration: none;
+    font-size: 11px;
+    padding: 1px 6px;
+    border: 1px solid #2a2e38;
+    border-radius: 999px;
+  }
+  .ports a:hover { border-color: #8ab4f8; }
+  .empty { color: #6b7280; }
+</style>
+</head>
+<body>
+  <div class="status">
+    <span id="status-dot" class="dot"></span>
+    <span id="status-text">connecting…</span>
+  </div>
+  <div class="active-workspace" id="active-workspace"><span class="none">no active workspace</span></div>
+  <h1>workspaces</h1>
+  <ul id="workspace-list"></ul>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

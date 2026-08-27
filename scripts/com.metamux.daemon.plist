@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the metamux daemon LaunchAgent. Placeholders (__BUN_PATH__,
+  __REPO_PATH__, __HOME__) are filled in by scripts/install-launchd.sh at
+  install time -- do not hand-edit this file directly, edit the template
+  and re-run the installer.
+
+  Socket-gated features (ports watcher, reverse sync, window follow) degrade
+  gracefully with no cmux env under launchd: the daemon logs "socket
+  features disabled" and runs tail-only. This is expected, not a bug.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.metamux.daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BUN_PATH__</string>
+    <string>__REPO_PATH__/daemon/src/main.ts</string>
+    <string>run</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_PATH__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/metamux/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/metamux/launchd.err.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

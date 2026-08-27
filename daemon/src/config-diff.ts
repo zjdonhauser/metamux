@@ -1,0 +1,71 @@
+// Pure config diff/classification for hot-reload. No I/O -- the watcher
+// (config-watch.ts) reads the file and calls this; main.ts decides what to
+// do with each ConfigChange (apply live, or log "restart required for").
+
+import type { MetamuxConfig } from "./config.ts";
+
+export type ConfigChangeKey =
+  | "port"
+  | "eventsPath"
+  | "closeBehavior"
+  | "collapseOthers"
+  | "debounceMs"
+  | "reverseSync"
+  | "groupBy"
+  | "createGroups"
+  | "ports.mode"
+  | "ports.ignore"
+  | "ports.maxPort";
+
+export interface ConfigChange {
+  key: ConfigChangeKey;
+  oldValue: unknown;
+  newValue: unknown;
+  hotApplicable: boolean;
+}
+
+/** Applied live without a daemon restart. port and eventsPath are the only
+ * config keys NOT in this set (port needs a rebind, eventsPath needs a
+ * fresh tail from a new file). */
+export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set([
+  "closeBehavior",
+  "collapseOthers",
+  "createGroups",
+  "debounceMs",
+  "groupBy",
+  "ports.ignore",
+  "ports.maxPort",
+  "ports.mode",
+  "reverseSync",
+]);
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((v, i) => deepEqual(v, b[i]));
+  }
+  return false;
+}
+
+/** Diffs two loaded configs key by key (including nested ports.*), reporting
+ * only the keys that actually changed, each tagged with whether it can be
+ * applied live. */
+export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): ConfigChange[] {
+  const candidates: { key: ConfigChangeKey; oldValue: unknown; newValue: unknown }[] = [
+    { key: "port", oldValue: oldConfig.port, newValue: newConfig.port },
+    { key: "eventsPath", oldValue: oldConfig.eventsPath, newValue: newConfig.eventsPath },
+    { key: "closeBehavior", oldValue: oldConfig.closeBehavior, newValue: newConfig.closeBehavior },
+    { key: "collapseOthers", oldValue: oldConfig.collapseOthers, newValue: newConfig.collapseOthers },
+    { key: "debounceMs", oldValue: oldConfig.debounceMs, newValue: newConfig.debounceMs },
+    { key: "reverseSync", oldValue: oldConfig.reverseSync, newValue: newConfig.reverseSync },
+    { key: "groupBy", oldValue: oldConfig.groupBy, newValue: newConfig.groupBy },
+    { key: "createGroups", oldValue: oldConfig.createGroups, newValue: newConfig.createGroups },
+    { key: "ports.mode", oldValue: oldConfig.ports.mode, newValue: newConfig.ports.mode },
+    { key: "ports.ignore", oldValue: oldConfig.ports.ignore, newValue: newConfig.ports.ignore },
+    { key: "ports.maxPort", oldValue: oldConfig.ports.maxPort, newValue: newConfig.ports.maxPort },
+  ];
+
+  return candidates
+    .filter((c) => !deepEqual(c.oldValue, c.newValue))
+    .map((c) => ({ ...c, hotApplicable: HOT_APPLICABLE_CONFIG_KEYS.has(c.key) }));
+}

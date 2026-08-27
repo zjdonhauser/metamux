@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "metamux",
+  "version": "0.1.0",
+  "description": "Mirrors cmux workspace switches to Chrome tab groups.",
+  "permissions": ["tabs", "tabGroups", "storage", "alarms"],
+  "background": {
+    "service_worker": "sw.js",
+    "type": "module"
+  },
+  "options_page": "options.html"
+}

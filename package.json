@@ -1,0 +1,19 @@
+{
+  "name": "metamux",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "metamux": "cli/metamux.ts"
+  },
+  "scripts": {
+    "daemon": "bun daemon/src/main.ts",
+    "test": "bun test",
+    "fake-ext": "bun scripts/fake-extension.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/chrome": "^0.0.280",
+    "playwright-core": "^1.62.1"
+  }
+}
