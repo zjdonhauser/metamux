@@ -30,6 +30,7 @@ function run() {
 }
 
 const read = (name: string) => readFileSync(join(home, name), "utf8");
+const SHELL_DIR = ".config/metamux/shell";
 const backups = (name: string) => readdirSync(home).filter((f) => f.startsWith(`${name}.metamux-bak-`));
 const count = (haystack: string, needle: string) => haystack.split(needle).length - 1;
 
@@ -95,7 +96,7 @@ describe("install-shell.sh", () => {
     const zshrc = read(".zshrc");
 
     expect(zshrc).not.toContain("ensure-daemon.sh");
-    expect(zshrc).toContain(`source "${REPO}/shell/metamux.zsh"`);
+    expect(zshrc).toContain(`source "${join(home, SHELL_DIR)}/metamux.zsh"`);
   });
 
   test("moves the tmux binds out and leaves theming in place", () => {
@@ -107,7 +108,7 @@ describe("install-shell.sh", () => {
     expect(conf).not.toContain("@jumpnav");
     expect(conf).toContain("set -g prefix C-a");
     expect(conf).toContain('set -g status-style "bg=#152744"');
-    expect(conf).toContain(`source-file "${REPO}/shell/metamux.tmux.conf"`);
+    expect(conf).toContain(`source-file "${join(home, SHELL_DIR)}/metamux.tmux.conf"`);
   });
 
   test("is idempotent: a second run writes nothing and adds no blank-line drift", () => {
@@ -135,9 +136,9 @@ describe("install-shell.sh", () => {
   test("installs into a home with no dotfiles yet", () => {
     run();
     expect(read(".zshrc")).toBe(
-      `# >>> metamux >>>\nsource "${REPO}/shell/metamux.zsh"\n# <<< metamux <<<\n`,
+      `# >>> metamux >>>\nsource "${join(home, SHELL_DIR)}/metamux.zsh"\n# <<< metamux <<<\n`,
     );
-    expect(read(".tmux.conf")).toContain(`source-file "${REPO}/shell/metamux.tmux.conf"`);
+    expect(read(".tmux.conf")).toContain(`source-file "${join(home, SHELL_DIR)}/metamux.tmux.conf"`);
     expect(backups(".zshrc").length).toBe(0);
   });
 
@@ -151,5 +152,33 @@ describe("install-shell.sh", () => {
 
     expect(zshrc).not.toContain("/old/path/metamux");
     expect(count(zshrc, "# >>> metamux >>>")).toBe(1);
+  });
+
+  // The bug this file's copy-instead-of-source design exists to prevent: macOS
+  // denies the tmux server access to ~/Documents, so a dotfile that sources
+  // straight out of the repo errors in every tmux pane.
+  test("never points a dotfile at the repo, only at the ungated copy", () => {
+    run();
+    for (const f of [".zshrc", ".tmux.conf"]) {
+      expect(read(f)).not.toContain(`${REPO}/shell/`);
+      expect(read(f)).toContain(`${join(home, SHELL_DIR)}/`);
+    }
+  });
+
+  test("installs both files and substitutes the repo path", () => {
+    run();
+    const zsh = read(`${SHELL_DIR}/metamux.zsh`);
+    expect(zsh).not.toContain("__METAMUX_REPO__");
+    expect(zsh).toContain(`METAMUX_REPO:-${REPO}`);
+    expect(read(`${SHELL_DIR}/metamux.tmux.conf`)).toContain("bind -n F1");
+  });
+
+  test("refreshes the installed copy when the template changes", () => {
+    run();
+    const target = join(home, SHELL_DIR, "metamux.zsh");
+    writeFileSync(target, "# stale\n");
+    const output = run();
+    expect(output).toContain("installed metamux.zsh");
+    expect(readFileSync(target, "utf8")).not.toBe("# stale\n");
   });
 });

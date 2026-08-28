@@ -60,11 +60,12 @@ Every step is idempotent, so re-running after a `git pull` is how you update. Th
 never starts a daemon, loads the LaunchAgent, or changes your default browser; it prints
 those as explicit follow-ups.
 
-1. **Shell + tmux** (`scripts/install-shell.sh`): writes one marker block into `~/.zshrc`
-   that sources `shell/metamux.zsh`, and one into `~/.tmux.conf` that source-files
-   `shell/metamux.tmux.conf`. Those two files hold everything metamux puts in your shell:
-   the tmux session picker (`t`), remote-login auto-attach, the daemon ensure, and the
-   F1-F4 / jumpnav navigation binds. Edit them and open a new shell; no reinstall needed.
+1. **Shell + tmux** (`scripts/install-shell.sh`): copies `shell/metamux.zsh` and
+   `shell/metamux.tmux.conf` into `~/.config/metamux/shell/`, then writes one marker block
+   into `~/.zshrc` and one into `~/.tmux.conf` pointing at those copies. They hold everything
+   metamux puts in your shell: the tmux session picker (`t`), remote-login auto-attach, the
+   daemon ensure, and the F1-F4 / jumpnav navigation binds. **Edit the repo copies and re-run
+   the installer** -- see the note below on why the dotfiles cannot read the repo directly.
 2. **Daemon**: auto-ensured by the shell block in every cmux shell
    (`scripts/ensure-daemon.sh`); manual start is `bun run daemon` from a cmux shell (socket
    features need cmux's env).
@@ -96,6 +97,20 @@ those as explicit follow-ups.
 the Left-arrow picker popup for phone clients. Its popup runs `zsh -ic _tmux_pick`, so the
 `~/.zshrc` source line must stay unconditional for interactive shells. Prefix, copy-mode,
 theming, and TPM stay in your own `~/.tmux.conf`.
+
+### Why the dotfiles point at ~/.config, not at the repo
+
+macOS gates `~/Documents` behind a TCC grant that the tmux server does not inherit. A shell
+started inside tmux gets `operation not permitted` on anything under it, so a `~/.zshrc` that
+sourced straight out of a repo living there printed an error in **every tmux pane**. `~/.config`
+is ungated, so the installer copies and substitutes `__METAMUX_REPO__` the way
+`install-launchd.sh` templates the plist. The cost is that editing `shell/*` needs
+`./install.sh --only shell` to take effect.
+
+Worth knowing if you hit the same wall: the grant attaches to the process that started the tmux
+server, so a long-lived server can go stale while a freshly started one is fine. Test with
+`tmux -L probe new -d -s p -c ~ '...'` from a terminal outside tmux; that leaves your real
+sessions untouched.
 
 ## CLI
 

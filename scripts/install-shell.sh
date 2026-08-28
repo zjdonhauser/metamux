@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Installs the metamux shell integration:
-#   ~/.zshrc      gets a marker block that sources shell/metamux.zsh
-#   ~/.tmux.conf  gets a marker block that source-files shell/metamux.tmux.conf
+#   ~/.config/metamux/shell/   gets copies of shell/metamux.{zsh,tmux.conf}
+#   ~/.zshrc                   sources the installed metamux.zsh
+#   ~/.tmux.conf               source-files the installed metamux.tmux.conf
 #
-# Idempotent. Re-running when both files already carry the current block makes
-# no writes and takes no backup. Editing shell/metamux.zsh needs no reinstall --
-# the block points at the repo file, so a new shell picks the edit up.
+# The dotfiles point at COPIES under ~/.config, never at the repo. macOS gates
+# ~/Documents behind a TCC grant the tmux server does not inherit, so a shell
+# started inside tmux cannot read anything under it -- sourcing from the repo
+# put an "operation not permitted" error in every tmux pane. ~/.config is
+# ungated. This is why editing shell/metamux.zsh needs a reinstall to take
+# effect; install-menubar.sh copies for a related reason.
+#
+# Idempotent. Re-running when everything already matches makes no writes and
+# takes no backup.
 #
 # One-time migration: the picker functions, remote auto-attach, daemon-ensure
 # line, and tmux navigation binds used to live inline in the dotfiles. This
@@ -20,6 +27,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZSHRC="${ZDOTDIR:-$HOME}/.zshrc"
 TMUX_CONF="$HOME/.tmux.conf"
 STAMP="$(date +%Y%m%d-%H%M%S)"
+SHELL_DIR="$HOME/.config/metamux/shell"
 
 BEGIN_MARK="# >>> metamux >>>"
 END_MARK="# <<< metamux <<<"
@@ -86,12 +94,25 @@ apply() {
   echo "installed $label -> $file"
 }
 
+# Copy the templates into the ungated location, substituting the repo path the
+# way install-launchd.sh templates the plist.
+mkdir -p "$SHELL_DIR"
+for f in metamux.zsh metamux.tmux.conf; do
+  rendered="$(sed "s#__METAMUX_REPO__#$REPO_DIR#g" "$REPO_DIR/shell/$f")"
+  if [[ -f "$SHELL_DIR/$f" ]] && diff -q "$SHELL_DIR/$f" <(printf '%s\n' "$rendered") >/dev/null 2>&1; then
+    echo "$f already current -> $SHELL_DIR/$f"
+  else
+    printf '%s\n' "$rendered" > "$SHELL_DIR/$f"
+    echo "installed $f -> $SHELL_DIR/$f"
+  fi
+done
+
 zshrc_src="$(cat "$ZSHRC" 2>/dev/null || true)"
 zshrc_new="$(
   printf '%s\n' "$zshrc_src" \
     | strip_region '^# --- tmux session picker' '^# fi$' \
     | strip_region '^# metamux: ensure the daemon is running' 'ensure-daemon' \
-    | upsert_block "source \"$REPO_DIR/shell/metamux.zsh\""
+    | upsert_block "source \"$SHELL_DIR/metamux.zsh\""
 )"
 apply "$ZSHRC" "$zshrc_new" "zsh integration"
 
@@ -99,10 +120,11 @@ tmux_src="$(cat "$TMUX_CONF" 2>/dev/null || true)"
 tmux_new="$(
   printf '%s\n' "$tmux_src" \
     | strip_region '^# Touch-only switching' "^  'send-keys Left'\$" \
-    | upsert_block "source-file \"$REPO_DIR/shell/metamux.tmux.conf\""
+    | upsert_block "source-file \"$SHELL_DIR/metamux.tmux.conf\""
 )"
 apply "$TMUX_CONF" "$tmux_new" "tmux integration"
 
 echo ""
 echo "Open a new shell to pick up the zsh side."
+echo "Edited shell/*? Re-run this script -- the dotfiles read the installed copies."
 echo "Reload tmux with: tmux source-file $TMUX_CONF"

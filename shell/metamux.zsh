@@ -1,20 +1,28 @@
 # metamux shell integration -- the single zsh-side entry point.
 #
-# Installed by scripts/install-shell.sh, which writes ONE marker block into
-# ~/.zshrc that sources this file. Everything metamux touches in your shell
-# lives here: the tmux session picker, remote-login auto-attach, and the
-# daemon ensure. Edit this file and open a new shell; no reinstall needed.
+# TEMPLATE. scripts/install-shell.sh COPIES this to ~/.config/metamux/shell/ and
+# substitutes __METAMUX_REPO__. ~/.zshrc sources the copy, never this file.
+# Re-run `./install.sh --only shell` after editing.
 #
-# Sourced unconditionally for interactive shells. Do not gate the source line
-# on CMUX_WORKSPACE_ID: ~/.tmux.conf's jumpnav Left bind runs
-# `zsh -ic _tmux_pick` from a plain client, and that needs these functions.
+# The copy is not a convenience. macOS gates ~/Documents behind a TCC grant the
+# tmux server does not inherit, so a shell started inside tmux gets "operation
+# not permitted" reading anything under it -- sourcing straight from the repo
+# broke every tmux pane. ~/.config is ungated. install-menubar.sh copies for a
+# related reason.
+#
+# Everything metamux touches in your shell lives here: the tmux session picker,
+# remote-login auto-attach, and the daemon ensure.
+#
+# Sourced unconditionally for interactive shells. Do not gate the source line on
+# CMUX_WORKSPACE_ID: ~/.tmux.conf's jumpnav Left bind runs `zsh -ic _tmux_pick`
+# from a plain client, and that needs these functions.
 
-# Repo root, resolved from this file so the integration is path-independent.
-# %x is the file currently being sourced; :h twice walks shell/ -> repo root.
-typeset -g METAMUX_REPO="${METAMUX_REPO:-${${(%):-%x}:A:h:h}}"
+# Baked in at install time. Not derived from this file's own path: the installed
+# copy lives outside the repo, so %x would resolve to the wrong place.
+typeset -g METAMUX_REPO="${METAMUX_REPO:-__METAMUX_REPO__}"
 
-# Where new tmux sessions start. Mirrors the daemon's tmux.spawnCwd config,
-# kept as a plain variable so the picker never has to reach the daemon.
+# Where new tmux sessions start. Mirrors the daemon's tmux.spawnCwd config, kept
+# as a plain variable so the picker never has to reach the daemon.
 typeset -g METAMUX_SPAWN_CWD="${METAMUX_SPAWN_CWD:-$HOME/Documents/GitHub}"
 
 # --- tmux session picker (shared by SSH login and the `t` shortcut) ---
@@ -161,4 +169,8 @@ fi
 # fi
 
 # Ensure the daemon is running (cmux shells only, keeps socket features on).
-[ -n "$CMUX_WORKSPACE_ID" ] && (bash "$METAMUX_REPO/scripts/ensure-daemon.sh" >/dev/null 2>&1 &)
+# Guarded on readability: inside tmux the repo sits behind the TCC wall, and the
+# daemon belongs to a non-tmux cmux shell anyway.
+if [ -n "$CMUX_WORKSPACE_ID" ] && [ -r "$METAMUX_REPO/scripts/ensure-daemon.sh" ]; then
+  (bash "$METAMUX_REPO/scripts/ensure-daemon.sh" >/dev/null 2>&1 &)
+fi

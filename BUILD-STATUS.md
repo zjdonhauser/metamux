@@ -668,3 +668,32 @@ Note for whoever reads the log next: doubling is present for every line before
 `2026-08-28T13:51Z`. It makes the 02:13 storm look twice as large as it was.
 
 - [x] `bun test`: 732 pass, 0 fail. `bunx tsc --noEmit`: clean.
+
+## Shell integration moved to ~/.config (2026-08-28, TCC incident)
+
+Zac: "all of my tmux sessions are getting blocked from claude codex etc." Two separate faults,
+one mine.
+
+- [x] MINE: sourcing `shell/metamux.zsh` out of `~/Documents/GitHub/metamux` put
+      `operation not permitted` in every tmux pane. macOS gates `~/Documents` behind a TCC grant
+      the tmux server does not inherit. `install-shell.sh` now COPIES both shell files into
+      `~/.config/metamux/shell/`, substituting `__METAMUX_REPO__` the way `install-launchd.sh`
+      templates the plist. Tradeoff accepted: editing `shell/*` now needs a reinstall.
+      3 new tests, including one asserting no dotfile ever points into the repo.
+- [x] NOT MINE, and the actual blocker: the tmux server (up since Aug 19) had a stale TCC
+      responsibility chain, so `getcwd` failed for any pane under `~/Documents` and claude/codex
+      could not start there. A server freshly spawned from a cmux tab had access; the old one did
+      not. Fixed by restarting the tmux server. No System Settings change was needed.
+
+Diagnostic trap worth remembering: this Claude session runs INSIDE a tmux pane, so every probe it
+spawns inherits the denied context. Two of my conclusions were artifacts of that, including
+"a fresh tmux server is also denied" (it is not -- it was denied because *I* spawned it). Any
+TCC test has to be run from a terminal outside tmux.
+
+Also fixed while there: tpm, tmux-resurrect, tmux-continuum, and tmux-sensible were declared in
+`~/.tmux.conf` but never installed, so nine days of sessions had no snapshot at all. Installed
+them, added `@resurrect-processes '"~claude" "~codex"'`, and migrated all 8 sessions to the new
+server with their agents auto-resuming. Note resurrect saves to `~/.local/share/tmux/resurrect`,
+not `~/.tmux/resurrect`.
+
+- [x] `bun test`: 735 pass, 0 fail. `bunx tsc --noEmit`: clean.
