@@ -44,12 +44,18 @@ export const METAMUX_MCP_TOOLS: McpTool[] = [
   },
   {
     name: "metamux_open",
-    description: "Open a URL in the Chrome tab group for a workspace. Defaults to the active workspace.",
+    description:
+      "Open a URL in a workspace's Chrome tab group. Defaults to the calling shell's own workspace, " +
+      "so a link lands where the agent is working rather than in whichever tab the human is looking at.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "URL to open" },
-        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the active workspace" },
+        workspaceId: { type: "string", description: "metamux workspace id (mw_...); defaults to the calling shell's workspace" },
+        active: {
+          type: "boolean",
+          description: "Target the visually active workspace instead of the calling shell's. Ignored when workspaceId is set.",
+        },
       },
       required: ["url"],
       additionalProperties: false,
@@ -327,6 +333,14 @@ export function createHttpToolHandlers(options: HttpBridgeOptions): Record<strin
         const rawWorkspaces = (raw.workspaces as Record<string, unknown>[]) ?? [];
         const rawMatch = rawWorkspaces.find((w) => w.id === workspaceId);
         cmuxWorkspaceId = typeof rawMatch?.sourceId === "string" ? rawMatch.sourceId : undefined;
+      } else if (args.active !== true) {
+        // Default to the CALLING shell's workspace, matching `metamux open`
+        // (cli/metamux.ts) -- an agent's link belongs in its own group, not
+        // in whichever tab the human happens to be looking at. $CMUX_WORKSPACE_ID
+        // already IS a cmux sourceId, which is what POST /open resolves by.
+        // Absent (some harnesses drop it when spawning the MCP server), leaving
+        // this undefined falls back to the daemon's activeId server-side.
+        cmuxWorkspaceId = process.env.CMUX_WORKSPACE_ID || undefined;
       }
 
       const f = options.fetchImpl ?? fetch;

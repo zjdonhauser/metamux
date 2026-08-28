@@ -596,3 +596,75 @@ looked identical to "this group is gone" to it. This round resolves "Known incom
       branches as a disconnected TS copy would test the copy, not the real behavior.
 - [x] README "Link routing" section + Setup step 4 + `--active` in the CLI table.
 - [x] `bun test`: 716 pass, 0 fail. `bunx tsc --noEmit`: clean.
+
+## Shell consolidation: one home, one installer (2026-08-28)
+
+Zac's ask: "move the tmux picker stuff into metamux so all my mux stuff has a consolidated
+home and installer." Scope chosen by him: everything mux, plus a single top-level installer.
+
+- [x] `shell/metamux.zsh`: the whole zsh-side footprint in one sourced file -- `_tmux_go` /
+      `_tmux_pick` / `_tmux_menu` / `t`, `REMOTE_SESSION` detection, remote-login auto-attach,
+      and the daemon ensure. Extracted from `~/.zshrc` with `sed`, never retyped: the fzf
+      `--bind` transform strings are quoting-fragile and a re-type would have silently broken
+      the `r`/`d` binds. Diffed against the backup to prove byte-identity.
+- [x] `METAMUX_SPAWN_CWD` replaces six hardcoded `$HOME/Documents/GitHub` literals. Mirrors
+      the daemon's `tmux.spawnCwd` as a plain shell variable rather than reading config over
+      HTTP -- the picker must not depend on a live daemon to make a session.
+- [x] `METAMUX_REPO` self-resolves from `${(%):-%x}`, so the integration is path-independent.
+- [x] `shell/metamux.tmux.conf`: F1/F2/F3 navigation, F4 jumpnav, Left-arrow picker popup.
+      Theming (prefix, copy-mode, titles, TPM, catppuccin, navy status) deliberately stays in
+      `~/.tmux.conf` -- it isn't mux tooling.
+- [x] `scripts/install-shell.sh`: marker-block upsert into both dotfiles, matching the
+      `# >>> grok installer >>>` idiom already in `~/.zshrc`. Backs up before the first write,
+      no-ops when current. One-time migration strips the legacy inline regions by anchor
+      comment, same pattern as install-menubar.sh removing superseded plugins.
+- [x] `install.sh` at the repo root: runs shell, menubar, opener, launchd-render in order,
+      `--only <step>` / `--skip-<step>`. A failed step does not block the rest (no swiftc must
+      not cost you the shell integration). Still never loads the LaunchAgent, starts a daemon,
+      or flips the default browser -- those print as follow-ups.
+- [x] `scripts/test/install-shell.test.ts` (7 tests, throwaway `$HOME`): legacy-region
+      removal, the earlier `# fi` decoy surviving, idempotence with no blank-line drift,
+      backup-once, empty-home install, repo-move re-point.
+- [x] Bug the tests caught: `awk -v` runs escape processing over the value before awk sees it
+      as a regex, so the `^\[ -n "\$CMUX_WORKSPACE_ID" \]` anchor arrived as a character class
+      and never matched. Anchors are now metacharacter-free by rule, documented at the
+      function.
+- [x] Live-verified on the real dotfiles: functions defined under `zsh -ic`, no hang on
+      `zsh -c true`, tmux binds registered (F1-F4 + Left, `@jumpnav`=1), daemon still answering
+      with no duplicate spawned, second install run a clean no-op, one backup each.
+- [x] `bun test`: 727 pass, 0 fail.
+
+Rollback: `~/.zshrc.metamux-bak-<stamp>` and `~/.tmux.conf.metamux-bak-<stamp>`. The
+tmux-cmux-sync superseded markers moved into `shell/metamux.zsh` verbatim, so this section's
+earlier rollback step still resolves.
+
+Not done, still loose on the machine: `~/bin/cmux-resource-pills` (never absorbed, not
+running, referenced by nothing) and the dead `~/bin/tmux-cmux-sync*` scripts plus their
+`~/.local/state/tmux-cmux-*` files.
+
+## Two defects found while triaging Zac's "duplicated tabs" report (2026-08-28)
+
+The report itself was NOT a regression from the shell work: the duplicates came from the
+`02:13Z`/`02:14Z` spawn-timeout storm during `socket features lost (cmux restarted?)`, under a
+daemon instance that had already been replaced by the time Zac saw them. Confirmed by the log:
+zero spawn/close/reap/retitle lines during the shell session's whole window. Two real defects
+surfaced during that triage.
+
+- [x] `metamux_open` targeted the wrong workspace. With no `workspaceId` it sent no
+      `cmuxWorkspaceId`, so `POST /open` fell back to the daemon's `activeId` -- an agent's link
+      landed in whatever tab the human was looking at. The CLI never had this bug
+      (`cli/metamux.ts:68` sends `$CMUX_WORKSPACE_ID`), and the sibling `metamux_tab_context`
+      already documented "the calling shell's workspace", so `metamux_open` was the odd one out
+      of three call sites. Now defaults to the calling shell, with a new `active: true` arg
+      mirroring the CLI's `--active`, and falls back to `activeId` when the harness drops the env
+      var. 5 tests in `daemon/test/mcp-open-target.test.ts`, written failing first.
+- [x] Every daemon.log line was written twice. Not two daemons and not two reconcilers:
+      `scripts/ensure-daemon.sh` redirected stdout into `daemon.log` while `log()` was already
+      appending to it, so one action produced two identical lines. Redirect now goes to
+      `daemon.stdout.log`, which still catches pre-`log()` startup output. Verified on an isolated
+      `METAMUX_PORT`/`METAMUX_STATE_DIR` daemon before touching the real one, then live.
+
+Note for whoever reads the log next: doubling is present for every line before
+`2026-08-28T13:51Z`. It makes the 02:13 storm look twice as large as it was.
+
+- [x] `bun test`: 732 pass, 0 fail. `bunx tsc --noEmit`: clean.
