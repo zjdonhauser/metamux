@@ -166,7 +166,7 @@
  * @property {number} [fromWindowId] recoverCrossWindow: the window the group is being recovered FROM
  * @property {number} [intoId]      mergeGroup/recoverCrossWindow: the canonical group to merge into
  * @property {number} [groupId]     closeGroup: the blank-orphan group to remove
- * @property {{title: string, tabCount: number}[]} [groups]  reportForeignGroups
+ * @property {{title: string, tabCount: number, windowId?: string}[]} [groups]  reportForeignGroups
  * @property {number|null} [windowId]  ensureGroup/openUrl/collapseOthers: the resolved target
  *   Chrome window (see targetWindowFor) -- null means "not yet paired, but wants to be" (see
  *   cmuxWindowId below), NOT "no window at all"; chrome-ops.js falls back to ctx.windowId (the
@@ -381,7 +381,7 @@ function classifyJanitor(byId, groups, foreignGroups, crossWindowEnabled) {
 
   /** @type {Op[]} */
   const ops = [];
-  /** @type {{title: string, tabCount: number}[]} */
+  /** @type {{title: string, tabCount: number, windowId?: string}[]} */
   const foreign = [];
 
   for (const group of groups) {
@@ -400,19 +400,26 @@ function classifyJanitor(byId, groups, foreignGroups, crossWindowEnabled) {
     }
   }
 
-  if (foreign.length > 0) {
-    ops.push({ op: "reportForeignGroups", groups: foreign });
-  }
-
   if (crossWindowEnabled) {
     for (const group of foreignGroups) {
       const id = idByTitle[group.title];
-      if (id === undefined) continue; // not a managed title -- never touched
+      if (id === undefined) {
+        // Not a managed title HERE -- but it may be an ORPHANED group whose
+        // identity fell out of byId (sync omitted it after attachment loss).
+        // Report it with its windowId so the daemon can adopt: re-attach the
+        // matching identity and record this window as its placement.
+        foreign.push({ title: group.title, tabCount: 0, windowId: String(group.windowId) });
+        continue; // never touched locally
+      }
       if (byId[id].placementOverride != null) continue; // overridden -- this IS its home now, never recover
       const canonicalGroupId = canonicalGroupIdByTitle[group.title];
       if (canonicalGroupId === undefined) continue; // no in-window canonical yet -- next sync recovers it
       ops.push({ op: "recoverCrossWindow", fromGroupId: group.groupId, fromWindowId: group.windowId, intoId: canonicalGroupId });
     }
+  }
+
+  if (foreign.length > 0) {
+    ops.push({ op: "reportForeignGroups", groups: foreign });
   }
 
   return ops;

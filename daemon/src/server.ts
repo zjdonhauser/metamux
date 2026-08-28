@@ -586,7 +586,14 @@ export class ActuatorServer {
           continue;
         }
         const member = snapshot.workspaces.find((w) => w.title === title && !w.archived);
-        if (member) this.registry.markAttached(member.id);
+        if (member) {
+          this.registry.markAttached(member.id);
+          // The report carries where the orphan actually lives; record it as
+          // the placement so activation finds the group IN PLACE instead of
+          // re-homing it to the legacy window. Never clobber an existing override.
+          const windowId = typeof g.windowId === "string" ? g.windowId : null;
+          if (windowId && member.placementOverride === null) member.placementOverride = windowId;
+        }
         this.lazyGroups.markAttached(identity.id);
         this.log(`adopted orphaned group '${title}' as attached ✓`);
         adopted++;
