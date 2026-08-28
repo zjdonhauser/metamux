@@ -566,11 +566,34 @@ export class ActuatorServer {
     if (!ws.data.authed) return; // ignore anything before a valid hello
 
     if (obj.type === "state") {
-      // Currently sent only by the extension's tab-group janitor, one entry
-      // per unrecognized (FOREIGN) group it left untouched.
+      // Sent by the extension's tab-group janitor, one entry per group it
+      // classified FOREIGN (title not in its pruned byId). A "foreign" title
+      // that actually matches a live identity is an ORPHANED group -- its
+      // attachment was lost (e.g. across the on-open rework), the sync then
+      // omitted the identity, and the extension pruned it, making a real
+      // group invisible to activation. Adopt it: re-attach the identity so
+      // the next sync re-includes it and the extension re-binds the group.
       const groups = Array.isArray(obj.groups) ? (obj.groups as Array<Record<string, unknown>>) : [];
+      let adopted = 0;
+      const snapshot = this.currentSnapshot();
+      const projected = this.groupProjection.projectState(snapshot);
       for (const g of groups) {
-        this.log(`janitor: leaving unknown group '${g.title}' (${g.tabCount} tabs)`);
+        const title = typeof g.title === "string" ? g.title : null;
+        if (!title) continue;
+        const identity = projected.workspaces.find((w) => w.title === title && !w.archived);
+        if (!identity || this.lazyGroups.isAttached(identity.id)) {
+          this.log(`janitor: leaving unknown group '${title}' (${g.tabCount} tabs)`);
+          continue;
+        }
+        const member = snapshot.workspaces.find((w) => w.title === title && !w.archived);
+        if (member) this.registry.markAttached(member.id);
+        this.lazyGroups.markAttached(identity.id);
+        this.log(`adopted orphaned group '${title}' as attached ✓`);
+        adopted++;
+      }
+      if (adopted > 0) {
+        void this.onPrune?.(); // persist the re-attachments
+        this.pushSyncToAll();
       }
       return;
     }

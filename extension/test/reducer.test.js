@@ -1197,6 +1197,18 @@ describe("targetWindowFor -- window pairing resolution (docs/protocol.md, 'Windo
     expect(targetWindowFor(entry({ placementOverride: "999" }), state)).toBe(999);
   });
 
+  test("the markerless secondary window case (live bug report): placementOverride alone is sufficient for activation -- no cmuxWindowId, no homeChromeWindowId, no marker ever needed", () => {
+    // Exactly the reported shape: a user-created secondary Chrome window,
+    // never resolved via resolveTargetWindow's own marker-creation path,
+    // so windowPairings never gained an entry for it and
+    // homeChromeWindowId/cmuxWindowId both stay null forever for this
+    // identity -- but placementOverride was still recorded (from a live
+    // move observation), and that alone must be enough.
+    const state = makeState({ windowId: 42 });
+    const markerless = entry({ cmuxWindowId: null, homeChromeWindowId: null, placementOverride: "287029199" });
+    expect(targetWindowFor(markerless, state)).toBe(287029199);
+  });
+
   test("cmuxWindowId alone (no homeChromeWindowId yet -- not yet paired) does NOT affect resolution -- only homeChromeWindowId/placementOverride do", () => {
     const state = makeState({ windowId: 42 });
     expect(targetWindowFor(entry({ cmuxWindowId: "win-1" }), state)).toBe(42);

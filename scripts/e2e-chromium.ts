@@ -543,6 +543,140 @@ async function main() {
       record("pruning assertion (skipped -- no group was created to close)", false, "see POST /open assertions above");
     }
 
+    // --- Placement following: the EXACT live bug report. Zac manually
+    // moved a paired window's group into a second Chrome window (hand-
+    // created, no marker -- registry windowPairings stayed {}) and
+    // auto-switching stopped for it. Reproduces the whole path: move a
+    // real group to a real second window, poll the daemon for the
+    // recorded placementOverride, then force a real activation and assert
+    // the moved group's tab -- not some tab in the original window --
+    // becomes active. ---
+    console.log("--- placement following: move a group to a second Chrome window, verify override + activation follow it ---");
+    const placementSourceId: string | null = stateAtBoot.workspaces.find((w: any) => w.id === stateAtBoot.activeId)?.sourceId ?? null;
+    if (placementSourceId) {
+      // Re-open fresh: the pruning section above closed the earlier
+      // group's tabs (attachedAt cleared, on-open mode -- POST /open
+      // recreates it cleanly around a brand-new real tab).
+      const reopenRes = await fetch(`http://127.0.0.1:${port}/open`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: secret, url: "https://example.com/metamux-e2e-placement", cmuxWorkspaceId: placementSourceId }),
+      });
+      const reopenBody = await reopenRes.json();
+      await sleep(1500);
+      const placementIdentityId: string | null = reopenBody.workspace ?? null;
+      const groupBeforeMove = await activeGroupFor(placementIdentityId);
+      record("placement following setup: a fresh group exists to move", !!groupBeforeMove, JSON.stringify(groupBeforeMove));
+
+      if (groupBeforeMove) {
+        const secondWindowId: number = await sw.evaluate(async () => {
+          const win = await chrome.windows.create({ url: "chrome://newtab/", focused: false });
+          return win.id as number;
+        });
+
+        // Simulate a user drag of the whole group into the new window.
+        // chrome.tabs.move() alone does NOT preserve group membership
+        // across windows -- it dissolves the source group and leaves the
+        // tabs ungrouped in the destination (confirmed empirically: an
+        // earlier version of this test that only moved tabs made
+        // watchGroupRemoved correctly, if unhelpfully, conclude the group
+        // had genuinely closed, since nothing regrouped them). A real
+        // drag's underlying mechanism also re-forms the tabs into a group
+        // in the destination window -- reproduce that explicitly: move,
+        // then re-group with the same title/color. This is the "hand-
+        // created, no marker" shape from the live report -- never goes
+        // through resolveTargetWindow's own window-creation path.
+        await sw.evaluate(
+          async (args) => {
+            const tabs = await chrome.tabs.query({ groupId: args.groupId });
+            const tabIds = tabs.map((t) => t.id as number);
+            await chrome.tabs.move(tabIds, { windowId: args.windowId, index: -1 });
+            // createProperties.windowId is NOT optional in practice, despite
+            // the type allowing it: without it, tabs.group() does not
+            // reliably create the new group in the tabs' post-move window
+            // (confirmed empirically -- an earlier version of this test
+            // omitted it and the "moved" group kept landing back in the
+            // ORIGINAL window, i.e. the move never happened in Chrome's own
+            // idea of where the group lives, even though the tabs
+            // themselves had already relocated).
+            const newGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId: args.windowId } });
+            await chrome.tabGroups.update(newGroupId, { title: args.title, color: args.color as chrome.tabGroups.ColorEnum });
+          },
+          { groupId: groupBeforeMove.id, windowId: secondWindowId, title: groupBeforeMove.title, color: groupBeforeMove.color },
+        );
+
+        // Bounded poll: the daemon only learns of this via the
+        // extension's own live observation (watchGroupPlacement) -- no
+        // extension reload happens in this script, so a failure to
+        // observe live here is a real failure, not a false negative from
+        // skipping the boot-time path.
+        const overrideRecorded = await pollUntil(async () => {
+          const state = await getState();
+          const raw = state.workspaces.find((w: any) => w.sourceId === placementSourceId);
+          return raw?.placementOverride === String(secondWindowId);
+        }, 8000, 400);
+        record(
+          "the daemon records a placementOverride for the moved group's new window",
+          overrideRecorded,
+          `expected window ${secondWindowId}`,
+        );
+
+        // Force a fresh activation of this exact real workspace --
+        // workspace.activated always broadcasts regardless of
+        // createGroups mode (docs/protocol.md, Grouping). Retried: a
+        // single `cmux rpc workspace.select` can race real, concurrent
+        // cmux activity re-selecting something else a moment later
+        // (the same known non-isolation as every other real-cmux-backed
+        // assertion in this script) -- poll the daemon's OWN activeId,
+        // not just the eventual tab state, and re-issue the select if it
+        // hasn't taken within a beat.
+        let selectResult = Bun.spawnSync(
+          ["cmux", "rpc", "workspace.select", JSON.stringify({ workspace_id: placementSourceId })],
+          { cwd: REPO_ROOT },
+        );
+        if (!selectResult.success) {
+          console.log("cmux rpc workspace.select failed:", new TextDecoder().decode(selectResult.stderr));
+        }
+        // getState()'s top-level activeId is the RAW registry id (mw_...);
+        // placementIdentityId is the WIRE/alias id POST /open returned
+        // (groupBy: "title" -- see pushOpenUrl) -- compare against
+        // `projected.activeId`, the wire-projected view, not the raw one.
+        let daemonActivated = await pollUntil(async () => {
+          const state = await getState();
+          return state.projected.activeId === placementIdentityId;
+        }, 4000, 300);
+        if (!daemonActivated) {
+          selectResult = Bun.spawnSync(
+            ["cmux", "rpc", "workspace.select", JSON.stringify({ workspace_id: placementSourceId })],
+            { cwd: REPO_ROOT },
+          );
+          daemonActivated = await pollUntil(async () => {
+            const state = await getState();
+            return state.projected.activeId === placementIdentityId;
+          }, 4000, 300);
+        }
+        record("the daemon's own activeId reflects the forced re-selection", daemonActivated, `target=${placementIdentityId}`);
+
+        const tabActiveInSecondWindow = await pollUntil(async () => {
+          const tabs = await sw.evaluate(
+            (windowId) => chrome.tabs.query({ windowId, active: true }),
+            secondWindowId,
+          );
+          return tabs.some((t) => t.groupId != null && t.groupId !== -1);
+        }, 8000, 400);
+        record(
+          "activating the moved workspace activates its tab in the SECOND window (the override), not the original one",
+          tabActiveInSecondWindow,
+        );
+
+        await sw.evaluate((windowId) => chrome.windows.remove(windowId).catch(() => {}), secondWindowId);
+      } else {
+        record("placement following assertions (skipped -- no group to move)", false, "see setup above");
+      }
+    } else {
+      record("placement following assertions (skipped -- no source workspace id available)", false, "");
+    }
+
     console.log("--- cmux rpc workspace.previous (restoring real cmux focus) ---");
     Bun.spawnSync(["cmux", "rpc", "workspace.previous", "{}"], { cwd: REPO_ROOT });
     await sleep(500);

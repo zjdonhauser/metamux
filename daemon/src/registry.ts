@@ -443,6 +443,18 @@ export class Registry {
   reclassifyAsTmux(cmuxSourceId: string, sessionId: string, sessionName: string): ActuatorEvent[] {
     const existing = this.findBySourceId("cmux", cmuxSourceId);
     if (!existing) return [];
+    // Shadow guard: seed-replay resurrects absorbed cmux workspaces from
+    // historical events on every restart, and the migration then re-runs
+    // against them. If a live tmux ref of record already exists for this
+    // session, reclassifying would mint a duplicate (the 2026-08-27
+    // one-dupe-per-restart incident) -- archive the shadow instead.
+    const tmuxRef = this.findBySourceId("tmux", sessionId);
+    if (tmuxRef && !tmuxRef.archived) {
+      existing.archived = true;
+      existing.paletteIndex = null;
+      existing.updatedAt = new Date().toISOString();
+      return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
+    }
     existing.source = "tmux";
     existing.sourceId = sessionId;
     existing.title = sessionName;
@@ -464,6 +476,49 @@ export class Registry {
     existing.paletteIndex = null; // release the palette claim, same as applyEvent's closed branch
     existing.updatedAt = new Date().toISOString();
     return [{ name: "workspace.archived", workspace: this.toActuator(existing) }];
+  }
+
+  /** One-time repair for the 2026-08-27 duplication incident: collapses
+   * multiple LIVE tmux-sourced refs sharing a title into one. Keeper
+   * choice: attachedAt holder > placementOverride holder > most recently
+   * updated. History fields (attachedAt, placementOverride, cmuxColor,
+   * paintedColor, cmuxWindowId) merge first-non-null into the keeper, and
+   * the keeper adopts the family's "$N"-shaped tmux session sourceId so
+   * reconcile re-binds cleanly forever after. Idempotent: a clean registry
+   * is a no-op. Runs at startup from main.ts. */
+  dedupeTmuxRefs(): { archived: number } {
+    const byTitle = new Map<string, WorkspaceRef[]>();
+    for (const ref of this.workspaces.values()) {
+      if (ref.source !== "tmux" || ref.archived) continue;
+      const family = byTitle.get(ref.title) ?? [];
+      family.push(ref);
+      byTitle.set(ref.title, family);
+    }
+
+    let archived = 0;
+    for (const family of byTitle.values()) {
+      if (family.length < 2) continue;
+      const keeper =
+        family.find((w) => w.attachedAt !== null) ??
+        family.find((w) => w.placementOverride !== null) ??
+        family.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b));
+      const sessionSourceId = family.find((w) => /^\$\d+$/.test(w.sourceId))?.sourceId;
+      if (sessionSourceId) keeper.sourceId = sessionSourceId;
+      for (const other of family) {
+        if (other === keeper) continue;
+        keeper.attachedAt = keeper.attachedAt ?? other.attachedAt;
+        keeper.placementOverride = keeper.placementOverride ?? other.placementOverride;
+        keeper.cmuxColor = keeper.cmuxColor ?? other.cmuxColor;
+        keeper.paintedColor = keeper.paintedColor ?? other.paintedColor;
+        keeper.cmuxWindowId = keeper.cmuxWindowId ?? other.cmuxWindowId;
+        other.archived = true;
+        other.paletteIndex = null;
+        other.updatedAt = new Date().toISOString();
+        archived++;
+      }
+      keeper.updatedAt = new Date().toISOString();
+    }
+    return { archived };
   }
 
   /** Registry compaction: removes archived refs from the registry -- ALL

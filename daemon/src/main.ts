@@ -148,6 +148,9 @@ async function runDaemon(): Promise<void> {
   registry.attachOnActivate = config.createGroups !== "on-open";
   registry.groupBy = config.groupBy;
   registry.colorMode = config.colorMode;
+  // Repair pass for the 2026-08-27 duplication incident: collapse duplicate
+  // live tmux refs before anything reads or extends the hydrated registry.
+  const deduped = registry.dedupeTmuxRefs();
 
   const stats = { skippedLines: 0 };
 
@@ -156,6 +159,7 @@ async function runDaemon(): Promise<void> {
     console.log(stamped);
     void appendFile(logPath(), stamped + "\n").catch(() => {});
   };
+  if (deduped.archived > 0) log(`registry repair: merged ${deduped.archived} duplicate tmux ref(s)`);
 
   // Process-level safety net (2026-08-27, incident: /automation testing
   // coincided with the daemon dying with no trace in daemon.log). Verified
