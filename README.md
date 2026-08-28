@@ -51,18 +51,51 @@ Reverse sync (click a Chrome group → cmux switches) is available, default off.
 
 ## Setup (once)
 
-1. **Daemon**: auto-ensured by `.zshrc` in every cmux shell (`scripts/ensure-daemon.sh`);
-   manual start is `bun run daemon` from a cmux shell (socket features need cmux's env).
-2. **Extension**: `chrome://extensions` → Developer mode → Load unpacked →
+```
+./install.sh              # shell + menubar + opener + launchd-render
+./install.sh --only shell # or one step at a time
+```
+
+Every step is idempotent, so re-running after a `git pull` is how you update. The installer
+never starts a daemon, loads the LaunchAgent, or changes your default browser; it prints
+those as explicit follow-ups.
+
+1. **Shell + tmux** (`scripts/install-shell.sh`): writes one marker block into `~/.zshrc`
+   that sources `shell/metamux.zsh`, and one into `~/.tmux.conf` that source-files
+   `shell/metamux.tmux.conf`. Those two files hold everything metamux puts in your shell:
+   the tmux session picker (`t`), remote-login auto-attach, the daemon ensure, and the
+   F1-F4 / jumpnav navigation binds. Edit them and open a new shell; no reinstall needed.
+2. **Daemon**: auto-ensured by the shell block in every cmux shell
+   (`scripts/ensure-daemon.sh`); manual start is `bun run daemon` from a cmux shell (socket
+   features need cmux's env).
+3. **Extension**: `chrome://extensions` → Developer mode → Load unpacked →
    `~/Documents/GitHub/metamux/extension`. In its Options: port `8377`, secret from
    `bun cli/metamux.ts secret`, Test connection, Save.
-3. **Harness wiring** (already done on this machine): Claude Code (`claude mcp add` +
+4. **Harness wiring** (already done on this machine): Claude Code (`claude mcp add` +
    settings.json hook + `~/.claude/skills/metamux`), Codex (`~/.codex/config.toml` MCP +
    hook, `~/.codex/skills`), Grok (`grok mcp add`, `~/.grok/hooks/metamux-url-hook.json`,
    `~/.grok/skills`). Codex/Grok trust-gate user hooks: approve "metamux URL auto-open" once.
-4. **Link routing** (optional): `bun scripts/install-opener.sh` builds `metamux-opener.app`,
-   then its `--register` flag makes it the default browser so a cmd-click on a link inside
-   cmux routes there too, not just agent-driven opens. See "Link routing" below.
+5. **Link routing** (optional): the `opener` step builds `metamux-opener.app`; its
+   `--register` flag then makes it the default browser so a cmd-click on a link inside cmux
+   routes there too, not just agent-driven opens. See "Link routing" below.
+
+## Shell integration
+
+`shell/metamux.zsh` is the single zsh entry point.
+
+- `t` opens the fzf session picker: arrows browse, live pane preview, Enter attaches, a
+  typed name that does not exist gets created, `r` renames, `d` kills. Falls back to a
+  numbered menu with no fzf.
+- `t <name>` jumps to that session and runs Claude in it. Other harnesses are not wired up
+  yet; `t <name>` means Claude for now.
+- `METAMUX_SPAWN_CWD` sets where new sessions start (default `~/Documents/GitHub`).
+- SSH and mosh logins drop straight into the picker. The `-t 0`/`-t 1` guards keep invisible
+  `zsh -ic` probes from hanging on it.
+
+`shell/metamux.tmux.conf` holds F1/F2/F3 window and session navigation, plus F4 jumpnav and
+the Left-arrow picker popup for phone clients. Its popup runs `zsh -ic _tmux_pick`, so the
+`~/.zshrc` source line must stay unconditional for interactive shells. Prefix, copy-mode,
+theming, and TPM stay in your own `~/.tmux.conf`.
 
 ## CLI
 
