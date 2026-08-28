@@ -250,8 +250,8 @@ it queries cmux for every workspace's current color and applies it in one pass.
 <details>
 <summary><b>Agents</b>: MCP tools, the URL hook, and the SSRF gate</summary>
 
-Wired for Claude Code, Codex, and Grok. Any agent gets `metamux_current` / `metamux_workspaces`
-(where am I, what exists), `metamux_open` (put a URL in my group), `metamux_tab_context`, and
+Wired for Claude Code, Codex, and Grok. Any agent gets `metamux_workspaces` (what exists),
+`metamux_open` (put a URL in my group), `metamux_tab_context` (my own tabs), and
 workspace-scoped browser automation (`metamux_browser_snapshot` / `_screenshot` / `_navigate` /
 `_click` / `_type`) via `chrome.debugger`, fenced to the calling workspace's group behind a
 fail-closed SSRF gate (`agentBrowser`: off / read / full, default read).
@@ -259,6 +259,10 @@ fail-closed SSRF gate (`agentBrowser`: off / read / full, default read).
 `metamux_open` and the CLI both default to the **calling shell's** workspace, not the visually
 active one, so an agent's link lands where it is working. Pass `active: true` / `--active` for the
 other behavior.
+
+One asymmetry to know: `metamux_current` (MCP) reports the *active* workspace, while
+`metamux current` (CLI) reports the *calling shell's*. An agent asking "which workspace am I in"
+wants the CLI. Worth reconciling.
 
 A PostToolUse hook in each harness auto-opens GitHub PR and compare URLs from any shell output
 into that session's group.

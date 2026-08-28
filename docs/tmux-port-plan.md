@@ -1,6 +1,13 @@
 # Absorbing tmux-cmux-sync into metamux: port plan
 
-Analysis only -- no code in this document has been written yet. Source read in full:
+> **Status: SHIPPED (2026-08-27).** This document is kept for its design rationale, not as a
+> to-do list. The port landed on branch `tmux-absorption`: tmux is a live second source
+> (`daemon/src/tmux-source.ts`, `tmux-reconcile.ts`) driving a second actuator
+> (`cmux-actuator.ts`), partition mode is the default, and the legacy `~/bin/tmux-cmux-sync*`
+> scripts are dead (still on disk as the documented rollback). Where this plan and
+> `docs/protocol.md` disagree, protocol.md is the contract and wins.
+
+Original analysis, as written before implementation. Source read in full:
 `~/bin/tmux-cmux-sync` (bash, 257 lines), `~/bin/tmux-cmux-sync-tick.py` (311 lines),
 `~/bin/tmux-cmux-crosswin.py` (74 lines, orphaned -- see §1.8), `docs/protocol.md`,
 `BUILD-STATUS.md`, and the current daemon source (`registry.ts`, `group-projection.ts`,

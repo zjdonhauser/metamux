@@ -23,6 +23,7 @@ a Chrome extension; you interact with it through a small CLI (and optionally MCP
 
 ```sh
 metamux open <url>      # open URL in the CURRENT workspace's Chrome tab group
+metamux open <url> --active   # ...or in whichever workspace the human is looking at
 metamux current         # print this shell's workspace (uses $CMUX_WORKSPACE_ID)
 metamux status          # daemon health: clients, last seq, active workspace
 metamux state           # full workspace registry JSON (includes ports when available)
@@ -34,9 +35,16 @@ If `metamux` is not on PATH, use `bun ~/Documents/GitHub/metamux/cli/metamux.ts 
 
 ## MCP tools (when the `metamux` MCP server is registered)
 
-- `metamux_current` - active workspace {id, title, cwd, ports}
+- `metamux_open` {url, workspaceId?, active?} - open a URL in a workspace's group.
+  Defaults to the calling shell's workspace; pass `active: true` for the visible one.
 - `metamux_workspaces` - list of live workspaces
-- `metamux_open` {url, workspaceId?} - open a URL in a workspace's group
+- `metamux_tab_context` - list the tabs in this workspace's own group
+- `metamux_current` - **the ACTIVE workspace, not necessarily yours.** To learn which
+  workspace *this shell* is in, use the `metamux current` CLI, which reads
+  `$CMUX_WORKSPACE_ID`.
+- `metamux_browser_snapshot` / `_screenshot` / `_navigate` / `_click` / `_type` - browser
+  automation fenced to your own workspace's group, gated by `agentBrowser`
+  (off / read / full, default read). Never reaches another workspace's tabs.
 
 ## Rules
 
@@ -47,3 +55,6 @@ If `metamux` is not on PATH, use `bun ~/Documents/GitHub/metamux/cli/metamux.ts 
   shown something right now.
 - If the daemon is down (`metamux status` fails), fall back to printing the URL and say
   the daemon is not running.
+- A pane with no `$CMUX_WORKSPACE_ID` cannot target itself, so every open silently lands
+  in the active group instead. If your links keep appearing in the wrong place, check
+  `echo $CMUX_WORKSPACE_ID` before assuming the daemon is wrong.

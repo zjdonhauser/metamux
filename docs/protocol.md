@@ -395,9 +395,16 @@ does not violate F3 (which bans focus stealing on automatic switches).
 
 `metamux mcp` (CLI subcommand): a stdio JSON-RPC 2.0 MCP server bridging to the daemon's HTTP
 API. Tools:
-- `metamux_current` → active workspace {id, title, cwd, ports}
+- `metamux_current` → the ACTIVE workspace {id, title, cwd, ports}. Note the asymmetry with
+  the CLI's `metamux current`, which is scoped to the calling shell via `$CMUX_WORKSPACE_ID`.
 - `metamux_workspaces` → non-archived workspace list
-- `metamux_open` {url, workspaceId?} → same as POST /open
+- `metamux_open` {url, workspaceId?, active?} → POST /open. Target precedence: explicit
+  `workspaceId`, else `active: true` means omit `cmuxWorkspaceId` and let the daemon use its
+  own `activeId`, else the calling shell's `$CMUX_WORKSPACE_ID` (matching `cli/metamux.ts`).
+  Absent env var, falls back to `activeId` server-side.
+- `metamux_tab_context` → the calling workspace's own tabs
+- `metamux_browser_snapshot` / `_screenshot` / `_navigate` / `_click` / `_type` → see
+  "Workspace-scoped browser automation" below
 Support `initialize` (echo a current protocolVersion), `notifications/initialized` (ignore),
 `tools/list`, `tools/call`, `ping`. Tolerant of unknown methods (JSON-RPC error -32601).
 Register in Claude Code: `claude mcp add metamux -- bun <repo>/cli/metamux.ts mcp`.
