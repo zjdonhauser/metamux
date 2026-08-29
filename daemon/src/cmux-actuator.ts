@@ -270,3 +270,14 @@ export async function listTabs(windowId: string): Promise<ActuatorTab[]> {
   }
   return out;
 }
+
+/** Which cmux window currently holds a workspace, or null. Costs one
+ * window.list plus one workspace.list per window, so callers should go through
+ * WindowLookup rather than calling this on every event. */
+export async function findWorkspaceWindow(workspaceId: string): Promise<string | null> {
+  for (const win of await listWindows()) {
+    const tabs = await listTabs(win.id);
+    if (tabs.some((t) => t.id === workspaceId)) return win.id;
+  }
+  return null;
+}

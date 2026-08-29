@@ -10,6 +10,9 @@ import { computeBackflowCandidates, planBackflow, type BackflowRef } from "./col
 import * as cmuxRpc from "./cmux-rpc.ts";
 import { diffConfig } from "./config-diff.ts";
 import { WindowSource } from "./window-source.ts";
+import { WindowLookup } from "./window-lookup.ts";
+import { decideFollowTab } from "./follow-tab.ts";
+import { titleAliasId } from "./group-projection.ts";
 import { ConfigWatcher } from "./config-watch.ts";
 import { loadConfig } from "./config.ts";
 import { Gate, type GateEmission } from "./gate.ts";
@@ -224,6 +227,7 @@ async function runDaemon(): Promise<void> {
   // marker-tab identity.
   const repoDir = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
   const windowSource = new WindowSource(repoDir, logPath().replace(/\/[^/]+$/, ""), log);
+  const windowLookup = new WindowLookup((workspaceId) => cmuxActuator.findWorkspaceWindow(workspaceId));
   if (config.windowPairing.enabled) {
     windowSource.start();
     log(`[window-pairing] engine on ${JSON.stringify(config.windowPairing)}`);
@@ -496,8 +500,43 @@ async function runDaemon(): Promise<void> {
     if (emit && event.name === "selected" && config.windowPairing.enabled) {
       const ref = registry.activeId ? registry.workspaces.get(registry.activeId) : null;
       if (ref?.cmuxWindowId) windowSource.pairing.noteActivation(ref.cmuxWindowId);
+      if (ref && config.windowPairing.followTab) void maybeFollowTab(ref);
     }
     if (emit && derived.length > 0) server.broadcast(derived);
+  };
+
+  /** Last cmux window each workspace was confirmed in, so a repeat selection
+   * in the same window is not mistaken for a move. */
+  const lastHoldingWindow = new Map<string, string | null>();
+
+  /** Follow-the-tab. The event log never carries window membership on the
+   * events that matter (window_id rides only on workspace.action), so a move is
+   * detected by confirming the holding window against the last one recorded.
+   * Fire-and-forget: never block the event path on a CLI round trip. */
+  const maybeFollowTab = async (ref: WorkspaceRef): Promise<void> => {
+    try {
+      const current = await windowLookup.holdingWindow(ref.sourceId);
+      const decision = decideFollowTab({
+        enabled: config.windowPairing.followTab,
+        pairingHealthy: windowSource.pairing.healthy,
+        aliasId: config.groupBy === "title" ? titleAliasId(ref.title) : ref.id,
+        previousCmuxWindowId: lastHoldingWindow.get(ref.sourceId) ?? ref.cmuxWindowId,
+        currentCmuxWindowId: current,
+        chromeWindowForCurrent: current ? windowSource.pairing.chromeWindowFor(current) : null,
+        chromeWindowForPrevious: (() => {
+          const prev = lastHoldingWindow.get(ref.sourceId) ?? ref.cmuxWindowId;
+          return prev ? windowSource.pairing.chromeWindowFor(prev) : null;
+        })(),
+      });
+      // Record the new home either way, so the next selection is not read as
+      // another move. Deliberately not persisted: after a restart the first
+      // selection is a first sighting, which correctly moves nothing.
+      lastHoldingWindow.set(ref.sourceId, current);
+      if (!decision) return;
+      server.pushMoveGroupToWindow(decision.aliasId, ref.title, decision.toChromeWindowId);
+    } catch (err) {
+      log(`[follow-tab] skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const handleEmission = (emission: GateEmission, emit: boolean) => {
