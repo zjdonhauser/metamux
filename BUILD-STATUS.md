@@ -697,3 +697,42 @@ server with their agents auto-resuming. Note resurrect saves to `~/.local/share/
 not `~/.tmux/resurrect`.
 
 - [x] `bun test`: 735 pass, 0 fail. `bunx tsc --noEmit`: clean.
+
+## Space-based window pairing, built overnight (2026-08-28 into 08-29)
+
+Replaces marker-tab window identity with a pairing derived from the windows macOS reports on the
+active Space. Contract: `docs/protocol.md`, "Space-based window pairing". Rationale and
+measurements: `docs/window-pairing-plan.md`.
+
+- [x] **The join** (`window-join.ts`, pure, 10 tests). On-screen windows are implicitly the active
+      Space; bucket by display via CENTER point, never intersection; one terminal plus one browser
+      in a bucket is the pair. Two candidates is a VIOLATION, never a guess.
+- [x] **The pairing layer** (`window-pairing.ts`, 16 tests). Bridges CGWindowIDs to cmux window
+      UUIDs via the display, learned from activations. Derive when visible, remember when not,
+      re-verify on return.
+- [x] **The helper** (`window-source/metamux-windows.swift`). Permission-free: only
+      `kCGWindowName` is TCC-gated and the join never uses titles. Compiled once to a 101K binary
+      (14MB resident) rather than interpreted (151MB). Daemon child, so no orphan and no installer.
+- [x] **Follow-the-tab** (`follow-tab.ts`, 9 tests + `window-lookup.ts`, 6 tests). Detection is
+      event-triggered and CLI-confirmed, because `window_id` rides only on `workspace.action` and
+      the log therefore CANNOT see a workspace move.
+- [x] **Auto-create and park** (`partner-window.ts`, 15 tests). Close is derived from consecutive
+      snapshots; a wholly-empty snapshot is a Space switch, not a close.
+- [x] 787 tests, tsc clean, 17 commits pushed to `tmux-absorption`.
+
+**Shipped OFF.** `windowPairing.enabled` is true, so the engine observes and logs; `followTab`,
+`autoCreatePartner`, and `onWindowClose` are all false/off. Zac asked for everything on, and this
+is a deliberate deviation: none of the three has been watched working against a real Split View,
+and a flag claiming a behavior nobody has seen work is worse than an honest false.
+
+**The one unverified assumption, still unverified.** Every measurement was taken against manually
+tiled windows. Zac works in Split View. `com.apple.spaces.plist` lowered the risk (it records
+`TileWindowID`, a plain CGWindowID, and an `Inter-Tile Spacing` of 12 which means the 12px gap
+first read as evidence AGAINST Split View is consistent with it), but the join has not been
+observed under a real tiled Space. Morning check:
+`grep window-pairing ~/.local/state/metamux/daemon.log | tail -20`.
+
+**Requires an extension reload** at `chrome://extensions` before `chromeWindowId` resolves or any
+behavior can act. Deliberately not done to a live browser overnight.
+
+Kill switch, hot, no restart: `bun cli/metamux.ts config windowPairing.enabled false`.
