@@ -16,7 +16,7 @@
 // back, so a Chrome window replaced while you were away is picked up rather than
 // remembered wrongly.
 
-import { joinWindows, type CGWindow, type ChromeWindow, type Display, type Violation } from "./window-join.ts";
+import { joinWindows, TERMINAL_OWNERS, type CGWindow, type ChromeWindow, type Display, type Violation } from "./window-join.ts";
 
 export interface WindowPairingOptions {
   /** A snapshot older than this means the helper died or stalled. Treated as
@@ -71,6 +71,15 @@ export class WindowPairing {
    * learned even while the current frame is unusable. */
   rememberedDisplayFor(cmuxWindowId: string): number | null {
     return this.cmuxWindowToDisplay.get(cmuxWindowId) ?? null;
+  }
+
+  /** Displays holding a terminal window with no browser partner. Empty while
+   * unhealthy: auto-create must never fire off an ambiguous frame. */
+  displaysNeedingPartner(now = Date.now()): number[] {
+    if (!this.healthyAt(now)) return [];
+    return this.lastViolations
+      .filter((v) => v.kind === "unpaired" && TERMINAL_OWNERS.includes(v.owner))
+      .map((v) => v.displayId);
   }
 
   get violations(): Violation[] {

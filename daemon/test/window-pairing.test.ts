@@ -105,3 +105,31 @@ describe("WindowPairing", () => {
     expect(p.healthyAt(9_000)).toBe(false);
   });
 });
+
+describe("WindowPairing.displaysNeedingPartner", () => {
+  const lone: CGWindow[] = [{ id: 300, owner: "cmux", bounds: { x: 0, y: 0, w: 1280, h: 1440 } }];
+
+  test("reports a display with a terminal but no browser", () => {
+    const p = new WindowPairing();
+    p.ingest(lone, [], SCREENS);
+    expect(p.displaysNeedingPartner()).toEqual([0]);
+  });
+
+  test("reports nothing when the display is already paired", () => {
+    const p = new WindowPairing();
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    expect(p.displaysNeedingPartner()).toEqual([]);
+  });
+
+  test("reports nothing for a browser with no terminal, which needs no partner", () => {
+    const p = new WindowPairing();
+    p.ingest([{ id: 301, owner: "Google Chrome", bounds: { x: 0, y: 0, w: 1280, h: 1440 } }], [], SCREENS);
+    expect(p.displaysNeedingPartner()).toEqual([]);
+  });
+
+  test("reports nothing while unhealthy", () => {
+    const p = new WindowPairing({ staleAfterMs: 5_000 });
+    p.ingest(lone, [], SCREENS, 1_000);
+    expect(p.displaysNeedingPartner(9_000)).toEqual([]);
+  });
+});
