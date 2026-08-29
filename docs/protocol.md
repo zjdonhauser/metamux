@@ -1025,3 +1025,118 @@ tracking of a group that was simply somewhere else now, rather than gone.
   either. `resolveGroupCache`'s "cached groupId is always authoritative once found to exist"
   priority means a coincidental same-titled group elsewhere is simply left alone rather than
   merged in that scenario.
+
+## Space-based window pairing (2026-08-29)
+
+Replaces marker-tab window identity with a pairing derived from the windows macOS reports on the
+active Space. Design rationale and the measurements behind it: `docs/window-pairing-plan.md`.
+
+**The invariant, which metamux verifies rather than assumes:**
+
+> One cmux window and one Chrome window per display, per Space.
+
+### The join (`daemon/src/window-join.ts`, pure)
+
+1. Enumerate on-screen windows. `CGWindowListCopyWindowInfo` with `.optionOnScreenOnly` is
+   implicitly a Space filter: windows on other Spaces are simply absent.
+2. Bucket by display, assigning each window by its CENTER point, never by intersection. A window
+   overlapping two displays belongs to exactly one, and intersection double-counts it.
+3. Within a bucket, one terminal window plus one browser window is the pair.
+
+Windows under 400x300 are dropped: the raw list is full of toolbars, dividers, and tab strips.
+
+**Two candidates on a display is a VIOLATION, never a guess.** The caller falls back to marker-tab
+identity and acts on nothing. This is the property marker-tab identity cannot express, since an
+ambiguous state is otherwise indistinguishable from a normal one.
+
+**Coordinate flip.** Every rectangle is in CG coordinates, whose origin is the PRIMARY screen's
+top-left with y growing down: `cgY = NSScreen.screens[0].frame.maxY - screen.frame.maxY`. Flipping
+against the union's max Y instead makes a full-height window match two displays at once. A
+secondary display positioned ABOVE the primary is the arrangement that exposes it.
+
+### Bridging to Chrome's own window ids
+
+Chrome's integer `windowId` and a CGWindowID are unrelated, and nothing maps them. Geometry is the
+only bridge: the extension reports its own window bounds, the helper reports CG bounds, and the
+daemon matches rectangles within a tolerance. Recomputed every tick, never persisted as truth.
+
+### Bridging to cmux window UUIDs
+
+The join speaks CGWindowIDs; the registry speaks cmux window UUIDs. The bridge is the DISPLAY.
+Activating a workspace puts its cmux window on screen, so an activation binds that UUID to the
+display holding the visible cmux window (`daemon/src/window-pairing.ts`). Composing that with the
+join's display-to-Chrome-window answers the question.
+
+Rule for windows not currently visible:
+
+> **Derive when visible, remember when not, re-verify on return.**
+
+An activation observed while the invariant is violated is NOT learned: a binding taken from an
+ambiguous frame is worse than no binding. Private CGS space-id APIs are deliberately not used.
+
+### The window helper
+
+`window-source/metamux-windows.swift`, spawned by the daemon as a child process so its lifetime is
+tied to the daemon, it leaves no orphan, and it adds no authenticated surface. Compiled once to
+`~/.local/state/metamux/metamux-windows` and recompiled when the source is newer; interpreting via
+`swift` costs ~150MB resident versus ~14MB compiled. Emits one JSON snapshot per line on stdout:
+
+```json
+{"windows":[{"id":13349,"owner":"cmux","x":0,"y":0,"w":1258,"h":1440}],
+ "displays":[{"id":0,"x":0,"y":0,"w":2560,"h":1440}]}
+```
+
+**Permission-free by design.** `CGWindowListCopyWindowInfo` needs no TCC grant for window id,
+owner, or bounds; only `kCGWindowName` is gated behind Screen Recording, and the join never uses
+titles. A source that cannot lose its permission cannot go dark silently.
+
+### Wire additions
+
+`windowBounds` (client -> server), advisory: the daemon pairs on CG geometry alone and leaves
+`chromeWindowId` null when these never arrive.
+```json
+{"type":"windowBounds","windows":[{"id":42,"left":1270,"top":47,"width":1290,"height":1393}]}
+```
+
+`move_group_to_window` (server -> client): follow-the-tab. Carries the group's TITLE, not a
+`groupId`, because a groupId does not survive a cross-window move.
+```json
+{"type":"event","seq":n,"name":"move_group_to_window","id":"t_...","title":"compliance","chromeWindowId":42}
+```
+
+The extension's `moveGroupToWindow` op resolves the group by title, refuses a target that is not a
+`normal` window (Chrome rejects moves into popup and app windows), and marks a server activation
+first so the resulting `tabs.onActivated` is not read back as user intent.
+
+### Follow-the-tab detection
+
+The event log CANNOT detect a workspace moving between windows: `window_id` rides only on
+`workspace.action` events (`set_color`, `clear_color`, `mark_read`), never on `selected`,
+`created`, `closed`, or `reordered`, and there is no `workspace.moved`. So detection is
+event-triggered and CLI-confirmed: on `workspace.selected`, confirm the holding window
+(`findWorkspaceWindow`) and compare against the last confirmed one.
+
+That confirmation costs `window.list` plus one `workspace.list` per window, so it goes through
+`WindowLookup`, which caches per workspace for 3s and coalesces concurrent callers. A thrown lookup
+is not cached (transient); a null IS cached ("in no window" is a real answer). The call is
+fire-and-forget: the event path never blocks on a CLI round trip.
+
+**Why this is only now possible.** A group appearing in an unexpected window is otherwise
+indistinguishable from the user having dragged it there, which is exactly what `placementOverride`
+resolves bluntly by assuming the user did it. A CONFIRMED `cmuxWindowId` change is what separates a
+workspace-move from a user-drag.
+
+### Config
+
+`"windowPairing": {"enabled", "followTab", "autoCreatePartner", "onWindowClose"}`. All four keys
+are hot-applicable: `windowPairing.enabled` is the kill switch and must not need a daemon restart.
+
+`onWindowClose` is `"off"` (default) | `"park"` | `"close"`. Park minimizes and is reversible;
+close destroys the window and any tabs in it, so it is never the default.
+
+### Degradation
+
+Unhealthy always means fall back to marker-tab identity, never guess. Two sources: the invariant
+broke, or the snapshot went stale (helper died or stalled, 10s). The helper restarts on a 5s
+backoff and logs the downgrade. Pairing state is per-session and never persisted, so a restart
+re-derives from scratch rather than trusting stale geometry.

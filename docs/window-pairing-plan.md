@@ -1,8 +1,9 @@
 # Space-based window pairing: design
 
-> **Status: IN PROGRESS.** The pure join (`daemon/src/window-join.ts`) and the tier-1 helper
-> (`window-source/metamux-windows.swift`) are built and verified end to end on live data. The
-> behaviors are not. Where this and `docs/protocol.md` disagree, protocol.md is the contract and
+> **Status: IN PROGRESS.** The join, the helper, the pairing layer, and follow-the-tab are built;
+> auto-create-partner and park-partner are not. The contract now lives in `docs/protocol.md`
+> ("Space-based window pairing"); this document is kept for the design rationale and the
+> measurements behind it. Where this and `docs/protocol.md` disagree, protocol.md is the contract and
 > wins; this doc becomes protocol text once it ships.
 
 ## The problem
