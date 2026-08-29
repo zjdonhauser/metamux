@@ -26,7 +26,11 @@ export type ConfigChangeKey =
   | "colorBackflow"
   | "pruneArchivedAfterDays"
   | "colorMode"
-  | "agentBrowser";
+  | "agentBrowser"
+  | "windowPairing.enabled"
+  | "windowPairing.followTab"
+  | "windowPairing.autoCreatePartner"
+  | "windowPairing.onWindowClose";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -59,6 +63,10 @@ export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set(
   "colorBackflow",
   "colorMode",
   "agentBrowser",
+  "windowPairing.enabled",
+  "windowPairing.followTab",
+  "windowPairing.autoCreatePartner",
+  "windowPairing.onWindowClose",
 ]);
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -96,6 +104,10 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "pruneArchivedAfterDays", oldValue: oldConfig.pruneArchivedAfterDays, newValue: newConfig.pruneArchivedAfterDays },
     { key: "colorMode", oldValue: oldConfig.colorMode, newValue: newConfig.colorMode },
     { key: "agentBrowser", oldValue: oldConfig.agentBrowser, newValue: newConfig.agentBrowser },
+    { key: "windowPairing.enabled", oldValue: oldConfig.windowPairing.enabled, newValue: newConfig.windowPairing.enabled },
+    { key: "windowPairing.followTab", oldValue: oldConfig.windowPairing.followTab, newValue: newConfig.windowPairing.followTab },
+    { key: "windowPairing.autoCreatePartner", oldValue: oldConfig.windowPairing.autoCreatePartner, newValue: newConfig.windowPairing.autoCreatePartner },
+    { key: "windowPairing.onWindowClose", oldValue: oldConfig.windowPairing.onWindowClose, newValue: newConfig.windowPairing.onWindowClose },
   ];
 
   return candidates

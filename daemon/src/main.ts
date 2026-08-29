@@ -9,6 +9,7 @@ import { loadCmuxNamedColorSlots } from "./cmux-config.ts";
 import { computeBackflowCandidates, planBackflow, type BackflowRef } from "./color-backflow.ts";
 import * as cmuxRpc from "./cmux-rpc.ts";
 import { diffConfig } from "./config-diff.ts";
+import { WindowSource } from "./window-source.ts";
 import { ConfigWatcher } from "./config-watch.ts";
 import { loadConfig } from "./config.ts";
 import { Gate, type GateEmission } from "./gate.ts";
@@ -216,6 +217,20 @@ async function runDaemon(): Promise<void> {
       ? "socket features enabled ✓"
       : "socket features disabled (start the daemon from a cmux shell to enable)",
   );
+
+  // Space-based cmux <-> Chrome window pairing. Needs no cmux socket and no TCC
+  // grant, so it runs regardless of socket-feature state. If the helper cannot
+  // run at all, pairing simply stays unhealthy and every caller keeps using
+  // marker-tab identity.
+  const repoDir = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+  const windowSource = new WindowSource(repoDir, logPath().replace(/\/[^/]+$/, ""), log);
+  if (config.windowPairing.enabled) {
+    windowSource.start();
+    log(`[window-pairing] engine on ${JSON.stringify(config.windowPairing)}`);
+    log("[window-pairing] follow-tab/auto-create/park await the extension half; engine observes only");
+  } else {
+    log("[window-pairing] disabled by config");
+  }
 
   // Tied to the INITIAL probe, not the live state: if the daemon starts
   // enabled and cmux later restarts, this instance persists and simply
@@ -458,6 +473,12 @@ async function runDaemon(): Promise<void> {
       groupProjection.setColorMode(newConfig.colorMode);
     }
     if (changes.some((c) => c.hotApplicable && c.key === "agentBrowser")) config.agentBrowser = newConfig.agentBrowser;
+    // Hot on purpose: windowPairing.enabled is the kill switch, and needing a
+    // daemon restart to turn pairing off would defeat it.
+    if (changes.some((c) => c.hotApplicable && c.key.startsWith("windowPairing."))) {
+      config.windowPairing = newConfig.windowPairing;
+      log(`[window-pairing] config -> ${JSON.stringify(newConfig.windowPairing)}`);
+    }
 
     if (extensionAffected) server.pushSyncToAll();
   };
@@ -465,6 +486,12 @@ async function runDaemon(): Promise<void> {
 
   const applyAndMaybeEmit = (event: CmuxWorkspaceEvent, emit: boolean) => {
     const derived = registry.applyEvent(event);
+    // An activation is the one moment a cmux window is guaranteed on screen,
+    // which is what lets the pairing bind that window's UUID to a display.
+    if (emit && event.name === "selected" && config.windowPairing.enabled) {
+      const ref = registry.activeId ? registry.workspaces.get(registry.activeId) : null;
+      if (ref?.cmuxWindowId) windowSource.pairing.noteActivation(ref.cmuxWindowId);
+    }
     if (emit && derived.length > 0) server.broadcast(derived);
   };
 

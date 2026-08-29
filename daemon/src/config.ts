@@ -36,6 +36,22 @@ export interface TmuxConfig {
   spawnCwd: string;
 }
 
+export interface WindowPairingConfig {
+  /** Master switch. Off restores marker-tab identity exactly, with no
+   * migration: every behavior below is inert. */
+  enabled: boolean;
+  /** Move a workspace to another cmux window and its Chrome tab group follows
+   * into that window's paired Chrome window. */
+  followTab: boolean;
+  /** A cmux window on a display with no Chrome partner gets one created.
+   * Rate-limited, and never while the invariant guard is tripped. */
+  autoCreatePartner: boolean;
+  /** What happens to a paired Chrome window when its cmux window closes.
+   * "park" (default) minimizes, which is reversible; "close" destroys the
+   * window and any tabs in it, so it is never the default. */
+  onWindowClose: "off" | "park" | "close";
+}
+
 export interface MetamuxConfig {
   port: number;
   eventsPath: string;
@@ -93,6 +109,11 @@ export interface MetamuxConfig {
    * input on the user's live browser). Enforced server-side, POST
    * /automation, before a request ever reaches the extension. */
   agentBrowser: "off" | "read" | "full";
+  /** Space-based cmux <-> Chrome window pairing (docs/window-pairing-plan.md).
+   * Replaces marker-tab window identity with a join derived from the windows
+   * macOS reports on the active Space. Any ambiguity or a stale helper falls
+   * back to the marker tab rather than guessing. */
+  windowPairing: WindowPairingConfig;
 }
 
 export const DEFAULT_CONFIG: MetamuxConfig = {
@@ -112,6 +133,11 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   pruneArchivedAfterDays: 7,
   colorMode: "palette",
   agentBrowser: "read",
+  // enabled: true ships the pairing ENGINE on, which is observable and acts on
+  // nothing. The three behaviors below need the extension half and stay false
+  // until that lands and is verified against a real Split View; a flag that
+  // claims a behavior nothing implements is worse than an honest false.
+  windowPairing: { enabled: true, followTab: false, autoCreatePartner: false, onWindowClose: "off" },
 };
 
 export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxConfig> {
@@ -146,6 +172,21 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
     spawnCwd: typeof tmuxObj.spawnCwd === "string" ? tmuxObj.spawnCwd : DEFAULT_CONFIG.tmux.spawnCwd,
   };
 
+  const wpObj = (obj.windowPairing && typeof obj.windowPairing === "object")
+    ? (obj.windowPairing as Record<string, unknown>)
+    : {};
+  const D_WP = DEFAULT_CONFIG.windowPairing;
+  const windowPairing: WindowPairingConfig = {
+    enabled: typeof wpObj.enabled === "boolean" ? wpObj.enabled : D_WP.enabled,
+    followTab: typeof wpObj.followTab === "boolean" ? wpObj.followTab : D_WP.followTab,
+    autoCreatePartner:
+      typeof wpObj.autoCreatePartner === "boolean" ? wpObj.autoCreatePartner : D_WP.autoCreatePartner,
+    onWindowClose:
+      wpObj.onWindowClose === "off" || wpObj.onWindowClose === "close" || wpObj.onWindowClose === "park"
+        ? wpObj.onWindowClose
+        : D_WP.onWindowClose,
+  };
+
   // METAMUX_PORT: tolerant override, same isolation purpose as paths.ts's
   // METAMUX_STATE_DIR/METAMUX_CONFIG_PATH -- takes precedence over the
   // config file's own `port` (env is the more explicit, per-invocation
@@ -171,6 +212,7 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
           ? "on-activate"
           : DEFAULT_CONFIG.createGroups,
     tmux,
+    windowPairing,
     janitor: typeof obj.janitor === "boolean" ? obj.janitor : DEFAULT_CONFIG.janitor,
     janitorCrossWindow: typeof obj.janitorCrossWindow === "boolean" ? obj.janitorCrossWindow : DEFAULT_CONFIG.janitorCrossWindow,
     colorBackflow: typeof obj.colorBackflow === "boolean" ? obj.colorBackflow : DEFAULT_CONFIG.colorBackflow,
