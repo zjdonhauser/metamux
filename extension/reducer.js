@@ -121,12 +121,17 @@
  * @typedef {Object} EventMsg
  * @property {"event"} type
  * @property {number} seq
- * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"|"move_group_to_window"} name
+ * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"|"move_group_to_window"|"create_partner_window"|"park_window"} name
  * @property {EventWorkspace} [workspace]  absent for focus_window, which carries no workspace
  * @property {string} [url]  present only for open_url
  * @property {string} [title]  present only for move_group_to_window: the group to move,
  *   resolved by title because a groupId does not survive a cross-window move
- * @property {number} [chromeWindowId]  present only for move_group_to_window: the destination
+ * @property {number} [chromeWindowId]  present only for move_group_to_window and park_window
+ * @property {number} [left]    present only for create_partner_window: target display bounds
+ * @property {number} [top]     present only for create_partner_window
+ * @property {number} [width]   present only for create_partner_window
+ * @property {number} [height]  present only for create_partner_window
+ * @property {"park"|"close"} [mode]  present only for park_window
  * @property {string|null} [homeChromeWindowId]  present only for open_url -- see WorkspaceEntry.
  *   Regular workspace.activated/upserted/archived events never carry window-pairing fields at
  *   all (docs/protocol.md's Wire protocol section spreads them only onto sync/state and
@@ -169,6 +174,11 @@
  * @property {number} [fromWindowId] recoverCrossWindow: the window the group is being recovered FROM
  * @property {number} [intoId]      mergeGroup/recoverCrossWindow: the canonical group to merge into
  * @property {number} [groupId]     closeGroup: the blank-orphan group to remove
+ * @property {number} [left]        createPartnerWindow: target display bounds
+ * @property {number} [top]         createPartnerWindow
+ * @property {number} [width]       createPartnerWindow
+ * @property {number} [height]      createPartnerWindow
+ * @property {"park"|"close"} [mode]  parkWindow: minimize, or destroy the window and its tabs
  * @property {{title: string, tabCount: number, windowId?: string}[]} [groups]  reportForeignGroups
  * @property {number|null} [windowId]  ensureGroup/openUrl/collapseOthers: the resolved target
  *   Chrome window (see targetWindowFor) -- null means "not yet paired, but wants to be" (see
@@ -181,6 +191,7 @@
  * @property {number} [chromeWindowId]  reportGroupPlacement: the Chrome window (a real number --
  *   this is chrome-ops.js's own observation, not a wire value) a managed group was observed
  *   living in, to report to the daemon as a `groupPlacement` frame.
+ *   moveGroupToWindow/parkWindow: the target Chrome window instead.
  */
 
 /**
@@ -450,6 +461,19 @@ function reduceEvent(state, msg) {
     // Follow-the-tab: the workspace moved to another cmux window, so its group
     // moves to that window's paired Chrome window. Carries the title because
     // chrome-ops resolves the group by title, a groupId not surviving the move.
+    case "create_partner_window":
+      return withSeq(
+        {
+          state,
+          ops: [{ op: "createPartnerWindow", left: msg.left, top: msg.top, width: msg.width, height: msg.height }],
+        },
+        msg.seq,
+      );
+    case "park_window":
+      return withSeq(
+        { state, ops: [{ op: "parkWindow", chromeWindowId: msg.chromeWindowId, mode: msg.mode }] },
+        msg.seq,
+      );
     case "move_group_to_window":
       return withSeq(
         {

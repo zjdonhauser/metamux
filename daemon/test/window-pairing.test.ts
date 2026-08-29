@@ -133,3 +133,36 @@ describe("WindowPairing.displaysNeedingPartner", () => {
     expect(p.displaysNeedingPartner(9_000)).toEqual([]);
   });
 });
+
+describe("WindowPairing.displaysThatLostTerminal", () => {
+  // The event log carries no usable window-close signal, so a cmux window
+  // going away is derived from consecutive snapshots instead.
+  test("reports a display whose terminal disappeared", () => {
+    const p = new WindowPairing();
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    p.ingest([{ id: 200, owner: "Google Chrome", bounds: { x: 1280, y: 0, w: 1280, h: 1440 } }], chromeReported, SCREENS);
+    expect(p.displaysThatLostTerminal()).toEqual([0]);
+  });
+
+  test("reports nothing while the terminal is still there", () => {
+    const p = new WindowPairing();
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    expect(p.displaysThatLostTerminal()).toEqual([]);
+  });
+
+  // Switching Spaces makes everything vanish at once. That is not a close, and
+  // parking on it would hide the browser every time you switch desktops.
+  test("reports nothing when the whole snapshot went empty", () => {
+    const p = new WindowPairing();
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    p.ingest([], chromeReported, SCREENS);
+    expect(p.displaysThatLostTerminal()).toEqual([]);
+  });
+
+  test("reports nothing on the first snapshot", () => {
+    const p = new WindowPairing();
+    p.ingest(onPrimary, chromeReported, SCREENS);
+    expect(p.displaysThatLostTerminal()).toEqual([]);
+  });
+});

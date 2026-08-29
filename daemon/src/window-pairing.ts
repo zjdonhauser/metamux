@@ -30,6 +30,8 @@ export class WindowPairing {
   private chromeByDisplay = new Map<number, number>();
   private cmuxWindowToDisplay = new Map<string, number>();
   private onScreenCmuxDisplay: number | null = null;
+  private terminalDisplays = new Set<number>();
+  private lostTerminalDisplays: number[] = [];
   private lastViolations: Violation[] = [];
   private lastIngestAt: number | null = null;
   private readonly staleAfterMs: number;
@@ -45,6 +47,21 @@ export class WindowPairing {
 
     // Refresh only the displays actually visible right now. Untouched entries
     // are the remembered off-Space bindings and must survive.
+    // A display that had a terminal and now does not. Derived from snapshots
+    // because the event log carries no usable window-close signal. Skipped when
+    // the whole snapshot went empty: that is a Space switch, not a close, and
+    // parking on it would hide the browser every time the desktop changes.
+    const terminalsNow = new Set<number>();
+    for (const p of pairs) terminalsNow.add(p.displayId);
+    for (const v of violations) {
+      if (v.kind === "unpaired" && TERMINAL_OWNERS.includes(v.owner)) terminalsNow.add(v.displayId);
+    }
+    const snapshotWentEmpty = cgWindows.length === 0;
+    this.lostTerminalDisplays = snapshotWentEmpty
+      ? []
+      : [...this.terminalDisplays].filter((d) => !terminalsNow.has(d));
+    this.terminalDisplays = terminalsNow;
+
     this.onScreenCmuxDisplay = pairs.length === 1 ? pairs[0].displayId : null;
     for (const p of pairs) {
       if (p.chromeWindowId !== null) this.chromeByDisplay.set(p.displayId, p.chromeWindowId);
@@ -80,6 +97,11 @@ export class WindowPairing {
     return this.lastViolations
       .filter((v) => v.kind === "unpaired" && TERMINAL_OWNERS.includes(v.owner))
       .map((v) => v.displayId);
+  }
+
+  /** Displays whose terminal window went away since the previous snapshot. */
+  displaysThatLostTerminal(): number[] {
+    return this.lostTerminalDisplays;
   }
 
   get violations(): Violation[] {

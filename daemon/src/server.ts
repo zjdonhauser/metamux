@@ -48,6 +48,16 @@ type PushedEvent =
   | {
       type: "event";
       seq: number;
+      name: "create_partner_window";
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    }
+  | { type: "event"; seq: number; name: "park_window"; chromeWindowId: number; mode: "park" | "close" }
+  | {
+      type: "event";
+      seq: number;
       name: "move_group_to_window";
       /** The title alias, for logging and correlation. */
       id: string;
@@ -574,6 +584,29 @@ export class ActuatorServer {
       chromeWindowId,
     });
     this.log(`[follow-tab] ${title} (${aliasId}) -> chrome window ${chromeWindowId}`);
+  }
+
+  /** Auto-create-partner: open an unfocused Chrome window on a display whose
+   * cmux window has no partner. */
+  pushCreatePartnerWindow(bounds: { x: number; y: number; w: number; h: number }, displayId: number): void {
+    this.seq++;
+    this.broadcastRaw({
+      type: "event",
+      seq: this.seq,
+      name: "create_partner_window",
+      left: Math.round(bounds.x),
+      top: Math.round(bounds.y),
+      width: Math.round(bounds.w),
+      height: Math.round(bounds.h),
+    });
+    this.log(`[partner] creating Chrome window on display ${displayId}`);
+  }
+
+  /** Park-the-partner: its cmux window went away. */
+  pushParkWindow(chromeWindowId: number, mode: "park" | "close"): void {
+    this.seq++;
+    this.broadcastRaw({ type: "event", seq: this.seq, name: "park_window", chromeWindowId, mode });
+    this.log(`[partner] ${mode} chrome window ${chromeWindowId}`);
   }
 
   private handleWsMessage(ws: ServerWebSocket<WsData>, message: string | Buffer): void {

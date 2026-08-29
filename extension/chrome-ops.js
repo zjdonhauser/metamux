@@ -99,6 +99,10 @@ function executeOp(op, state, ctx) {
       return reportGroupPlacement(op, ctx);
     case "moveGroupToWindow":
       return moveGroupToWindow(op);
+    case "createPartnerWindow":
+      return createPartnerWindow(op);
+    case "parkWindow":
+      return parkWindow(op);
     default:
       return Promise.resolve(null);
   }
@@ -355,6 +359,50 @@ async function recoverCrossWindow(op, ctx) {
     const tabIds = /** @type {number[]} */ (tabs.map((t) => t.id));
     await chrome.tabs.move(tabIds, { windowId: ctx.windowId, index: -1 });
     await chrome.tabs.group({ tabIds, groupId: /** @type {number} */ (op.intoId) });
+  }
+  return null;
+}
+
+/**
+ * Auto-create-partner: a display holds a cmux window with no Chrome partner,
+ * so open one there. Created unfocused so it never steals the screen, and
+ * positioned to the display bounds the daemon supplies.
+ * @param {Op} op
+ * @returns {Promise<null>}
+ */
+async function createPartnerWindow(op) {
+  try {
+    await chrome.windows.create({
+      focused: false,
+      type: "normal",
+      left: /** @type {number} */ (op.left),
+      top: /** @type {number} */ (op.top),
+      width: /** @type {number} */ (op.width),
+      height: /** @type {number} */ (op.height),
+    });
+  } catch (err) {
+    console.warn("[metamux] createPartnerWindow failed:", err);
+  }
+  return null;
+}
+
+/**
+ * Park-the-partner: the paired cmux window went away. Minimize by default;
+ * "close" destroys the window and every tab in it, so the daemon only ever
+ * sends that when explicitly configured to.
+ * @param {Op} op
+ * @returns {Promise<null>}
+ */
+async function parkWindow(op) {
+  const windowId = /** @type {number} */ (op.chromeWindowId);
+  try {
+    if (op.mode === "close") {
+      await chrome.windows.remove(windowId);
+    } else {
+      await chrome.windows.update(windowId, { state: "minimized" });
+    }
+  } catch (err) {
+    console.warn("[metamux] parkWindow failed:", err);
   }
   return null;
 }
