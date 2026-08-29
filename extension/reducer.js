@@ -121,9 +121,12 @@
  * @typedef {Object} EventMsg
  * @property {"event"} type
  * @property {number} seq
- * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"} name
+ * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"|"move_group_to_window"} name
  * @property {EventWorkspace} [workspace]  absent for focus_window, which carries no workspace
  * @property {string} [url]  present only for open_url
+ * @property {string} [title]  present only for move_group_to_window: the group to move,
+ *   resolved by title because a groupId does not survive a cross-window move
+ * @property {number} [chromeWindowId]  present only for move_group_to_window: the destination
  * @property {string|null} [homeChromeWindowId]  present only for open_url -- see WorkspaceEntry.
  *   Regular workspace.activated/upserted/archived events never carry window-pairing fields at
  *   all (docs/protocol.md's Wire protocol section spreads them only onto sync/state and
@@ -444,6 +447,17 @@ function reduceEvent(state, msg) {
       return withSeq(reduceOpenUrl(state, msg), msg.seq);
     case "focus_window":
       return withSeq({ state, ops: [{ op: "focusWindow" }] }, msg.seq);
+    // Follow-the-tab: the workspace moved to another cmux window, so its group
+    // moves to that window's paired Chrome window. Carries the title because
+    // chrome-ops resolves the group by title, a groupId not surviving the move.
+    case "move_group_to_window":
+      return withSeq(
+        {
+          state,
+          ops: [{ op: "moveGroupToWindow", title: msg.title, chromeWindowId: msg.chromeWindowId }],
+        },
+        msg.seq,
+      );
     default:
       return withSeq({ state, ops: [] }, msg.seq);
   }

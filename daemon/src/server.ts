@@ -48,6 +48,17 @@ type PushedEvent =
   | {
       type: "event";
       seq: number;
+      name: "move_group_to_window";
+      /** The title alias, for logging and correlation. */
+      id: string;
+      /** chrome-ops resolves the group by title: a groupId does not survive a
+       * cross-window move. */
+      title: string;
+      chromeWindowId: number;
+    }
+  | {
+      type: "event";
+      seq: number;
       name: "open_url";
       workspace: ActuatorWorkspace;
       url: string;
@@ -548,6 +559,21 @@ export class ActuatorServer {
     this.broadcastRaw({ type: "event", seq: this.seq, name: "open_url", workspace: identity, url: urlStr, homeChromeWindowId, cmuxWindowId });
     this.log(`[open_url] ${identity.title} (${identity.id}) -> ${urlStr}${homeChromeWindowId ? ` [win ${homeChromeWindowId}]` : ""}`);
     return identity;
+  }
+
+  /** Follow-the-tab: tell the extension to move a title's group into the Chrome
+   * window now paired with the workspace's new cmux window. */
+  pushMoveGroupToWindow(aliasId: string, title: string, chromeWindowId: number): void {
+    this.seq++;
+    this.broadcastRaw({
+      type: "event",
+      seq: this.seq,
+      name: "move_group_to_window",
+      id: aliasId,
+      title,
+      chromeWindowId,
+    });
+    this.log(`[follow-tab] ${title} (${aliasId}) -> chrome window ${chromeWindowId}`);
   }
 
   private handleWsMessage(ws: ServerWebSocket<WsData>, message: string | Buffer): void {
