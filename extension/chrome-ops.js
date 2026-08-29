@@ -97,6 +97,8 @@ function executeOp(op, state, ctx) {
       return reportForeignGroups(op, ctx);
     case "reportGroupPlacement":
       return reportGroupPlacement(op, ctx);
+    case "moveGroupToWindow":
+      return moveGroupToWindow(op);
     default:
       return Promise.resolve(null);
   }
@@ -353,6 +355,36 @@ async function recoverCrossWindow(op, ctx) {
     const tabIds = /** @type {number[]} */ (tabs.map((t) => t.id));
     await chrome.tabs.move(tabIds, { windowId: ctx.windowId, index: -1 });
     await chrome.tabs.group({ tabIds, groupId: /** @type {number} */ (op.intoId) });
+  }
+  return null;
+}
+
+/**
+ * Follow-the-tab (docs/window-pairing-plan.md): the workspace moved to another
+ * cmux window, so its group moves to that window's paired Chrome window.
+ *
+ * Resolved by TITLE rather than a cached groupId, because a groupId is not
+ * stable across a cross-window move (the same reason ensureGroup re-resolves
+ * on startup). Refuses quietly when the group or target window is gone, or
+ * when the group is already where it belongs.
+ * @param {Op} op
+ * @returns {Promise<null>}
+ */
+async function moveGroupToWindow(op) {
+  const targetWindowId = /** @type {number} */ (op.chromeWindowId);
+  try {
+    const groups = await chrome.tabGroups.query({ title: /** @type {string} */ (op.title) });
+    const group = groups.find((g) => g.windowId !== targetWindowId);
+    if (!group) return null;
+    // Chrome refuses a move into a popup or app window; check before asking.
+    const target = await chrome.windows.get(targetWindowId);
+    if (target.type !== "normal") return null;
+    // Suppress the activation echo this move generates, the same guard
+    // reverse sync uses, or the daemon reads it back as user intent.
+    markServerActivation();
+    await chrome.tabGroups.move(group.id, { windowId: targetWindowId, index: -1 });
+  } catch (err) {
+    console.warn("[metamux] moveGroupToWindow failed:", err);
   }
   return null;
 }
