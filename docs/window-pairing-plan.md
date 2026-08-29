@@ -1,8 +1,9 @@
 # Space-based window pairing: design
 
-> **Status: DESIGN, not built.** Gated on one pre-flight (see Assumptions). Where this and
-> `docs/protocol.md` disagree, protocol.md is the contract and wins; this doc becomes protocol
-> text once it ships.
+> **Status: IN PROGRESS.** The pure join (`daemon/src/window-join.ts`) and the tier-1 helper
+> (`window-source/metamux-windows.swift`) are built and verified end to end on live data. The
+> behaviors are not. Where this and `docs/protocol.md` disagree, protocol.md is the contract and
+> wins; this doc becomes protocol text once it ships.
 
 ## The problem
 
@@ -145,11 +146,14 @@ available for anyone who wants it and is never the default.
 
 ## Assumptions, and the one that gates this
 
-- **UNVERIFIED: the join behaves identically under real macOS Split View.** Every measurement so
-  far was taken against manually tiled windows (12px gap, mismatched y origins). Split View
-  windows are managed by the window server and may report differently. **Verify before building:**
-  run `axprobe3.swift` while in the normal fullscreen split and confirm `pairable: YES` per
-  display. If Split View reports differently, the join changes and this spec is wrong.
+- **Split View was over-gated in the first draft of this doc, and the gate has been lowered.**
+  `com.apple.spaces.plist` records `TileWindowID` per tile, which is a plain CGWindowID, so tiled
+  windows carry ordinary window ids: the only property the join needs. The plist also records
+  `Inter-Tile Spacing: 12`, which means the 12px gap first read as evidence AGAINST Split View is
+  actually consistent with it. Confirming per-display `pairable: YES` while tiled is still worth
+  doing, but it validates rather than blocks: the join is pure and tested against both shapes, and
+  the only Split-View-dependent piece is the helper's size filter, which is relative to display
+  area rather than absolute.
 - Verified: the Space filter discriminates (2 on-Space vs 4 total).
 - Verified: window id, owner, and bounds need no TCC grant. Only `kCGWindowName` is gated.
 - Verified: `window_id` is absent from the workspace events that matter.
