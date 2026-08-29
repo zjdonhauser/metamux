@@ -415,13 +415,21 @@ async function parkWindow(op) {
  * stable across a cross-window move (the same reason ensureGroup re-resolves
  * on startup). Refuses quietly when the group or target window is gone, or
  * when the group is already where it belongs.
+ *
+ * RETURNS A CACHE CORRECTION. A cross-window move can mint a NEW group id, so
+ * leaving the cached one in place points every later activate/collapse at a
+ * dead group ("No group with id: ..."). archiveGroup's close path already
+ * corrects itself this way; this must too, and cannot rely on
+ * watchGroupPlacement's debounced rescan, which never runs if the service
+ * worker dies first.
  * @param {Op} op
- * @returns {Promise<null>}
+ * @returns {Promise<Msg|null>}
  */
 async function moveGroupToWindow(op) {
   const targetWindowId = /** @type {number} */ (op.chromeWindowId);
+  const title = /** @type {string} */ (op.title);
   try {
-    const groups = await chrome.tabGroups.query({ title: /** @type {string} */ (op.title) });
+    const groups = await chrome.tabGroups.query({ title });
     const group = groups.find((g) => g.windowId !== targetWindowId);
     if (!group) return null;
     // Chrome refuses a move into a popup or app window; check before asking.
@@ -430,11 +438,23 @@ async function moveGroupToWindow(op) {
     // Suppress the activation echo this move generates, the same guard
     // reverse sync uses, or the daemon reads it back as user intent.
     markServerActivation();
+    // The old id may not survive the move, so suppress its removal too, or
+    // watchGroupRemoved reads the move as the user closing the group.
+    markServerRemoval(group.id);
     await chrome.tabGroups.move(group.id, { windowId: targetWindowId, index: -1 });
+
+    if (op.id == null) return null;
+    const after = await chrome.tabGroups.query({ title, windowId: targetWindowId });
+    return {
+      type: "local",
+      name: "groupCreated",
+      id: /** @type {string} */ (op.id),
+      groupId: after[0]?.id ?? null,
+    };
   } catch (err) {
     console.warn("[metamux] moveGroupToWindow failed:", err);
+    return null;
   }
-  return null;
 }
 
 /**

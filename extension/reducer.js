@@ -124,6 +124,8 @@
  * @property {"workspace.activated"|"workspace.upserted"|"workspace.archived"|"open_url"|"focus_window"|"move_group_to_window"|"create_partner_window"|"park_window"} name
  * @property {EventWorkspace} [workspace]  absent for focus_window, which carries no workspace
  * @property {string} [url]  present only for open_url
+ * @property {string} [id]  present only for move_group_to_window: the title alias whose
+ *   cached groupId gets corrected after the move
  * @property {string} [title]  present only for move_group_to_window: the group to move,
  *   resolved by title because a groupId does not survive a cross-window move
  * @property {number} [chromeWindowId]  present only for move_group_to_window and park_window
@@ -478,7 +480,7 @@ function reduceEvent(state, msg) {
       return withSeq(
         {
           state,
-          ops: [{ op: "moveGroupToWindow", title: msg.title, chromeWindowId: msg.chromeWindowId }],
+          ops: [{ op: "moveGroupToWindow", id: msg.id, title: msg.title, chromeWindowId: msg.chromeWindowId }],
         },
         msg.seq,
       );
