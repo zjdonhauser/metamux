@@ -105,11 +105,16 @@ export class WindowSource {
     });
   }
 
-  private logOnChange(windows: CGWindow[]): void {
-    const seen = windows.map((w) => `${w.owner}#${w.id}`).sort().join(",");
+  /** Logs the resolved PAIRS, not the raw window list. The window list looked
+   * informative and was not: it never showed whether pairing actually worked. */
+  private logOnChange(): void {
     const health = this.pairing.healthy ? "healthy" : "FALLBACK";
+    const pairs = this.pairing
+      .currentPairs()
+      .map((p) => `d${p.displayId}:cmux#${p.cmuxWindowId}<->chrome#${p.chromeCgWindowId}${p.chromeWindowId !== null ? `(win ${p.chromeWindowId})` : ""}`)
+      .join(" ");
     const violations = this.pairing.violations.map((v) => `${v.kind}:${v.owner}@${v.displayId}`).join(",");
-    const summary = `${health} [${seen}]${violations ? " " + violations : ""}`;
+    const summary = `${health} ${pairs || "no pairs"}${violations ? " | " + violations : ""}`;
     if (summary === this.lastSummary) return;
     this.lastSummary = summary;
     this.log(`[window-pairing] ${summary}`);
@@ -138,7 +143,7 @@ export class WindowSource {
         bounds: { x: d.x, y: d.y, w: d.w, h: d.h },
       }));
       this.pairing.ingest(windows, this.chromeWindows, displays);
-      this.logOnChange(windows);
+      this.logOnChange();
     }
   }
 }

@@ -16,7 +16,7 @@
 // back, so a Chrome window replaced while you were away is picked up rather than
 // remembered wrongly.
 
-import { joinWindows, TERMINAL_OWNERS, type CGWindow, type ChromeWindow, type Display, type Violation } from "./window-join.ts";
+import { joinWindows, TERMINAL_OWNERS, type CGWindow, type ChromeWindow, type Display, type Pair, type Violation } from "./window-join.ts";
 
 export interface WindowPairingOptions {
   /** A snapshot older than this means the helper died or stalled. Treated as
@@ -33,6 +33,7 @@ export class WindowPairing {
   private terminalDisplays = new Set<number>();
   private lostTerminalDisplays: number[] = [];
   private displayBoundsById = new Map<number, Display["bounds"]>();
+  private lastPairs: Pair[] = [];
   private lastViolations: Violation[] = [];
   private lastIngestAt: number | null = null;
   private readonly staleAfterMs: number;
@@ -45,6 +46,7 @@ export class WindowPairing {
     const { pairs, violations } = joinWindows(cgWindows, chromeWindows, displays);
     for (const d of displays) this.displayBoundsById.set(d.id, d.bounds);
     this.lastViolations = violations;
+    this.lastPairs = pairs;
     this.lastIngestAt = now;
 
     // Refresh only the displays actually visible right now. Untouched entries
@@ -99,6 +101,11 @@ export class WindowPairing {
     return this.lastViolations
       .filter((v) => v.kind === "unpaired" && TERMINAL_OWNERS.includes(v.owner))
       .map((v) => v.displayId);
+  }
+
+  /** The pairs resolved from the most recent snapshot, for diagnostics. */
+  currentPairs(): Pair[] {
+    return this.lastPairs;
   }
 
   /** Where to place a partner window for a display. */
