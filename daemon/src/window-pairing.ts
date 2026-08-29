@@ -29,7 +29,7 @@ const DEFAULT_STALE_AFTER_MS = 10_000;
 export class WindowPairing {
   private chromeByDisplay = new Map<number, number>();
   private cmuxWindowToDisplay = new Map<string, number>();
-  private onScreenCmuxDisplay: number | null = null;
+  private frontmostTerminalDisplayId: number | null = null;
   private terminalDisplays = new Set<number>();
   private lostTerminalDisplays: number[] = [];
   private displayBoundsById = new Map<number, Display["bounds"]>();
@@ -66,7 +66,18 @@ export class WindowPairing {
       : [...this.terminalDisplays].filter((d) => !terminalsNow.has(d));
     this.terminalDisplays = terminalsNow;
 
-    this.onScreenCmuxDisplay = pairs.length === 1 ? pairs[0].displayId : null;
+    // The display of the FRONT-MOST terminal window. CGWindowList returns
+    // front-to-back, and cmux's own `key: true` window is always the front-most
+    // one (verified live, two windows across two displays), so this is what
+    // ties a cmux window UUID to a display. The previous rule -- "the display
+    // of the only on-screen pair" -- could never resolve on a multi-monitor
+    // setup, where every display shows a pair at once.
+    const frontTerminal = cgWindows.find((w) => TERMINAL_OWNERS.includes(w.owner));
+    this.frontmostTerminalDisplayId = frontTerminal
+      ? (pairs.find((p) => p.cmuxWindowId === frontTerminal.id)?.displayId ??
+         violations.find((v) => v.kind === "unpaired" && v.owner === frontTerminal.owner)?.displayId ??
+         null)
+      : null;
     for (const p of pairs) {
       if (p.chromeWindowId !== null) this.chromeByDisplay.set(p.displayId, p.chromeWindowId);
     }
@@ -77,8 +88,8 @@ export class WindowPairing {
    * violated: a binding learned from an ambiguous frame is worse than none. */
   noteActivation(cmuxWindowId: string, now = Date.now()): void {
     if (!this.healthyAt(now)) return;
-    if (this.onScreenCmuxDisplay === null) return;
-    this.cmuxWindowToDisplay.set(cmuxWindowId, this.onScreenCmuxDisplay);
+    if (this.frontmostTerminalDisplayId === null) return;
+    this.cmuxWindowToDisplay.set(cmuxWindowId, this.frontmostTerminalDisplayId);
   }
 
   chromeWindowFor(cmuxWindowId: string, now = Date.now()): number | null {

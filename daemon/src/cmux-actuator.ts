@@ -281,3 +281,20 @@ export async function findWorkspaceWindow(workspaceId: string): Promise<string |
   }
   return null;
 }
+
+/** The cmux window that currently has focus, or null. Used to confirm a
+ * display binding is being learned for the window actually in front, rather
+ * than whichever one happened to be front after an async round trip. */
+export async function keyWindowId(): Promise<string | null> {
+  const result = await rpc("window.list");
+  if (!result.ok || !result.data || typeof result.data !== "object") return null;
+  const windows = (result.data as Record<string, unknown>).windows;
+  if (!Array.isArray(windows)) return null;
+  for (const w of windows) {
+    if (w && typeof w === "object" && (w as Record<string, unknown>).key === true) {
+      const id = (w as Record<string, unknown>).id;
+      if (typeof id === "string") return id;
+    }
+  }
+  return null;
+}

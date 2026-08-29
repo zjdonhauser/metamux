@@ -242,6 +242,9 @@ async function runDaemon(): Promise<void> {
       }
     }, 4000);
     log(`[window-pairing] engine on ${JSON.stringify(config.windowPairing)}`);
+    // Deferred: seedHoldingWindows is declared below, and the seed needs the
+    // cmux CLI anyway, so there is no value in racing startup for it.
+    if (config.windowPairing.followTab) setTimeout(() => void seedHoldingWindows(), 2000);
     log("[window-pairing] all three behaviors are built; each acts only when its own flag is true");
   } else {
     log("[window-pairing] disabled by config");
@@ -510,10 +513,28 @@ async function runDaemon(): Promise<void> {
     // which is what lets the pairing bind that window's UUID to a display.
     if (emit && event.name === "selected" && config.windowPairing.enabled) {
       const ref = registry.activeId ? registry.workspaces.get(registry.activeId) : null;
-      if (ref?.cmuxWindowId) windowSource.pairing.noteActivation(ref.cmuxWindowId);
       if (ref && config.windowPairing.followTab) void maybeFollowTab(ref);
     }
     if (emit && derived.length > 0) server.broadcast(derived);
+  };
+
+  /** Seed where every workspace currently lives, so the FIRST move after the
+   * daemon starts is detectable. Without this the first selection of any
+   * workspace is a first sighting and correctly moves nothing, which reads as
+   * "follow-the-tab is broken" on a fresh daemon. */
+  const seedHoldingWindows = async (): Promise<void> => {
+    try {
+      let seeded = 0;
+      for (const win of await cmuxActuator.listWindows()) {
+        for (const tab of await cmuxActuator.listTabs(win.id)) {
+          lastHoldingWindow.set(tab.id, win.id);
+          seeded++;
+        }
+      }
+      log(`[follow-tab] seeded ${seeded} workspace location(s) across cmux windows`);
+    } catch (err) {
+      log(`[follow-tab] seed failed, first move after startup will not be detected: ${err}`);
+    }
   };
 
   /** Auto-create rate limiting, per display. */
@@ -561,18 +582,49 @@ async function runDaemon(): Promise<void> {
   const maybeFollowTab = async (ref: WorkspaceRef): Promise<void> => {
     try {
       const current = await windowLookup.holdingWindow(ref.sourceId);
+      // Bind the window we just confirmed, not ref.cmuxWindowId: the cmux-sourced
+      // ref that activeId points at carries a null cmuxWindowId, so binding on it
+      // never learned anything.
+      //
+      // Only bind when cmux still reports this window as key. The display comes
+      // from the front-most terminal window, and this call happens after an async
+      // CLI round trip, so without the guard a slow lookup binds the wrong
+      // display and two cmux windows collapse onto one Chrome window.
+      if (current && (await cmuxActuator.keyWindowId()) === current) {
+        windowSource.pairing.noteActivation(current);
+      }
+      const previous = lastHoldingWindow.get(ref.sourceId) ?? ref.cmuxWindowId;
+      // Resolve the destination through registry.homeChromeWindowId, the
+      // pairing metamux already learns from the extension's windowPairing
+      // frames. The Space-based join cannot answer this: cmux reports no window
+      // geometry (`window.list` has id/index/key and no bounds), so a cmux
+      // window UUID cannot be tied to a display. The join's job here is the
+      // health gate, not the lookup.
+      // Space-based pairing first; the extension's own windowPairing map only
+      // ever covers its single marker-tab window, so it cannot answer for a
+      // second cmux window.
+      const chromeFor = (cmuxWindowId: string | null): number | null => {
+        if (!cmuxWindowId) return null;
+        const fromJoin = windowSource.pairing.chromeWindowFor(cmuxWindowId);
+        if (fromJoin !== null) return fromJoin;
+        const raw = registry.homeChromeWindowId(cmuxWindowId);
+        const n = raw === null ? NaN : Number(raw);
+        return Number.isFinite(n) ? n : null;
+      };
       const decision = decideFollowTab({
         enabled: config.windowPairing.followTab,
         pairingHealthy: windowSource.pairing.healthy,
         aliasId: config.groupBy === "title" ? titleAliasId(ref.title) : ref.id,
-        previousCmuxWindowId: lastHoldingWindow.get(ref.sourceId) ?? ref.cmuxWindowId,
+        previousCmuxWindowId: previous,
         currentCmuxWindowId: current,
-        chromeWindowForCurrent: current ? windowSource.pairing.chromeWindowFor(current) : null,
-        chromeWindowForPrevious: (() => {
-          const prev = lastHoldingWindow.get(ref.sourceId) ?? ref.cmuxWindowId;
-          return prev ? windowSource.pairing.chromeWindowFor(prev) : null;
-        })(),
+        chromeWindowForCurrent: chromeFor(current),
+        chromeWindowForPrevious: chromeFor(previous),
       });
+      log(
+        `[follow-tab] ${ref.title}: ${previous ?? "?"} -> ${current ?? "?"} ` +
+          `chrome ${chromeFor(previous) ?? "?"} -> ${chromeFor(current) ?? "?"} ` +
+          `healthy=${windowSource.pairing.healthy} decision=${decision ? "MOVE" : "none"}`,
+      );
       // Record the new home either way, so the next selection is not read as
       // another move. Deliberately not persisted: after a restart the first
       // selection is a first sighting, which correctly moves nothing.

@@ -25,6 +25,10 @@ export const CONFIG_ALLOWED_KEYS = [
   "pruneArchivedAfterDays",
   "colorMode",
   "agentBrowser",
+  "windowPairing.enabled",
+  "windowPairing.followTab",
+  "windowPairing.autoCreatePartner",
+  "windowPairing.onWindowClose",
 ] as const;
 
 export type ConfigKey = (typeof CONFIG_ALLOWED_KEYS)[number];
@@ -85,7 +89,14 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
         : { ok: false, error: `${key} must be "on-open", "on-activate", or "eager"` };
     case "tmux.enabled":
     case "tmux.alphabetize":
+    case "windowPairing.enabled":
+    case "windowPairing.followTab":
+    case "windowPairing.autoCreatePartner":
       return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };
+    case "windowPairing.onWindowClose":
+      return value === "off" || value === "park" || value === "close"
+        ? { ok: true }
+        : { ok: false, error: `${key} must be one of: off, park, close` };
     case "tmux.mirror":
       return value === "windows" || value === "global" || value === "partition"
         ? { ok: true }
