@@ -30,6 +30,15 @@ interface CursorState {
   seq: number;
 }
 
+/** One Chrome window as the extension sees it, in Chrome's own coordinates. */
+export interface ChromeWindowBounds {
+  id: number;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
 export interface ServerStats {
   skippedLines: number;
 }
@@ -103,6 +112,9 @@ export interface ActuatorServerOptions {
    * `groupPlacement`'s shape. Registry.setWindowPairing + persisting live
    * in main.ts. */
   onWindowPairing?: (cmuxWindowId: string, chromeWindowId: string) => void;
+  /** Chrome's own reported window geometry, the only bridge between its
+   * integer windowId and a CGWindowID (docs/window-pairing-plan.md). */
+  onWindowBounds?: (windows: ChromeWindowBounds[]) => void;
   /** Registry compaction (POST /prune, `metamux prune`): called after
    * `registry.pruneArchived(null)` actually removed something, so main.ts
    * can persist registry.json -- ActuatorServer owns no file I/O itself. */
@@ -126,6 +138,7 @@ export class ActuatorServer {
   private onUserClosedGroup?: (id: string) => void;
   private onGroupPlacement?: (id: string, chromeWindowId: string | null) => void;
   private onWindowPairing?: (cmuxWindowId: string, chromeWindowId: string) => void;
+  private onWindowBounds?: (windows: ChromeWindowBounds[]) => void;
   private onPrune?: () => void | Promise<void>;
   private port: number;
   private secret: string;
@@ -157,6 +170,7 @@ export class ActuatorServer {
     this.onUserClosedGroup = options.onUserClosedGroup;
     this.onGroupPlacement = options.onGroupPlacement;
     this.onWindowPairing = options.onWindowPairing;
+    this.onWindowBounds = options.onWindowBounds;
     this.onPrune = options.onPrune;
     this.log = options.log ?? ((line: string) => console.log(line));
   }
@@ -628,6 +642,26 @@ export class ActuatorServer {
       const cmuxWindowId = typeof obj.cmuxWindowId === "string" ? obj.cmuxWindowId : null;
       const chromeWindowId = typeof obj.chromeWindowId === "string" ? obj.chromeWindowId : null;
       if (cmuxWindowId && chromeWindowId) this.onWindowPairing?.(cmuxWindowId, chromeWindowId);
+      return;
+    }
+
+    if (obj.type === "windowBounds") {
+      const raw = Array.isArray(obj.windows) ? obj.windows : [];
+      const windows: ChromeWindowBounds[] = [];
+      for (const entry of raw) {
+        if (!entry || typeof entry !== "object") continue;
+        const e = entry as Record<string, unknown>;
+        if (
+          typeof e.id === "number" &&
+          typeof e.left === "number" &&
+          typeof e.top === "number" &&
+          typeof e.width === "number" &&
+          typeof e.height === "number"
+        ) {
+          windows.push({ id: e.id, left: e.left, top: e.top, width: e.width, height: e.height });
+        }
+      }
+      this.onWindowBounds?.(windows);
       return;
     }
 

@@ -289,6 +289,11 @@ async function runDaemon(): Promise<void> {
     onGroupPlacement: (id, chromeWindowId) => {
       handleGroupPlacement(id, chromeWindowId);
     },
+    onWindowBounds: (windows) => {
+      windowSource.setChromeWindows(
+        windows.map((w) => ({ id: w.id, bounds: { x: w.left, y: w.top, w: w.width, h: w.height } })),
+      );
+    },
     onWindowPairing: (cmuxWindowId, chromeWindowId) => {
       handleWindowPairing(cmuxWindowId, chromeWindowId);
     },

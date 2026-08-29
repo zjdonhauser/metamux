@@ -118,9 +118,45 @@ async function boot() {
     },
     onStatus: (status) => {
       chrome.storage.local.set({ metamuxStatus: { ...status, at: Date.now() } });
+      // Geometry is the only bridge between Chrome's integer windowId and the
+      // CGWindowID the daemon's window helper sees, so re-report on every
+      // (re)connect (docs/window-pairing-plan.md).
+      if (status?.connected) void reportWindowBounds();
     },
   });
 }
+
+/**
+ * Reports every normal Chrome window's bounds to the daemon. Advisory only:
+ * the daemon pairs on geometry and simply leaves chromeWindowId null if this
+ * never arrives, so a failure here degrades rather than breaks.
+ */
+async function reportWindowBounds() {
+  try {
+    const wins = await chrome.windows.getAll({ populate: false });
+    const windows = wins
+      .filter((w) => w.type === "normal" && typeof w.id === "number")
+      .map((w) => ({ id: w.id, left: w.left ?? 0, top: w.top ?? 0, width: w.width ?? 0, height: w.height ?? 0 }));
+    ws.send({ type: "windowBounds", windows });
+  } catch (err) {
+    console.warn("[metamux] windowBounds report failed:", err);
+  }
+}
+
+// Re-report whenever the window layout could have changed. onBoundsChanged
+// fires continuously during a drag, so this is debounced.
+/** @type {ReturnType<typeof setTimeout>|null} */
+let boundsTimer = null;
+function scheduleBoundsReport() {
+  if (boundsTimer) clearTimeout(boundsTimer);
+  boundsTimer = setTimeout(() => {
+    boundsTimer = null;
+    void reportWindowBounds();
+  }, 400);
+}
+chrome.windows.onBoundsChanged?.addListener(scheduleBoundsReport);
+chrome.windows.onCreated.addListener(scheduleBoundsReport);
+chrome.windows.onRemoved.addListener(scheduleBoundsReport);
 
 chrome.runtime.onStartup.addListener(boot);
 chrome.runtime.onInstalled.addListener(boot);
