@@ -12,6 +12,7 @@ import { diffConfig } from "./config-diff.ts";
 import { WindowSource } from "./window-source.ts";
 import { WindowLookup } from "./window-lookup.ts";
 import { decideFollowTab } from "./follow-tab.ts";
+import { decideAutoCreate, decidePartnerClose } from "./partner-window.ts";
 import { titleAliasId } from "./group-projection.ts";
 import { ConfigWatcher } from "./config-watch.ts";
 import { loadConfig } from "./config.ts";
@@ -228,10 +229,20 @@ async function runDaemon(): Promise<void> {
   const repoDir = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
   const windowSource = new WindowSource(repoDir, logPath().replace(/\/[^/]+$/, ""), log);
   const windowLookup = new WindowLookup((workspaceId) => cmuxActuator.findWorkspaceWindow(workspaceId));
+  let partnerTimer: ReturnType<typeof setInterval> | null = null;
   if (config.windowPairing.enabled) {
     windowSource.start();
+    // Snapshots arrive at 1 Hz; evaluating every 4s is often enough for a new
+    // window to get a partner promptly without churning on transient frames.
+    partnerTimer = setInterval(() => {
+      try {
+        runPartnerBehaviors();
+      } catch (err) {
+        log(`[partner] skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }, 4000);
     log(`[window-pairing] engine on ${JSON.stringify(config.windowPairing)}`);
-    log("[window-pairing] follow-tab/auto-create/park await the extension half; engine observes only");
+    log("[window-pairing] all three behaviors are built; each acts only when its own flag is true");
   } else {
     log("[window-pairing] disabled by config");
   }
@@ -503,6 +514,40 @@ async function runDaemon(): Promise<void> {
       if (ref && config.windowPairing.followTab) void maybeFollowTab(ref);
     }
     if (emit && derived.length > 0) server.broadcast(derived);
+  };
+
+  /** Auto-create rate limiting, per display. */
+  const lastPartnerCreateAt = new Map<number, number>();
+
+  /** The two partner behaviors, evaluated against each fresh pairing snapshot
+   * rather than an event, because the log carries no window-close signal.
+   * Both refuse while the pairing is unhealthy, inside their own decisions. */
+  const runPartnerBehaviors = (): void => {
+    if (!config.windowPairing.enabled) return;
+    const pairing = windowSource.pairing;
+
+    const create = decideAutoCreate({
+      enabled: config.windowPairing.autoCreatePartner,
+      pairingHealthy: pairing.healthy,
+      displaysNeedingPartner: pairing.displaysNeedingPartner(),
+      lastCreateAtByDisplay: lastPartnerCreateAt,
+      now: Date.now(),
+    });
+    if (create) {
+      const bounds = pairing.displayBounds(create.displayId);
+      if (bounds) {
+        lastPartnerCreateAt.set(create.displayId, Date.now());
+        server.pushCreatePartnerWindow(bounds, create.displayId);
+      }
+    }
+
+    for (const displayId of pairing.displaysThatLostTerminal()) {
+      const decision = decidePartnerClose({
+        behavior: config.windowPairing.onWindowClose,
+        chromeWindowId: pairing.chromeWindowForDisplay(displayId),
+      });
+      if (decision) server.pushParkWindow(decision.chromeWindowId, decision.kind);
+    }
   };
 
   /** Last cmux window each workspace was confirmed in, so a repeat selection
@@ -929,6 +974,8 @@ async function runDaemon(): Promise<void> {
     configWatcher.stop();
     if (pendingTimer) clearTimeout(pendingTimer);
     if (portsPollTimer) clearInterval(portsPollTimer);
+    if (partnerTimer) clearInterval(partnerTimer);
+    windowSource.stop();
     clearInterval(socketProbeTimer);
     clearInterval(tmuxPollTimer);
     clearInterval(colorBackflowTimer);

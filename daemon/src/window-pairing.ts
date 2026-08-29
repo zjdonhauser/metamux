@@ -32,6 +32,7 @@ export class WindowPairing {
   private onScreenCmuxDisplay: number | null = null;
   private terminalDisplays = new Set<number>();
   private lostTerminalDisplays: number[] = [];
+  private displayBoundsById = new Map<number, Display["bounds"]>();
   private lastViolations: Violation[] = [];
   private lastIngestAt: number | null = null;
   private readonly staleAfterMs: number;
@@ -42,6 +43,7 @@ export class WindowPairing {
 
   ingest(cgWindows: CGWindow[], chromeWindows: ChromeWindow[], displays: Display[], now = Date.now()): void {
     const { pairs, violations } = joinWindows(cgWindows, chromeWindows, displays);
+    for (const d of displays) this.displayBoundsById.set(d.id, d.bounds);
     this.lastViolations = violations;
     this.lastIngestAt = now;
 
@@ -97,6 +99,17 @@ export class WindowPairing {
     return this.lastViolations
       .filter((v) => v.kind === "unpaired" && TERMINAL_OWNERS.includes(v.owner))
       .map((v) => v.displayId);
+  }
+
+  /** Where to place a partner window for a display. */
+  displayBounds(displayId: number): Display["bounds"] | null {
+    return this.displayBoundsById.get(displayId) ?? null;
+  }
+
+  /** The Chrome window paired to a display, regardless of which cmux window
+   * pointed at it. Park needs this after the terminal has already gone. */
+  chromeWindowForDisplay(displayId: number): number | null {
+    return this.chromeByDisplay.get(displayId) ?? null;
   }
 
   /** Displays whose terminal window went away since the previous snapshot. */
