@@ -630,7 +630,21 @@ async function runDaemon(): Promise<void> {
       // selection is a first sighting, which correctly moves nothing.
       lastHoldingWindow.set(ref.sourceId, current);
       if (!decision) return;
+      // A daemon-driven move must record the same placement override a user-driven
+      // move records (handleGroupPlacement). Without it the next janitor sync sees
+      // a managed-title group outside the metamux window with no override and
+      // recovers it straight back, and ensureGroup re-creates it in the old window.
+      const derived = registry.setPlacementOverride(ref.id, String(decision.toChromeWindowId));
       server.pushMoveGroupToWindow(decision.aliasId, ref.title, decision.toChromeWindowId);
+      if (derived.length > 0) {
+        server.broadcast(derived);
+        // placementOverride is computed at serialization time, not carried by
+        // broadcast events, so connected clients only learn it from a full sync --
+        // pushed AFTER the move so ensureGroup finds the group already relocated
+        // instead of creating a second one in the destination.
+        server.pushSyncToAll();
+        void persist();
+      }
     } catch (err) {
       log(`[follow-tab] skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
