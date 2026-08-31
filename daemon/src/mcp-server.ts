@@ -45,8 +45,15 @@ export const METAMUX_MCP_TOOLS: McpTool[] = [
   {
     name: "metamux_open",
     description:
-      "Open a URL in a workspace's Chrome tab group. Defaults to the calling shell's own workspace, " +
-      "so a link lands where the agent is working rather than in whichever tab the human is looking at.",
+      "Show a URL to the human. The URL opens as a new tab in a workspace's Chrome tab group. " +
+      "The default target is the calling shell's own workspace, so a link lands where the agent " +
+      "works, not in the tab the human looks at. " +
+      "Use this tool only for a URL the human must see. Each call adds one tab, and the tab stays " +
+      "until the human closes it. Do not open an enumerated list, such as every open PR or every " +
+      "ticket: this buries the workspace in tabs nobody asked for. " +
+      "Do not use this tool to read or collect content. To read a page, use the API or the CLI for " +
+      "that system, such as `gh` for GitHub. To inspect a tab that is already open, use " +
+      "metamux_tab_context or metamux_browser_snapshot.",
     inputSchema: {
       type: "object",
       properties: {
