@@ -1,6 +1,6 @@
 ---
 name: metamux
-description: Interact with the human's metamux setup - the daemon that pairs each cmux workspace with a tab group in their real Chrome browser. Use when the human should SEE a URL (a PR, a preview, a dashboard, docs) in their own browser next to this terminal, when you need to know which workspace/project context you are running in, or when a dev server port should open for the human. Commands run from any cmux shell.
+description: Interact with the human's metamux setup - the daemon that pairs each cmux workspace with a tab group in their real Chrome browser. Use when the human should SEE a URL (a PR, a preview, a dashboard, docs) in their own browser next to this terminal, when you need to know which workspace/project context you are running in, or when a dev server port should open for the human. Opening a URL is for the human to look at, never a way for you to read a page. Commands run from any cmux shell.
 license: MIT
 metadata:
   version: 0.1.0
@@ -35,7 +35,7 @@ If `metamux` is not on PATH, use `bun ~/Documents/GitHub/metamux/cli/metamux.ts 
 
 ## MCP tools (when the `metamux` MCP server is registered)
 
-- `metamux_open` {url, workspaceId?, active?} - open a URL in a workspace's group.
+- `metamux_open` {url, workspaceId?, active?} - show a URL to the human, in a workspace's group.
   Defaults to the calling shell's workspace; pass `active: true` for the visible one.
 - `metamux_workspaces` - list of live workspaces
 - `metamux_tab_context` - list the tabs in this workspace's own group
@@ -50,7 +50,12 @@ If `metamux` is not on PATH, use `bun ~/Documents/GitHub/metamux/cli/metamux.ts 
 
 - `metamux open` targets the workspace of the SHELL you run it from, not the visually
   focused one. That is usually what you want (your work lands in your workspace's group).
-- Never spam opens: one URL per meaningful artifact (the PR, the preview), not every link.
+- **`metamux open` shows a URL to the human. It is not a way for you to read a page.**
+  Each open adds a tab, and the tab stays until the human closes it. To read a page, use
+  that system's API or CLI (`gh` for GitHub). To inspect a tab that is already open, use
+  `metamux_tab_context` or `metamux_browser_snapshot`, which reuse the tab.
+- Never bulk-open an enumerated list, such as every open PR or every ticket. One URL per
+  meaningful artifact: the PR under discussion, the preview you just built.
 - `metamux focus` steals the human's screen focus - use it only when they asked to be
   shown something right now.
 - If the daemon is down (`metamux status` fails), fall back to printing the URL and say
