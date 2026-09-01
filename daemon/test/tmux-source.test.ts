@@ -1,55 +1,101 @@
 import { describe, expect, test } from "bun:test";
-import { buildHookCommand, HOOK_EVENTS, parseSessionList } from "../src/model/tmux-source.ts";
+import { hostMap, listSessions, parseHostMapOutput, parseSessionsOutput, resolveMirrorMode } from "../src/tmux-source.ts";
 
-describe("parseSessionList", () => {
-  test("reads name and stamped id", () => {
-    expect(parseSessionList("alpha\tmw_abc123\n")).toEqual([{ name: "alpha", metamuxId: "mw_abc123" }]);
-  });
+const TAB = "\t";
 
-  // tmux renders an unset user option as an empty field, so this is what every
-  // session looks like right after a tmux server restart.
-  test("treats an empty id field as never stamped", () => {
-    expect(parseSessionList("beta\t\n")).toEqual([{ name: "beta", metamuxId: null }]);
-  });
-
-  test("reads a mixed list", () => {
-    expect(parseSessionList("alpha\tmw_1\nbeta\t\ngamma\tmw_3\n")).toEqual([
-      { name: "alpha", metamuxId: "mw_1" },
-      { name: "beta", metamuxId: null },
-      { name: "gamma", metamuxId: "mw_3" },
+describe("parseSessionsOutput", () => {
+  test("parses id/name/attached rows", () => {
+    const stdout = [`$25${TAB}cmux${TAB}3`, `$2${TAB}compliance${TAB}2`, `$36${TAB}wakey${TAB}0`].join("\n");
+    expect(parseSessionsOutput(stdout)).toEqual([
+      { id: "$25", name: "cmux", attached: 3 },
+      { id: "$2", name: "compliance", attached: 2 },
+      { id: "$36", name: "wakey", attached: 0 },
     ]);
   });
 
-  // Splitting on the last tab keeps a tab inside a session name from eating
-  // the id field.
-  test("a tab inside a session name does not eat the id", () => {
-    expect(parseSessionList("odd\tname\tmw_9\n")).toEqual([{ name: "odd\tname", metamuxId: "mw_9" }]);
+  test("returns [] for empty output", () => {
+    expect(parseSessionsOutput("")).toEqual([]);
   });
 
-  test("is empty for no output", () => {
-    expect(parseSessionList("")).toEqual([]);
+  test("skips a malformed row (missing id or name)", () => {
+    const stdout = [`$25${TAB}cmux${TAB}1`, `${TAB}${TAB}1`, `$2${TAB}compliance${TAB}1`].join("\n");
+    expect(parseSessionsOutput(stdout)).toEqual([
+      { id: "$25", name: "cmux", attached: 1 },
+      { id: "$2", name: "compliance", attached: 1 },
+    ]);
+  });
+
+  test("defaults attached to 0 when unparseable", () => {
+    const stdout = `$9${TAB}mh-accounts${TAB}notanumber`;
+    expect(parseSessionsOutput(stdout)).toEqual([{ id: "$9", name: "mh-accounts", attached: 0 }]);
   });
 });
 
-describe("buildHookCommand", () => {
-  test("builds a global hook that nudges the daemon", () => {
-    expect(buildHookCommand("session-created", "http://127.0.0.1:8377/tmux-changed")).toEqual([
-      "set-hook",
-      "-g",
-      "session-created",
-      'run-shell "curl -s -m 1 -X POST http://127.0.0.1:8377/tmux-changed >/dev/null 2>&1 || true"',
-    ]);
+describe("parseHostMapOutput", () => {
+  test("joins client pid -> session id -> CMUX_WORKSPACE_ID via ps eww", () => {
+    const clients = [`3674${TAB}$25`, `3583${TAB}$2`].join("\n");
+    const ps = [
+      "3674 /bin/tmux attach -t cmux ANTHROPIC_API_KEY=redacted CMUX_WORKSPACE_ID=1D334484-F4CC-4088-B3F0-ADA3E1B955A1 PATH=/usr/bin",
+      "3583 /bin/tmux attach -t compliance CMUX_WORKSPACE_ID=0CF5CF2D-FFB0-41ED-9735-A78A2AA28B79 PATH=/usr/bin",
+    ].join("\n");
+    const result = parseHostMapOutput(clients, ps);
+    expect(result.get("1D334484-F4CC-4088-B3F0-ADA3E1B955A1")).toBe("$25");
+    expect(result.get("0CF5CF2D-FFB0-41ED-9735-A78A2AA28B79")).toBe("$2");
+    expect(result.size).toBe(2);
   });
 
-  // A hook that fails must never break the tmux command that triggered it, and
-  // must never hang a session on a dead daemon.
-  test("the hook cannot fail or hang the tmux action that fired it", () => {
-    const cmd = buildHookCommand("session-closed", "http://127.0.0.1:8377/tmux-changed")[3];
-    expect(cmd).toContain("-m 1");
-    expect(cmd).toContain("|| true");
+  test("empty clients output produces an empty map without touching ps output", () => {
+    expect(parseHostMapOutput("", "irrelevant CMUX_WORKSPACE_ID=abc").size).toBe(0);
   });
 
-  test("covers create, rename and close", () => {
-    expect(HOOK_EVENTS).toEqual(["session-created", "session-renamed", "session-closed"]);
+  test("a client with no matching ps line (process already exited) is silently dropped", () => {
+    const clients = `9999${TAB}$25`;
+    expect(parseHostMapOutput(clients, "").size).toBe(0);
+  });
+
+  test("a ps line with no CMUX_WORKSPACE_ID is ignored", () => {
+    const clients = `3674${TAB}$25`;
+    const ps = "3674 /bin/tmux attach -t cmux PATH=/usr/bin";
+    expect(parseHostMapOutput(clients, ps).size).toBe(0);
+  });
+});
+
+describe("resolveMirrorMode", () => {
+  test("a recognized env override wins over the default", () => {
+    expect(resolveMirrorMode("windows", { TMUX_CMUX_MIRROR: "global" })).toBe("global");
+    expect(resolveMirrorMode("global", { TMUX_CMUX_MIRROR: "windows" })).toBe("windows");
+  });
+
+  test("falls back to the given default when unset", () => {
+    expect(resolveMirrorMode("global", {})).toBe("global");
+  });
+
+  test("falls back to the given default for an unrecognized value", () => {
+    expect(resolveMirrorMode("windows", { TMUX_CMUX_MIRROR: "bogus" })).toBe("windows");
+  });
+
+  test("defaults to windows with no default and no env given", () => {
+    expect(resolveMirrorMode(undefined, {})).toBe("windows");
+  });
+});
+
+// Live smoke tests: exercise the real subprocess path against whatever tmux
+// this machine has (may or may not be running, may have no sessions). Only
+// asserts the tolerant-of-anything contract these functions promise --
+// never asserts specific session data, so this is safe in any environment.
+describe("live tmux smoke (read-only, tolerant of tmux being absent)", () => {
+  test("listSessions() returns an array and never throws", async () => {
+    const sessions = await listSessions();
+    expect(Array.isArray(sessions)).toBe(true);
+    for (const s of sessions) {
+      expect(typeof s.id).toBe("string");
+      expect(typeof s.name).toBe("string");
+      expect(typeof s.attached).toBe("number");
+    }
+  });
+
+  test("hostMap() returns a Map and never throws", async () => {
+    const map = await hostMap();
+    expect(map instanceof Map).toBe(true);
   });
 });
