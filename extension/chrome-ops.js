@@ -248,8 +248,34 @@ async function archiveGroup(op, state) {
  * @param {{windowId: number, sendFrame?: (frame: Record<string, any>) => void}} ctx
  * @returns {Promise<Msg|null>}
  */
+/**
+ * Finds a live tab whose url matches exactly. Pure: chrome.tabs.query's
+ * result is passed in as data. A tab mid-navigation can report an empty or
+ * missing url, and that must never match, or a duplicate open could silently
+ * reactivate the wrong tab.
+ * @param {{id?: number, url?: string}[]} tabs
+ * @param {string} url
+ */
+export function findExistingTab(tabs, url) {
+  return tabs.find((t) => !!t.url && t.url === url);
+}
+
 async function openUrl(op, state, ctx) {
   const entry = state.byId[/** @type {string} */ (op.id)];
+
+  // If this identity's group already has a tab open on this exact URL,
+  // activate it instead of piling on a duplicate. Without this, a caller
+  // that re-opens the same reference URL on every pass (an agent re-checking
+  // a doc, a repeated PR link) accumulates a new tab forever.
+  if (entry.groupId != null) {
+    const existingTabs = await chrome.tabs.query({ groupId: entry.groupId });
+    const existing = findExistingTab(existingTabs, /** @type {string} */ (op.url));
+    if (existing) {
+      await chrome.tabs.update(/** @type {number} */ (existing.id), { active: true });
+      return { type: "local", name: "groupCreated", id: /** @type {string} */ (op.id), groupId: entry.groupId };
+    }
+  }
+
   const windowId = await resolveTargetWindow(op, ctx);
   const tab = await chrome.tabs.create({ windowId, url: op.url, active: true });
 
