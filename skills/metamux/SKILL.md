@@ -56,10 +56,17 @@ If `metamux` is not on PATH, use `bun ~/Documents/GitHub/metamux/cli/metamux.ts 
   `metamux_tab_context` or `metamux_browser_snapshot`, which reuse the tab.
 - Never bulk-open an enumerated list, such as every open PR or every ticket. One URL per
   meaningful artifact: the PR under discussion, the preview you just built.
+- A second `metamux open` on the SAME url activates the existing tab instead of opening
+  another. The match is exact: a different query string or fragment counts as a different
+  url and opens a new tab. To reuse a tab whose url is close but not identical, check
+  `metamux_tab_context` first and decide yourself -- only you know whether it's really the
+  same thing.
 - `metamux focus` steals the human's screen focus - use it only when they asked to be
   shown something right now.
 - If the daemon is down (`metamux status` fails), fall back to printing the URL and say
   the daemon is not running.
-- A pane with no `$CMUX_WORKSPACE_ID` cannot target itself, so every open silently lands
-  in the active group instead. If your links keep appearing in the wrong place, check
-  `echo $CMUX_WORKSPACE_ID` before assuming the daemon is wrong.
+- Identity comes from the tmux session you're actually in, asked for at call time -- not
+  from `$CMUX_WORKSPACE_ID`, which is a stale per-pane snapshot and is no longer trusted.
+  A pane with no tmux session cannot target itself: `metamux open` fails loud and prints
+  the url rather than guessing at the active workspace. If that happens, run inside a
+  tmux session (`t <name>`).

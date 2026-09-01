@@ -55,7 +55,13 @@ export const METAMUX_MCP_TOOLS: McpTool[] = [
       "ticket: this buries the workspace in tabs nobody asked for. " +
       "Do not use this tool to read or collect content. To read a page, use the API or the CLI for " +
       "that system, such as `gh` for GitHub. To inspect a tab that is already open, use " +
-      "metamux_tab_context or metamux_browser_snapshot.",
+      "metamux_tab_context or metamux_browser_snapshot. " +
+      "Deduping: a second call with the SAME url activates the existing tab instead of opening " +
+      "another. This match is exact -- a different query string or fragment (a different PR, a " +
+      "different tab within the same page) counts as a different URL and opens a new tab. If you " +
+      "want to reuse a tab whose URL is close but not identical, call metamux_tab_context first " +
+      "and decide for yourself: that judgment belongs to you, since only you know whether it is " +
+      "really the same thing.",
     inputSchema: {
       type: "object",
       properties: {
