@@ -6,11 +6,16 @@
 //   1. Capture the frontmost app's bundle id FAST, before this process
 //      itself steals focus by handling the URL event.
 //   2. Frontmost == com.cmuxterm.app -> POST http://127.0.0.1:<port>/open
-//      {token, url} (no cmuxWorkspaceId -- daemon's existing "target the
-//      active workspace" behavior), 1s timeout.
+//      {token, url}, 1s timeout.
 //   3. Daemon down / non-2xx / any other frontmost app -> passthrough:
 //      open the URL with Google Chrome EXPLICITLY, never via the OS
 //      default handler (that's ourselves -- an infinite loop).
+//
+// Step 3 carries the weight it did not used to. This process has no tmux
+// session, so under the identity model it cannot name a workspace, and
+// /open answers 404 rather than guessing at the active one. An OS-level
+// link therefore lands in plain unmanaged Chrome, which is what "no tmux
+// session, no linkage" means for a caller with no terminal to fail into.
 //   4. Never shows UI, never a Dock icon (LSUIElement in Info.plist).
 //
 // No test rig for Swift in this repo -- the routing decision stays here,
