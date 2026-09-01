@@ -771,6 +771,16 @@ export async function markWindow(windowId) {
 export async function runChromeCall(call) {
   switch (call.op) {
     case "createGroup": {
+      // Idempotent, matching ensureGroup's established pattern: two observation
+      // cycles can fire close enough together that the second one still sees
+      // "no group for this label" before the first create has landed and been
+      // re-observed. Re-resolving by title+window first is what stops that
+      // race from minting a second group instead of just a duplicate tab.
+      const found = await chrome.tabGroups.query({ title: call.label, windowId: call.windowId });
+      if (found.length > 0) {
+        await chrome.tabGroups.update(found[0].id, { title: call.label, collapsed: true });
+        return true;
+      }
       const tab = await chrome.tabs.create({ windowId: call.windowId, url: "chrome://newtab/", active: false });
       const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
       await chrome.tabGroups.update(groupId, { title: call.label, collapsed: true });
