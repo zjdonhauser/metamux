@@ -10,6 +10,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import { lookup } from "node:dns/promises";
 import { PendingRequestTable } from "./automation-rpc.ts";
+import type { IdentityEngine } from "./model/engine.ts";
 import { toolAllowed } from "./automation-policy.ts";
 import { decideNavigate } from "./navigate-gate.ts";
 import type { MetamuxConfig } from "./config.ts";
@@ -93,6 +94,12 @@ export interface ActuatorServerOptions {
   port: number;
   secret: string;
   registry: Registry;
+  /** Identity model (docs/superpowers/specs/2026-08-31-metamux-identity-model-design.md).
+   *  Resolves a caller to its workspace from the tmux session it is really in. */
+  engine?: IdentityEngine;
+  /** Called by the tmux hooks, which carry no payload and only mean
+   *  "something changed, re-project now". */
+  onTmuxChanged?: () => void;
   config: MetamuxConfig;
   cursor: CursorState;
   stats: ServerStats;
@@ -149,6 +156,8 @@ export class ActuatorServer {
   private seq = 0;
   private log: (line: string) => void;
   private registry: Registry;
+  private readonly engine: IdentityEngine | null;
+  private readonly onTmuxChanged?: () => void;
   private config: MetamuxConfig;
   private cursor: CursorState;
   private stats: ServerStats;
@@ -181,6 +190,8 @@ export class ActuatorServer {
     this.port = options.port;
     this.secret = options.secret;
     this.registry = options.registry;
+    this.engine = options.engine ?? null;
+    this.onTmuxChanged = options.onTmuxChanged;
     this.config = options.config;
     this.cursor = options.cursor;
     this.stats = options.stats;
@@ -327,6 +338,10 @@ export class ActuatorServer {
       return new Response("Upgrade failed", { status: 400 });
     }
 
+    if (url.pathname === "/tmux-changed" && req.method === "POST") {
+      this.onTmuxChanged?.();
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/open" && req.method === "POST") {
       return this.handleOpen(req);
     }
@@ -377,21 +392,48 @@ export class ActuatorServer {
       return new Response(JSON.stringify({ ok: false, error: "missing url" }), { status: 400 });
     }
     const cmuxWorkspaceId = typeof obj.cmuxWorkspaceId === "string" ? obj.cmuxWorkspaceId : null;
+    const tmuxSessionName = typeof obj.tmuxSessionName === "string" ? obj.tmuxSessionName : null;
+    const metamuxId = typeof obj.metamuxId === "string" ? obj.metamuxId : null;
+    // `active` is stated user intent (`metamux open --active`), which is not
+    // the same thing as the silent fallback that used to run whenever a caller
+    // could not identify itself.
+    const wantsActive = obj.active === true;
 
     let target: WorkspaceRef | null = null;
-    if (cmuxWorkspaceId) {
+    if (wantsActive) {
+      target = this.registry.activeId ? (this.registry.workspaces.get(this.registry.activeId) ?? null) : null;
+    } else if (this.engine && (tmuxSessionName !== null || metamuxId !== null)) {
+      const workspace = this.engine.workspaceFor({
+        kind: "tmux",
+        sessionName: tmuxSessionName ?? "",
+        metamuxId,
+      });
+      // The engine owns identity; the registry still owns the Chrome-side
+      // projection until cutover, so bridge by label.
+      if (workspace) {
+        for (const ref of this.registry.workspaces.values()) {
+          if (!ref.archived && ref.title === workspace.label) {
+            target = ref;
+            break;
+          }
+        }
+      }
+    } else if (cmuxWorkspaceId) {
       for (const ref of this.registry.workspaces.values()) {
         if (ref.sourceId === cmuxWorkspaceId) {
           target = ref;
           break;
         }
       }
-    } else if (this.registry.activeId) {
-      target = this.registry.workspaces.get(this.registry.activeId) ?? null;
     }
 
     if (!target) {
-      return new Response(JSON.stringify({ ok: false, error: "no target workspace" }), { status: 404 });
+      // No silent fallback to whatever workspace happens to be on screen: that
+      // is what put links in a stranger's tab group across multiple displays.
+      const error = tmuxSessionName === null && metamuxId === null && !wantsActive && cmuxWorkspaceId === null
+        ? "caller is not in a tmux session, so it has no workspace"
+        : "no target workspace";
+      return new Response(JSON.stringify({ ok: false, error }), { status: 404 });
     }
 
     const identity = this.pushOpenUrl(target, urlStr);

@@ -21,7 +21,12 @@ import { GroupProjection } from "./group-projection.ts";
 import { LazyGroupTracker } from "./lazy-groups.ts";
 import { loadPalette, type PaletteEntry } from "./palette.ts";
 import { parseLine, parseWindowFocusedLine, type CmuxWorkspaceEvent } from "./parser.ts";
-import { atomicWriteJson, CONFIG_PATH, cursorPath, ensureSecret, ensureStateDir, logPath, registryPath } from "./paths.ts";
+import { atomicWriteJson, CONFIG_PATH, cursorPath, desiredStatePath, ensureSecret, ensureStateDir, logPath, registryPath } from "./paths.ts";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { IdentityEngine } from "./model/engine.ts";
+import { parseStoreText, serializeStore, type DesiredState } from "./model/store.ts";
+import { installHooks, listSessions, stampId } from "./model/tmux-source.ts";
 import { PortsTracker } from "./ports.ts";
 import { colorFor, Registry, type ActuatorEvent, type WorkspaceRef } from "./registry.ts";
 import { shouldReverseSyncSelect } from "./reverse-sync.ts";
@@ -288,10 +293,42 @@ async function runDaemon(): Promise<void> {
     lazyGroups.seedFromRefs(seedSnapshot.workspaces, (ref) => groupProjection.identityFor(ref, seedSnapshot).id);
   }
 
+  // Identity model. The workspace set is projected from tmux, so the engine is
+  // authoritative for "which workspace is calling" while the registry still
+  // owns the Chrome-side projection until cutover.
+  const engine = new IdentityEngine({
+    listSessions,
+    stampId,
+    load: () => {
+      try {
+        return parseStoreText(readFileSync(desiredStatePath(), "utf8"));
+      } catch {
+        return parseStoreText("");
+      }
+    },
+    save: (state: DesiredState) => {
+      void atomicWriteJson(desiredStatePath(), JSON.parse(serializeStore(state)));
+    },
+    mintId: () => `mw_${randomUUID().slice(0, 8)}`,
+  });
+
+  const refreshFromTmux = () => {
+    try {
+      engine.refresh();
+    } catch (err) {
+      log(`[tmux] refresh failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  refreshFromTmux();
+  log(`[tmux] projected ${engine.workspaces.filter((w) => !w.archived).length} workspace(s) from tmux`);
+  setInterval(refreshFromTmux, 5000);
+
   const server = new ActuatorServer({
     port: config.port,
     secret,
     registry,
+    engine,
+    onTmuxChanged: refreshFromTmux,
     config,
     cursor,
     stats,
@@ -319,6 +356,10 @@ async function runDaemon(): Promise<void> {
     log,
   });
   server.start();
+  // Only now: the hooks point at this port, and a daemon that failed to bind
+  // does not own it. Installing earlier pointed a live tmux server's global
+  // hooks at somebody else's daemon.
+  installHooks(`http://127.0.0.1:${config.port}/tmux-changed`);
 
   // Detach-on-close: the user closed a managed Chrome group by hand.
   // Clears attachedAt for every real workspace composing the wire

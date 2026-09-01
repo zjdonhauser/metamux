@@ -19,6 +19,12 @@ export function expandHome(p: string): string {
 export const STATE_DIR = expandHome(process.env.METAMUX_STATE_DIR || "~/.local/state/metamux");
 export const CONFIG_PATH = expandHome(process.env.METAMUX_CONFIG_PATH || "~/.config/metamux/config.json");
 
+/** Desired state for the identity model. Separate from registry.json on
+ *  purpose: the cutover starts clean rather than migrating it. */
+export function desiredStatePath(): string {
+  return join(STATE_DIR, "desired.json");
+}
+
 export function registryPath(): string {
   return join(STATE_DIR, "registry.json");
 }
