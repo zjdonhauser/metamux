@@ -1,5 +1,5 @@
 import type { CallerIdentity } from "./caller-identity.ts";
-import type { Action, Observed, Workspace, WorkspaceId } from "./identity.ts";
+import type { Action, ChromeWindowId, Observed, Workspace, WorkspaceId } from "./identity.ts";
 import { projectWorkspaces, type TmuxSession } from "./project-workspaces.ts";
 import { reconcile } from "./reconcile.ts";
 import { EMPTY, type DesiredState } from "./store.ts";
@@ -96,3 +96,31 @@ export class IdentityEngine {
 }
 
 export const emptyState = (): DesiredState => ({ ...EMPTY });
+
+/**
+ * Validates an `observation` frame from the extension into an Observed.
+ *
+ * Malformed rows are dropped rather than throwing: one bad group must not stop
+ * the daemon reconciling the rest. A null chromeWindowId is kept, not dropped,
+ * because "this group sits in a window with no marker" is exactly the state
+ * that should produce a move toward the paired window.
+ */
+export function observedFromFrame(frame: unknown): Observed {
+  const record = typeof frame === "object" && frame !== null ? (frame as Record<string, unknown>) : {};
+  const rawGroups = Array.isArray(record.groups) ? record.groups : [];
+  const groups = [];
+  for (const raw of rawGroups) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const g = raw as Record<string, unknown>;
+    if (typeof g.groupId !== "number" || typeof g.label !== "string") continue;
+    const chromeWindowId = typeof g.chromeWindowId === "string" ? g.chromeWindowId : null;
+    const tabs = Array.isArray(g.tabs)
+      ? g.tabs
+          .filter((t): t is Record<string, unknown> => typeof t === "object" && t !== null)
+          .filter((t) => typeof t.tabId === "number" && typeof t.url === "string")
+          .map((t) => ({ tabId: t.tabId as number, url: t.url as string }))
+      : [];
+    groups.push({ groupId: g.groupId, label: g.label, chromeWindowId: chromeWindowId as never, tabs });
+  }
+  return { groups };
+}

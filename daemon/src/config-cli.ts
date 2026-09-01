@@ -21,6 +21,7 @@ export const CONFIG_ALLOWED_KEYS = [
   "tmux.spawnCwd",
   "janitor",
   "janitorCrossWindow",
+  "identityModel",
   "colorBackflow",
   "pruneArchivedAfterDays",
   "colorMode",
@@ -61,6 +62,7 @@ export function validateConfigValue(key: ConfigKey, value: unknown): ConfigValue
     case "reverseSync":
     case "collapseOthers":
     case "janitor":
+    case "identityModel":
     case "janitorCrossWindow":
     case "colorBackflow":
       return typeof value === "boolean" ? { ok: true } : { ok: false, error: `${key} must be a boolean (true/false)` };

@@ -84,6 +84,10 @@ export interface MetamuxConfig {
    * Foreign (unmanaged-title) groups in other windows are never touched
    * regardless of this setting. Default true. */
   janitorCrossWindow: boolean;
+  /** Identity model cutover. Off until the extension is reloaded: with it on,
+   *  the extension reports observations and the daemon replies with the
+   *  reconciler's actions instead of driving the old title-keyed projection. */
+  identityModel: boolean;
   /** Color backflow (daemon/src/color-backflow.ts): paints a cmux tab's
    * own color to match its Chrome group's color when that color is the
    * title-hash fallback (never overwrites a user-set cmux color). Default
@@ -129,6 +133,7 @@ export const DEFAULT_CONFIG: MetamuxConfig = {
   tmux: { enabled: false, mirror: "partition", alphabetize: true, reattachGraceMs: 8000, spawnCwd: "~/Documents/GitHub" },
   janitor: true,
   janitorCrossWindow: true,
+  identityModel: false,
   colorBackflow: true,
   pruneArchivedAfterDays: 7,
   colorMode: "palette",
@@ -215,6 +220,7 @@ export async function loadConfig(path: string = CONFIG_PATH): Promise<MetamuxCon
     windowPairing,
     janitor: typeof obj.janitor === "boolean" ? obj.janitor : DEFAULT_CONFIG.janitor,
     janitorCrossWindow: typeof obj.janitorCrossWindow === "boolean" ? obj.janitorCrossWindow : DEFAULT_CONFIG.janitorCrossWindow,
+    identityModel: typeof obj.identityModel === "boolean" ? obj.identityModel : DEFAULT_CONFIG.identityModel,
     colorBackflow: typeof obj.colorBackflow === "boolean" ? obj.colorBackflow : DEFAULT_CONFIG.colorBackflow,
     pruneArchivedAfterDays:
       typeof obj.pruneArchivedAfterDays === "number" ? obj.pruneArchivedAfterDays : DEFAULT_CONFIG.pruneArchivedAfterDays,
