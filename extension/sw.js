@@ -126,7 +126,7 @@ async function boot() {
       // window id becomes a numeric one, and it skips rather than retargeting
       // when the intended window is not live.
       if (msg && msg.type === "actions" && Array.isArray(msg.actions) && lastObservation) {
-        const calls = orderCalls(msg.actions.map((a) => planChromeCall(a, lastObservation)));
+        const calls = orderCalls(msg.actions.map((/** @type {any} */ a) => planChromeCall(a, lastObservation)));
         for (const call of calls) {
           if (call.op === "skip") continue;
           try {
