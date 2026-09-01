@@ -10,7 +10,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import { lookup } from "node:dns/promises";
 import { PendingRequestTable } from "./automation-rpc.ts";
-import { observedFromFrame } from "./model/engine.ts";
+import { observedFromFrame, observedWindowsFromFrame } from "./model/engine.ts";
 import type { IdentityEngine } from "./model/engine.ts";
 import { toolAllowed } from "./automation-policy.ts";
 import { decideNavigate } from "./navigate-gate.ts";
@@ -101,6 +101,9 @@ export interface ActuatorServerOptions {
   /** Called by the tmux hooks, which carry no payload and only mean
    *  "something changed, re-project now". */
   onTmuxChanged?: () => void;
+  /** Called with each observation frame's window list: the extension's live
+   *  minted-id-to-numeric-id map. */
+  onObservationWindows?: (windows: import("./model/engine.ts").ObservedWindow[]) => void;
   config: MetamuxConfig;
   cursor: CursorState;
   stats: ServerStats;
@@ -159,6 +162,7 @@ export class ActuatorServer {
   private registry: Registry;
   private readonly engine: IdentityEngine | null;
   private readonly onTmuxChanged?: () => void;
+  private readonly onObservationWindows?: (windows: import("./model/engine.ts").ObservedWindow[]) => void;
   private config: MetamuxConfig;
   private cursor: CursorState;
   private stats: ServerStats;
@@ -193,6 +197,7 @@ export class ActuatorServer {
     this.registry = options.registry;
     this.engine = options.engine ?? null;
     this.onTmuxChanged = options.onTmuxChanged;
+    this.onObservationWindows = options.onObservationWindows;
     this.config = options.config;
     this.cursor = options.cursor;
     this.stats = options.stats;
@@ -726,6 +731,7 @@ export class ActuatorServer {
     // extension only sends this once it has been reloaded with the new code.
     if (obj.type === "observation") {
       if (!this.config.identityModel || !this.engine) return;
+      this.onObservationWindows?.(observedWindowsFromFrame(obj));
       const observed = observedFromFrame(obj);
       const actions = this.engine.plan(observed);
       ws.send(JSON.stringify({ type: "actions", actions }));

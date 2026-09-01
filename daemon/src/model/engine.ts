@@ -133,3 +133,29 @@ export function observedFromFrame(frame: unknown): Observed {
   }
   return { groups };
 }
+
+export interface ObservedWindow {
+  chromeWindowId: ChromeWindowId;
+  numericId: number;
+}
+
+/**
+ * Validates the `windows` field of an observation frame: the extension's
+ * minted-id-to-numeric-id map for every window it currently sees.
+ *
+ * Malformed rows are dropped, matching observedFromFrame's tolerance -- one
+ * bad row from a Chrome API race must not stop the daemon reconciling the
+ * rest.
+ */
+export function observedWindowsFromFrame(frame: unknown): ObservedWindow[] {
+  const record = typeof frame === "object" && frame !== null ? (frame as Record<string, unknown>) : {};
+  const raw = Array.isArray(record.windows) ? record.windows : [];
+  const windows: ObservedWindow[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const w = entry as Record<string, unknown>;
+    if (typeof w.chromeWindowId !== "string" || typeof w.numericId !== "number") continue;
+    windows.push({ chromeWindowId: w.chromeWindowId, numericId: w.numericId });
+  }
+  return windows;
+}

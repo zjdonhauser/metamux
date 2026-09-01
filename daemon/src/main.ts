@@ -28,6 +28,7 @@ import { IdentityEngine } from "./model/engine.ts";
 import { parseStoreText, serializeStore, type DesiredState } from "./model/store.ts";
 import { installHooks, listSessions, paneRootPids, stampId } from "./model/tmux-source.ts";
 import { findHarness, parsePsOutput } from "./model/harness.ts";
+import { resolvePairObservation } from "./identity-placement.ts";
 import { PortsTracker } from "./ports.ts";
 import { colorFor, Registry, type ActuatorEvent, type WorkspaceRef } from "./registry.ts";
 import { shouldReverseSyncSelect } from "./reverse-sync.ts";
@@ -342,6 +343,10 @@ async function runDaemon(): Promise<void> {
     registry,
     engine,
     onTmuxChanged: refreshFromTmux,
+    onObservationWindows: (windows) => {
+      numericToMinted = new Map(windows.map((w) => [w.numericId, w.chromeWindowId]));
+      liveMintedChromeWindowIds = windows.map((w) => w.chromeWindowId);
+    },
     config,
     cursor,
     stats,
@@ -574,6 +579,12 @@ async function runDaemon(): Promise<void> {
       const ref = registry.activeId ? registry.workspaces.get(registry.activeId) : null;
       if (ref && config.windowPairing.followTab) void maybeFollowTab(ref);
     }
+    // Identity model placement: independent of windowPairing.enabled, since it
+    // is a separate system with its own kill switch (config.identityModel).
+    if (emit && event.name === "selected" && config.identityModel) {
+      const ref = registry.activeId ? registry.workspaces.get(registry.activeId) : null;
+      if (ref) void maybeUpdateIdentityPlacement(ref);
+    }
     if (emit && derived.length > 0) server.broadcast(derived);
   };
 
@@ -706,6 +717,34 @@ async function runDaemon(): Promise<void> {
       }
     } catch (err) {
       log(`[follow-tab] skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  // The extension's minted-id-to-numeric-id map, refreshed on every
+  // observation frame. Bridges the CG-geometry join (which speaks
+  // chrome.windows.id) to the identity model (which speaks minted ids).
+  let numericToMinted = new Map<number, string>();
+  let liveMintedChromeWindowIds: string[] = [];
+
+  /** Identity model placement: on each workspace activation, records which
+   *  cmux window the workspace sits in and, when the geometry join and the
+   *  extension's marker map agree, which Chrome window pairs with it. Mirrors
+   *  maybeFollowTab's reasoning (activation is the one moment a cmux window
+   *  is guaranteed on screen) but writes into the engine, not the registry. */
+  const maybeUpdateIdentityPlacement = async (ref: WorkspaceRef): Promise<void> => {
+    try {
+      const workspace = engine.workspaces.find((w) => !w.archived && w.sessionName === ref.title);
+      if (!workspace) return;
+
+      const current = await windowLookup.holdingWindow(ref.sourceId);
+      if (current !== null) engine.placeWorkspace(workspace.id, current);
+
+      const chromeNumeric = current !== null ? windowSource.pairing.chromeWindowFor(current) : null;
+      const observation = resolvePairObservation(current, chromeNumeric, numericToMinted);
+      const liveCmuxWindowIds = (await cmuxActuator.listWindows()).map((w) => w.id);
+      engine.observePair(observation, liveCmuxWindowIds, liveMintedChromeWindowIds);
+    } catch (err) {
+      log(`[identity] placement skipped: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
 

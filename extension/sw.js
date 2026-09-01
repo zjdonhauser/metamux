@@ -115,7 +115,7 @@ async function boot() {
             for (const windowId of observation.unmarkedWindowIds) await chromeOps.markWindow(windowId);
             observation = await chromeOps.gatherObservation();
           }
-          ws.send({ type: "observation", groups: observation.groups });
+          ws.send({ type: "observation", groups: observation.groups, windows: observation.windows });
           lastObservation = observation;
         } catch (err) {
           console.warn("[metamux] observation failed:", err);
