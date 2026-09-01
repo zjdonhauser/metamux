@@ -815,6 +815,7 @@ export class ActuatorServer {
         closeBehavior: this.config.closeBehavior,
         janitor: this.config.janitor,
         janitorCrossWindow: this.config.janitorCrossWindow,
+        identityModel: this.config.identityModel,
       },
       state: {
         activeId: projected.activeId,

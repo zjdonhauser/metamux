@@ -11,6 +11,15 @@ function cfg(overrides: Partial<MetamuxConfig> = {}): MetamuxConfig {
 }
 
 describe("diffConfig", () => {
+  // The exact miss this pins: identityModel was wired into config.ts and the
+  // config-cli.ts allowlist, but forgotten here, so a config.json edit for it
+  // parsed fine on disk and never reached a running daemon's in-memory
+  // config -- not hot, and with no "restart required" notice either.
+  test("identityModel is detected as a change and is hot-applicable", () => {
+    const changes = diffConfig(cfg({ identityModel: false }), cfg({ identityModel: true }));
+    expect(changes).toEqual([{ key: "identityModel", oldValue: false, newValue: true, hotApplicable: true }]);
+  });
+
   test("identical configs produce no changes", () => {
     expect(diffConfig(cfg(), cfg())).toEqual([]);
   });
@@ -112,6 +121,7 @@ describe("diffConfig", () => {
       "colorBackflow",
       "colorMode",
       "agentBrowser",
+      "identityModel",
     ].sort();
     expect(actual).toEqual(expected);
   });

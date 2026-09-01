@@ -30,7 +30,8 @@ export type ConfigChangeKey =
   | "windowPairing.enabled"
   | "windowPairing.followTab"
   | "windowPairing.autoCreatePartner"
-  | "windowPairing.onWindowClose";
+  | "windowPairing.onWindowClose"
+  | "identityModel";
 
 export interface ConfigChange {
   key: ConfigChangeKey;
@@ -67,6 +68,10 @@ export const HOT_APPLICABLE_CONFIG_KEYS: ReadonlySet<ConfigChangeKey> = new Set(
   "windowPairing.followTab",
   "windowPairing.autoCreatePartner",
   "windowPairing.onWindowClose",
+  // Hot on purpose, matching windowPairing.enabled: this is the cutover
+  // switch, and needing a restart to turn it off would defeat it as a kill
+  // switch.
+  "identityModel",
 ]);
 
 function deepEqual(a: unknown, b: unknown): boolean {
@@ -108,6 +113,7 @@ export function diffConfig(oldConfig: MetamuxConfig, newConfig: MetamuxConfig): 
     { key: "windowPairing.followTab", oldValue: oldConfig.windowPairing.followTab, newValue: newConfig.windowPairing.followTab },
     { key: "windowPairing.autoCreatePartner", oldValue: oldConfig.windowPairing.autoCreatePartner, newValue: newConfig.windowPairing.autoCreatePartner },
     { key: "windowPairing.onWindowClose", oldValue: oldConfig.windowPairing.onWindowClose, newValue: newConfig.windowPairing.onWindowClose },
+    { key: "identityModel", oldValue: oldConfig.identityModel, newValue: newConfig.identityModel },
   ];
 
   return candidates

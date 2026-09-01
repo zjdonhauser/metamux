@@ -504,7 +504,8 @@ async function runDaemon(): Promise<void> {
         change.key === "createGroups" ||
         change.key === "janitor" ||
         change.key === "janitorCrossWindow" ||
-        change.key === "colorMode"
+        change.key === "colorMode" ||
+        change.key === "identityModel"
       ) {
         extensionAffected = true;
       }
@@ -555,6 +556,10 @@ async function runDaemon(): Promise<void> {
     if (changes.some((c) => c.hotApplicable && c.key.startsWith("windowPairing."))) {
       config.windowPairing = newConfig.windowPairing;
       log(`[window-pairing] config -> ${JSON.stringify(newConfig.windowPairing)}`);
+    }
+    if (changes.some((c) => c.hotApplicable && c.key === "identityModel")) {
+      config.identityModel = newConfig.identityModel;
+      log(`[identity] config -> identityModel=${newConfig.identityModel}`);
     }
 
     if (extensionAffected) server.pushSyncToAll();
