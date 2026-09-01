@@ -15,7 +15,8 @@ import { chainStep } from "./chain.js";
 import { orderCalls, planChromeCall } from "./apply.js";
 
 /** Last observation sent, so the actions reply can map minted ids back to
- *  numeric ones without re-querying Chrome. */
+ *  numeric ones without re-querying Chrome.
+ *  @type {{windows: {chromeWindowId: string, numericId: number}[], groups: any[], unmarkedWindowIds: number[]} | null} */
 let lastObservation = null;
 
 const HEARTBEAT_ALARM = "metamux-heartbeat";
