@@ -152,8 +152,16 @@ For each workspace, walk the pane's process tree (recursively, not direct childr
 record the harness and its session id from the command line. Direct-children detection misses
 the common `pane -> zsh -> claude` nesting.
 
-This spec **stores** the field. Restoring a session (`claude --resume <id>` and the codex
-equivalent) is a follow-on, not part of this work.
+This spec **stores** the field. Restore is a follow-on, not part of this work.
+
+Measured on the live machine, not assumed: a session started by typing `claude` in a pane has
+a command line of exactly `claude`, with no `--session-id`. Only a cmux-spawned session
+carries one. So `sessionId` is null for most real sessions and a restore cannot rely on it.
+
+The follow-on should therefore restore with `claude --continue` in the workspace's cwd, which
+resumes the most recent session there and needs no id at all. Correlating a session id by
+matching transcript files under `~/.claude/projects/` by cwd and mtime is a guess, and a guess
+does not belong in a durable field.
 
 ## Outside-tmux guard
 

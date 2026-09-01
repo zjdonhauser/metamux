@@ -20,7 +20,9 @@ export type ChromeWindowId = string;
 
 export interface Harness {
   kind: "claude" | "codex" | "grok";
-  sessionId: string;
+  /** Null when the harness does not put a resumable id on its command line.
+   *  Recorded honestly rather than invented: a restore cannot use what is not there. */
+  sessionId: string | null;
 }
 
 export interface Workspace {
