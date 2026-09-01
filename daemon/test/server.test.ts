@@ -407,6 +407,64 @@ describe("ActuatorServer.pushOpenUrl -- groupBy: title routes to the alias", () 
   });
 });
 
+describe("ActuatorServer.handleOpen -- rate guard (POST /open)", () => {
+  // handleOpen is private, same convention as handlePrune above: a real
+  // Request through the bracket-cast handler, no server actually bound.
+  function callOpen(server: ActuatorServer, body: Record<string, unknown>): Promise<Response> {
+    const req = new Request("http://127.0.0.1/open", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: "test-secret", ...body }),
+    });
+    return (server as unknown as { handleOpen(req: Request): Promise<Response> }).handleOpen(req);
+  }
+
+  function registryWithOneWorkspace(): Registry {
+    const registry = new Registry();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-A", title: "1897", cwd: "/a", bootId: "B1", seq: 1, occurredAtMs: 1 });
+    return registry;
+  }
+
+  // The exact incident this guard exists for: 51 distinct urls, one workspace,
+  // under a second.
+  test("rejects a burst past the cap and lets earlier ones through", async () => {
+    const registry = registryWithOneWorkspace();
+    const { server } = makeServer(cfg({ createGroups: "eager" }), registry);
+
+    const results: Response[] = [];
+    for (let i = 0; i < 51; i++) {
+      results.push(await callOpen(server, { cmuxWorkspaceId: "SRC-A", url: `https://example.test/pr/${i}` }));
+    }
+
+    const allowed = results.filter((r) => r.ok).length;
+    const rejected = results.filter((r) => r.status === 429).length;
+    expect(allowed).toBe(8);
+    expect(rejected).toBe(51 - 8);
+  });
+
+  test("a rejection names the reason, not just a bare failure", async () => {
+    const registry = registryWithOneWorkspace();
+    const { server } = makeServer(cfg({ createGroups: "eager" }), registry);
+    for (let i = 0; i < 8; i++) await callOpen(server, { cmuxWorkspaceId: "SRC-A", url: `https://example.test/${i}` });
+
+    const res = await callOpen(server, { cmuxWorkspaceId: "SRC-A", url: "https://example.test/9" });
+    expect(res.status).toBe(429);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.error).toContain("too many opens");
+  });
+
+  test("a different workspace is not penalized by another one's burst", async () => {
+    const registry = registryWithOneWorkspace();
+    registry.applyEvent({ name: "created", workspaceId: "SRC-B", title: "other", cwd: "/b", bootId: "B1", seq: 2, occurredAtMs: 2 });
+    const { server } = makeServer(cfg({ createGroups: "eager" }), registry);
+
+    for (let i = 0; i < 8; i++) await callOpen(server, { cmuxWorkspaceId: "SRC-A", url: `https://example.test/${i}` });
+    const res = await callOpen(server, { cmuxWorkspaceId: "SRC-B", url: "https://example.test/first" });
+    expect(res.ok).toBe(true);
+  });
+});
+
 describe("ActuatorServer -- window pairing (docs/protocol.md, 'Window pairing')", () => {
   test("getState's raw view carries a tmux-sourced ref's cmuxWindowId/placementOverride natively (full-fidelity WorkspaceRef fields)", () => {
     const registry = new Registry();

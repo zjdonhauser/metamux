@@ -10,6 +10,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import { lookup } from "node:dns/promises";
 import { PendingRequestTable } from "./automation-rpc.ts";
+import { DEFAULT_OPEN_RATE_LIMIT, OpenRateLimiter } from "./open-rate-limit.ts";
 import { observedFromFrame, observedWindowsFromFrame } from "./model/engine.ts";
 import type { IdentityEngine } from "./model/engine.ts";
 import { toolAllowed } from "./automation-policy.ts";
@@ -161,6 +162,7 @@ export class ActuatorServer {
   private log: (line: string) => void;
   private registry: Registry;
   private readonly engine: IdentityEngine | null;
+  private readonly openRateLimiter = new OpenRateLimiter(DEFAULT_OPEN_RATE_LIMIT.maxPerWindow, DEFAULT_OPEN_RATE_LIMIT.windowMs);
   private readonly onTmuxChanged?: () => void;
   private readonly onObservationWindows?: (windows: import("./model/engine.ts").ObservedWindow[]) => void;
   private config: MetamuxConfig;
@@ -440,6 +442,22 @@ export class ActuatorServer {
         ? "caller is not in a tmux session, so it has no workspace"
         : "no target workspace";
       return new Response(JSON.stringify({ ok: false, error }), { status: 404 });
+    }
+
+    // Rate guard: built after a caller opened 51 distinct PR urls into one
+    // group in under a second, despite the tool description saying not to.
+    // Keyed on the resolved target's own id, not the caller's identity, so
+    // every path that resolves to the same workspace counts against one cap.
+    const rateDecision = this.openRateLimiter.check(target.id, Date.now());
+    if (!rateDecision.allowed) {
+      this.log(`[open-guard] rejected: ${target.title} already has ${rateDecision.countInWindow} opens in the last window`);
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: `too many opens for this workspace in a short window (${rateDecision.countInWindow} already). Wait a few seconds, or read the source instead of opening every item.`,
+        }),
+        { status: 429 },
+      );
     }
 
     const identity = this.pushOpenUrl(target, urlStr);
