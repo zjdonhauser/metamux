@@ -59,7 +59,7 @@ interface WindowPair {
 
 interface Harness {
   kind: "claude" | "codex" | "grok";
-  sessionId: string;
+  sessionId: string | null;   // usually null: see "Harness tracking"
 }
 ```
 
