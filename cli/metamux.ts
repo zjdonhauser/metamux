@@ -127,6 +127,13 @@ async function cmdState(): Promise<void> {
 }
 
 async function cmdCurrent(): Promise<void> {
+  // Prefer the tmux session this process is in; fall back to the env var for a
+  // cmux-native shell, where cmux sets it directly and it cannot be stale.
+  const tmuxIdentity = probeTmuxIdentity();
+  if (tmuxIdentity.kind === "tmux") {
+    console.log(`${tmuxIdentity.sessionName}${tmuxIdentity.metamuxId ? ` (${tmuxIdentity.metamuxId})` : ""}`);
+    return;
+  }
   const cmuxWorkspaceId = process.env.CMUX_WORKSPACE_ID;
   if (!cmuxWorkspaceId) {
     console.error("metamux current: no $CMUX_WORKSPACE_ID (run from a cmux shell)");
