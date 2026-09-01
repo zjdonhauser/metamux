@@ -174,3 +174,37 @@ fi
 if [ -n "$CMUX_WORKSPACE_ID" ] && [ -r "$METAMUX_REPO/scripts/ensure-daemon.sh" ]; then
   (bash "$METAMUX_REPO/scripts/ensure-daemon.sh" >/dev/null 2>&1 &)
 fi
+
+# Harness guard: the identity model links a Chrome tab group to a TMUX SESSION,
+# so a harness started outside tmux has no workspace and `metamux open` from it
+# cannot land in a group. Catch that here, where it costs one keystroke, rather
+# than an hour later when a link fails to open.
+#
+# The -t guards matter as much as they do for the picker above: a scripted or
+# piped `claude` must run untouched and must never stop to ask a question that
+# nobody is there to answer.
+_metamux_harness_guard() {
+  local harness="$1"; shift
+  if [[ -n $TMUX || ! -o interactive || ! -t 0 || ! -t 1 ]]; then
+    command "$harness" "$@"
+    return
+  fi
+
+  local name="${PWD:t}"
+  print -u2 "metamux: starting $harness outside tmux, so its links cannot open in a tab group."
+  local answer
+  if read -q "answer?Start it in tmux session '$name' instead? [y/N] "; then
+    print -u2 ""
+    # -A attaches when the session already exists, in which case tmux ignores
+    # the command and the existing shell is reused.
+    tmux new-session -A -s "$name" -- "$harness" "$@"
+    return
+  fi
+  print -u2 ""
+  command "$harness" "$@"
+}
+
+for _metamux_h in claude codex grok; do
+  eval "${_metamux_h}() { _metamux_harness_guard ${_metamux_h} \"\$@\" }"
+done
+unset _metamux_h
