@@ -41,12 +41,28 @@ afterEach(() => {
 });
 
 describe("metamux_open target resolution", () => {
-  test("defaults to the calling shell's workspace, not the active one", async () => {
+  // The identity model replaced $CMUX_WORKSPACE_ID with the tmux session the
+  // process is actually in. The env var is a copy taken when the pane was
+  // created, and this MCP server outlives that by days.
+  test("identifies the caller by its tmux session, ignoring CMUX_WORKSPACE_ID", async () => {
     process.env.CMUX_WORKSPACE_ID = "SRC-CALLER";
+    if (!process.env.TMUX) return; // resolution needs a real tmux; covered by caller-identity tests
     await handlers().metamux_open({ url: "https://example.test" });
 
     expect(openBodies).toHaveLength(1);
-    expect(openBodies[0].cmuxWorkspaceId).toBe("SRC-CALLER");
+    expect(openBodies[0].cmuxWorkspaceId).toBeUndefined();
+    expect(typeof openBodies[0].tmuxSessionName).toBe("string");
+  });
+
+  test("refuses to open when the caller is not in a tmux session", async () => {
+    const savedTmux = process.env.TMUX;
+    delete process.env.TMUX;
+    try {
+      await expect(handlers().metamux_open({ url: "https://example.test" })).rejects.toThrow(/not in a tmux session/);
+      expect(openBodies).toHaveLength(0);
+    } finally {
+      if (savedTmux !== undefined) process.env.TMUX = savedTmux;
+    }
   });
 
   test("an explicit workspaceId still wins over the calling shell", async () => {
@@ -64,11 +80,18 @@ describe("metamux_open target resolution", () => {
     expect(openBodies[0].cmuxWorkspaceId).toBeUndefined();
   });
 
-  test("falls back to the active workspace when the harness dropped the env var", async () => {
+  // The old behavior this replaces: a missing env var fell back to whatever
+  // workspace was on screen, which is how links reached a stranger's group.
+  test("never falls back to the active workspace when it cannot identify the caller", async () => {
     delete process.env.CMUX_WORKSPACE_ID;
-    await handlers().metamux_open({ url: "https://example.test" });
-
-    expect(openBodies[0].cmuxWorkspaceId).toBeUndefined();
+    const savedTmux = process.env.TMUX;
+    delete process.env.TMUX;
+    try {
+      await expect(handlers().metamux_open({ url: "https://example.test" })).rejects.toThrow();
+      expect(openBodies).toHaveLength(0);
+    } finally {
+      if (savedTmux !== undefined) process.env.TMUX = savedTmux;
+    }
   });
 
   test("rejects an unknown explicit workspaceId instead of silently using active", async () => {

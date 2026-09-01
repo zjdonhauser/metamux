@@ -4,6 +4,8 @@
 // bridge (createHttpToolHandlers) and the stdio transport (runStdioServer)
 // are the I/O boundary.
 
+import { notInTmuxMessage, probeTmuxIdentity, type CallerIdentity } from "./model/caller-identity.ts";
+
 export interface JsonRpcRequest {
   jsonrpc?: string;
   id?: string | number | null;
@@ -340,21 +342,33 @@ export function createHttpToolHandlers(options: HttpBridgeOptions): Record<strin
         const rawWorkspaces = (raw.workspaces as Record<string, unknown>[]) ?? [];
         const rawMatch = rawWorkspaces.find((w) => w.id === workspaceId);
         cmuxWorkspaceId = typeof rawMatch?.sourceId === "string" ? rawMatch.sourceId : undefined;
-      } else if (args.active !== true) {
-        // Default to the CALLING shell's workspace, matching `metamux open`
-        // (cli/metamux.ts) -- an agent's link belongs in its own group, not
-        // in whichever tab the human happens to be looking at. $CMUX_WORKSPACE_ID
-        // already IS a cmux sourceId, which is what POST /open resolves by.
-        // Absent (some harnesses drop it when spawning the MCP server), leaving
-        // this undefined falls back to the daemon's activeId server-side.
-        cmuxWorkspaceId = process.env.CMUX_WORKSPACE_ID || undefined;
+      }
+
+      // Identity comes from the tmux session this process is in, asked for at
+      // call time. The MCP server is long-lived (instances here have run for
+      // days), so an env var captured when it spawned is the staler of the two.
+      let identity: CallerIdentity = { kind: "not-in-tmux" };
+      if (!workspaceId && args.active !== true) {
+        identity = probeTmuxIdentity();
+        if (identity.kind === "not-in-tmux") {
+          // Fail loud rather than letting the daemon place the link in whichever
+          // group is on screen, which is how links reached a stranger's group.
+          throw new Error(notInTmuxMessage(url));
+        }
       }
 
       const f = options.fetchImpl ?? fetch;
       const res = await f(`http://127.0.0.1:${options.port}/open`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ token: options.token, url, cmuxWorkspaceId }),
+        body: JSON.stringify({
+          token: options.token,
+          url,
+          cmuxWorkspaceId,
+          active: args.active === true,
+          tmuxSessionName: identity.kind === "tmux" ? identity.sessionName : undefined,
+          metamuxId: identity.kind === "tmux" ? identity.metamuxId : undefined,
+        }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(`daemon returned ${res.status}: ${JSON.stringify(body)}`);

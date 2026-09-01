@@ -19,7 +19,7 @@ import { loadConfig } from "../daemon/src/config.ts";
 import { createHttpToolHandlers, runStdioServer } from "../daemon/src/mcp-server.ts";
 import { atomicWriteJson, CONFIG_PATH, ensureSecret, secretPath } from "../daemon/src/paths.ts";
 import { parseOpenArgs } from "./open-args.ts";
-import { notInTmuxMessage, resolveCallerIdentity, type CallerIdentity } from "../daemon/src/model/caller-identity.ts";
+import { notInTmuxMessage, probeTmuxIdentity, type CallerIdentity } from "../daemon/src/model/caller-identity.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DAEMON_MAIN = join(HERE, "..", "daemon", "src", "main.ts");
@@ -69,9 +69,7 @@ async function cmdOpen(args: string[]): Promise<void> {
   // and went stale the moment a session was re-attached from another window.
   let identity: CallerIdentity = { kind: "not-in-tmux" };
   if (!active) {
-    const probe = Bun.spawnSync(["tmux", "display-message", "-p", "#S\t#{@metamux_id}"]);
-    const out = probe.exitCode === 0 ? new TextDecoder().decode(probe.stdout) : null;
-    identity = resolveCallerIdentity(process.env, out);
+    identity = probeTmuxIdentity();
     if (identity.kind === "not-in-tmux") {
       // Fail loud: no workspace to put this in, so hand the human the URL
       // rather than dropping it into whichever group is on screen.

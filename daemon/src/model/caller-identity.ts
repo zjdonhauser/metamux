@@ -42,3 +42,21 @@ export function notInTmuxMessage(url: string): string {
     `  ${url}`,
   ].join("\n");
 }
+
+/**
+ * Asks tmux which session this process is in.
+ *
+ * Targets `$TMUX_PANE` when it is set rather than letting tmux pick the
+ * "current" client. A long-lived process (the MCP server runs for days) has no
+ * client of its own, and the pane it was spawned in is the honest answer.
+ */
+export function probeTmuxIdentity(env: Record<string, string | undefined> = process.env): CallerIdentity {
+  if (!env.TMUX) return { kind: "not-in-tmux" };
+  const format = "#S\t#{@metamux_id}";
+  const args = env.TMUX_PANE
+    ? ["display-message", "-p", "-t", env.TMUX_PANE, format]
+    : ["display-message", "-p", format];
+  const proc = Bun.spawnSync(["tmux", ...args]);
+  const stdout = proc.exitCode === 0 ? new TextDecoder().decode(proc.stdout) : null;
+  return resolveCallerIdentity(env, stdout);
+}
