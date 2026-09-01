@@ -10,6 +10,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import { lookup } from "node:dns/promises";
 import { PendingRequestTable } from "./automation-rpc.ts";
+import { observedFromFrame } from "./model/engine.ts";
 import type { IdentityEngine } from "./model/engine.ts";
 import { toolAllowed } from "./automation-policy.ts";
 import { decideNavigate } from "./navigate-gate.ts";
@@ -717,6 +718,18 @@ export class ActuatorServer {
         void this.onPrune?.(); // persist the re-attachments
         this.pushSyncToAll();
       }
+      return;
+    }
+
+    // Identity model: the extension reports what Chrome actually looks like and
+    // the daemon replies with the reconciler's actions. Gated, because the
+    // extension only sends this once it has been reloaded with the new code.
+    if (obj.type === "observation") {
+      if (!this.config.identityModel || !this.engine) return;
+      const observed = observedFromFrame(obj);
+      const actions = this.engine.plan(observed);
+      ws.send(JSON.stringify({ type: "actions", actions }));
+      if (actions.length > 0) this.log(`[identity] ${actions.length} action(s) planned`);
       return;
     }
 

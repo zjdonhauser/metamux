@@ -175,7 +175,7 @@ that checks `$TMUX` and offers to start a session first.
 print an error to, so "fail loudly" cannot apply to it. **Rule: it passes through to plain
 unmanaged Chrome.** That matches "no tmux, no linkage" and keeps OS-level link opens working.
 
-## What is deleted
+## What is deleted (deferred until the flag is verified on)
 
 - `titleAliasId` and title-hash identity
 - `groupBy: "title" | "workspace"`
@@ -211,6 +211,23 @@ groups by label once. That one-shot label match is the only surviving use of the
 
 Requires from the user: reload the Chrome extension, re-run `install-shell.sh`, and one daemon
 restart.
+
+### Deviation from the pure big bang: a flag first
+
+The cutover is gated on `config.identityModel`, default off, and the deletions below are
+deferred until after it has been verified on. This deviates from the chosen big-bang
+approach, deliberately.
+
+The reason is that the extension cannot be reloaded from the build side, so the
+reconciler-driven path ships unverified. With the flag off the old title-keyed projection
+still runs and the branch stays working; with it on the reconciler drives Chrome. Deleting
+the old paths before that has been seen working would leave no path that runs at all.
+
+Order: flag on, verify, then the deletion pass.
+
+Getting the branch live is itself part of the cutover. `ensure-daemon.sh` runs `main.ts` from
+the MAIN checkout, so restarting the daemon picks up nothing until the branch is merged into
+what that checkout has on disk.
 
 ## Testing
 

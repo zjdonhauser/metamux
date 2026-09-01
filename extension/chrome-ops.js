@@ -1,3 +1,4 @@
+import { buildObservation } from "./observe.js";
 // @ts-check
 /**
  * Executes reducer.js op descriptors against the real chrome.* APIs, plus the
@@ -701,4 +702,70 @@ export function watchGroupRemoved(getState, onFact, onUserClosedGroup) {
       onUserClosedGroup(id);
     }, GROUP_REMOVED_MOVE_CHECK_DELAY_MS);
   });
+}
+
+/**
+ * Identity model: gathers what Chrome actually looks like, keyed by the minted
+ * window ids carried in marker tabs. Pure classification lives in observe.js;
+ * this is only the chrome.* gathering.
+ */
+export async function gatherObservation() {
+  const panelUrl = chrome.runtime.getURL("panel.html");
+  const [windows, markerTabs, groups] = await Promise.all([
+    chrome.windows.getAll({ populate: false }),
+    chrome.tabs.query({ url: `${panelUrl}*` }),
+    chrome.tabGroups.query({}),
+  ]);
+  const withTabs = await Promise.all(
+    groups.map(async (g) => ({
+      groupId: g.id,
+      title: g.title ?? "",
+      windowId: g.windowId,
+      tabs: (await chrome.tabs.query({ groupId: g.id })).map((t) => ({ tabId: t.id, url: t.url ?? "" })),
+    })),
+  );
+  return buildObservation(
+    windows.map((w) => ({ id: w.id, type: w.type ?? "normal" })),
+    markerTabs.map((t) => ({ windowId: t.windowId, url: t.url ?? "" })),
+    withTabs,
+    panelUrl,
+  );
+}
+
+/** Stamps a window with a minted id by opening its marker tab, pinned so it
+ *  survives casual tab closing and restores with the session. */
+export async function markWindow(windowId) {
+  const mintedId = crypto.randomUUID();
+  const url = chrome.runtime.getURL(`panel.html?win=${encodeURIComponent(mintedId)}`);
+  await chrome.tabs.create({ windowId, url, active: false, pinned: true, index: 0 });
+  return mintedId;
+}
+
+/** Runs one call from planChromeCall. Returns false when it could not act. */
+export async function runChromeCall(call) {
+  switch (call.op) {
+    case "createGroup": {
+      const tab = await chrome.tabs.create({ windowId: call.windowId, url: "chrome://newtab/", active: false });
+      const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+      await chrome.tabGroups.update(groupId, { title: call.label, collapsed: true });
+      return true;
+    }
+    case "moveGroup":
+      markServerActivation();
+      markServerRemoval(call.groupId);
+      await chrome.tabGroups.move(call.groupId, { windowId: call.windowId, index: -1 });
+      return true;
+    case "mergeGroups": {
+      const tabs = await chrome.tabs.query({ groupId: call.fromGroupId });
+      if (tabs.length > 0) await chrome.tabs.group({ groupId: call.intoGroupId, tabIds: tabs.map((t) => t.id) });
+      return true;
+    }
+    case "closeGroup": {
+      const tabs = await chrome.tabs.query({ groupId: call.groupId });
+      if (tabs.length > 0) await chrome.tabs.remove(tabs.map((t) => t.id));
+      return true;
+    }
+    default:
+      return false;
+  }
 }

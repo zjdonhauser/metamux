@@ -12,6 +12,11 @@ import * as chromeOps from "./chrome-ops.js";
 import * as ws from "./ws.js";
 import { executeAutomation } from "./automation.js";
 import { chainStep } from "./chain.js";
+import { orderCalls, planChromeCall } from "./apply.js";
+
+/** Last observation sent, so the actions reply can map minted ids back to
+ *  numeric ones without re-querying Chrome. */
+let lastObservation = null;
 
 const HEARTBEAT_ALARM = "metamux-heartbeat";
 const HEARTBEAT_PERIOD_MINUTES = 0.5;
@@ -96,6 +101,40 @@ async function boot() {
         ]);
         const foreignJanitorGroups = allGroups.filter((g) => g.windowId !== windowId);
         msg = { ...msg, janitorGroups, foreignJanitorGroups };
+      }
+
+      // Identity model cutover, gated on config.identityModel. Report what
+      // Chrome actually looks like, keyed by minted window ids, and let the
+      // daemon's reconciler decide. Any window with no marker gets one first,
+      // or its groups report a null window and can never be paired.
+      if (msg && msg.type === "sync" && msg.config && msg.config.identityModel) {
+        try {
+          let observation = await chromeOps.gatherObservation();
+          if (observation.unmarkedWindowIds.length > 0) {
+            for (const windowId of observation.unmarkedWindowIds) await chromeOps.markWindow(windowId);
+            observation = await chromeOps.gatherObservation();
+          }
+          ws.send({ type: "observation", groups: observation.groups });
+          lastObservation = observation;
+        } catch (err) {
+          console.warn("[metamux] observation failed:", err);
+        }
+      }
+
+      // The reconciler's reply. planChromeCall is the only place a minted
+      // window id becomes a numeric one, and it skips rather than retargeting
+      // when the intended window is not live.
+      if (msg && msg.type === "actions" && Array.isArray(msg.actions) && lastObservation) {
+        const calls = orderCalls(msg.actions.map((a) => planChromeCall(a, lastObservation)));
+        for (const call of calls) {
+          if (call.op === "skip") continue;
+          try {
+            await chromeOps.runChromeCall(call);
+          } catch (err) {
+            console.warn("[metamux] action failed:", call.op, err);
+          }
+        }
+        return;
       }
 
       // Workspace-scoped browser automation (docs/protocol.md): a

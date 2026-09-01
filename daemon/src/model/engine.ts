@@ -1,5 +1,5 @@
 import type { CallerIdentity } from "./caller-identity.ts";
-import type { Action, ChromeWindowId, Observed, Workspace, WorkspaceId } from "./identity.ts";
+import type { Action, ChromeWindowId, Harness, Observed, Workspace, WorkspaceId } from "./identity.ts";
 import { projectWorkspaces, type TmuxSession } from "./project-workspaces.ts";
 import { reconcile } from "./reconcile.ts";
 import { EMPTY, type DesiredState } from "./store.ts";
@@ -9,6 +9,10 @@ import { resolvePairs, type PairObservation } from "./window-pairs.ts";
  *  orchestration is testable without a tmux server or a browser. */
 export interface EngineIO {
   listSessions(): TmuxSession[];
+  /** The harness running in a session, if any. Snapshotted state: read from the
+   *  live process tree, but written down because the process is gone when a
+   *  restore would need it. */
+  harnessFor?(sessionName: string): Harness | null;
   stampId(sessionName: string, id: WorkspaceId): boolean;
   load(): DesiredState;
   save(state: DesiredState): void;
@@ -50,7 +54,12 @@ export class IdentityEngine {
       () => this.io.mintId(),
     );
     for (const { sessionName, id } of toStamp) this.io.stampId(sessionName, id);
-    this.commit({ ...this.state, workspaces });
+
+    const probe = this.io.harnessFor;
+    const withHarness = probe
+      ? workspaces.map((w) => (w.archived ? w : { ...w, harness: probe.call(this.io, w.sessionName) }))
+      : workspaces;
+    this.commit({ ...this.state, workspaces: withHarness });
   }
 
   /** Records a confirmed cmux-window/Chrome-window sighting. */

@@ -26,7 +26,8 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { IdentityEngine } from "./model/engine.ts";
 import { parseStoreText, serializeStore, type DesiredState } from "./model/store.ts";
-import { installHooks, listSessions, stampId } from "./model/tmux-source.ts";
+import { installHooks, listSessions, paneRootPids, stampId } from "./model/tmux-source.ts";
+import { findHarness, parsePsOutput } from "./model/harness.ts";
 import { PortsTracker } from "./ports.ts";
 import { colorFor, Registry, type ActuatorEvent, type WorkspaceRef } from "./registry.ts";
 import { shouldReverseSyncSelect } from "./reverse-sync.ts";
@@ -299,6 +300,18 @@ async function runDaemon(): Promise<void> {
   const engine = new IdentityEngine({
     listSessions,
     stampId,
+    // One ps snapshot per refresh, walked per session. pane -> zsh -> claude is
+    // the normal nesting, so this has to be recursive.
+    harnessFor: (sessionName) => {
+      const ps = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,command="]);
+      if (ps.exitCode !== 0) return null;
+      const procs = parsePsOutput(new TextDecoder().decode(ps.stdout));
+      for (const pid of paneRootPids(sessionName)) {
+        const harness = findHarness(procs, pid);
+        if (harness) return harness;
+      }
+      return null;
+    },
     load: () => {
       try {
         return parseStoreText(readFileSync(desiredStatePath(), "utf8"));
